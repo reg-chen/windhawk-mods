@@ -2,7 +2,7 @@
 // @id              fluent-osd-media
 // @name            Fluent OSD & Media
 // @description     Fluent-style Windows 11 OSDs for volume, DDC/CI brightness, media controls, per-app audio mixer, lock keys, clipboard and device events.
-// @version         1.6.9
+// @version         1.7.0
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -108,6 +108,15 @@ Windows owns process cleanup when Explorer exits. This limits one potential
 source of "GDI+ Window is preventing shutdown" without claiming to resolve
 shutdown blockers originating in other processes.
 
+## Display language
+
+Custom OSD text can follow the Windows UI language (**Auto**, default),
+or explicitly use **English** or **繁體中文**. Auto uses Traditional Chinese
+for zh-TW / zh-HK / zh-MO and English otherwise. Media titles, app/process
+names, device names and Windows-supplied text remain unchanged. Windhawk's
+settings-label localization is independent. Display strings never serve as
+internal event identifiers.
+
 ## Resource and input limits
 
 Cross-process brightness notifications are checked for structure size, bounded
@@ -128,6 +137,19 @@ trademarks remain the property of their respective owners.
 
 // ==WindhawkModSettings==
 /*
+- displayLanguage: auto
+  $name: Display language
+  $name:zh-TW: 顯示語言
+  $description: Choose the language used in custom OSD text. Auto follows Windows UI language (English fallback for other languages). System-provided names are unchanged.
+  $description:zh-TW: 選擇自訂 OSD 的文字語言。自動會依 Windows 介面語言選擇（其他語系回退英文）；系統提供的名稱不受影響。
+  $options:
+    - auto: Auto (Windows language)
+    - en: English
+    - zh-TW: Traditional Chinese
+  $options:zh-TW:
+    - auto: 自動（隨系統）
+    - en: English
+    - zh-TW: 繁體中文
 - NativeHide:
     - hideAllNativeOsd: false
       $name: Hide all supported Windows native OSDs
@@ -540,6 +562,125 @@ enum class Kind : int {
     Text, Desktop, Count
 };
 
+// Localized custom OSD strings. Event identities do not depend on UI text.
+enum class OsdText : size_t {
+    KeyboardBacklight,
+    Level,
+    AirplaneMode,
+    Enabled,
+    Disabled,
+    CameraAccess,
+    Camera,
+    Allowed,
+    Blocked,
+    Microphone,
+    Unmuted,
+    Muted,
+    StatusChanged,
+    VirtualDesktop,
+    DesktopSwitched,
+    SystemNotice,
+    SystemStatus,
+    Device,
+    CountUnit,
+    ViewDetails,
+    Clipboard,
+    ContentCopied,
+    ImageCopied,
+    ClipboardImage,
+    TextCopied,
+    ClipboardText,
+    EmptyText,
+    FilesCopied,
+    ClipboardFiles,
+    UsbDevice,
+    Bluetooth,
+    BluetoothDevice,
+    NetworkInterface,
+    Network,
+    Connected,
+    Disconnected,
+    Removed,
+    NetworkChanged,
+    WindowsNetwork,
+    EventDetails,
+    VolumeMixer,
+    MediaPlayback,
+    SystemSounds,
+    ProcessPrefix,
+    On,
+    Off,
+    Count
+};
+struct LocalizedText { PCWSTR en; PCWSTR zhTw; };
+constexpr LocalizedText kLocalizedText[] = {
+    {L"Keyboard backlight", L"鍵盤背光"}, // KeyboardBacklight
+    {L"Level ", L"等級 "}, // Level
+    {L"Airplane mode", L"飛航模式"}, // AirplaneMode
+    {L"Enabled", L"已開啟"}, // Enabled
+    {L"Disabled", L"已關閉"}, // Disabled
+    {L"Camera access", L"相機存取權限"}, // CameraAccess
+    {L"Camera", L"相機"}, // Camera
+    {L"Allowed", L"已允許"}, // Allowed
+    {L"Blocked", L"已封鎖"}, // Blocked
+    {L"Microphone", L"麥克風"}, // Microphone
+    {L"Unmuted", L"已解除靜音"}, // Unmuted
+    {L"Muted", L"已靜音"}, // Muted
+    {L"Status changed", L"狀態已變更"}, // StatusChanged
+    {L"Virtual desktop", L"虛擬桌面"}, // VirtualDesktop
+    {L"Desktop switched", L"桌面已切換"}, // DesktopSwitched
+    {L"System notice", L"系統提示"}, // SystemNotice
+    {L"System status", L"系統狀態"}, // SystemStatus
+    {L"device", L"裝置"}, // Device
+    {L"events", L"個"}, // CountUnit
+    {L"Click to view details", L"點擊查看詳細資訊"}, // ViewDetails
+    {L"Clipboard", L"剪貼簿"}, // Clipboard
+    {L"Content copied", L"內容已複製"}, // ContentCopied
+    {L"Image copied", L"已複製圖片"}, // ImageCopied
+    {L"Clipboard image", L"剪貼簿圖片"}, // ClipboardImage
+    {L"Text copied", L"已複製文字"}, // TextCopied
+    {L"Clipboard text", L"剪貼簿文字"}, // ClipboardText
+    {L"Empty text", L"空白文字"}, // EmptyText
+    {L"Files copied", L"已複製檔案"}, // FilesCopied
+    {L"Clipboard file selection", L"剪貼簿檔案選取"}, // ClipboardFiles
+    {L"USB device", L"USB 裝置"}, // UsbDevice
+    {L"Bluetooth", L"藍牙"}, // Bluetooth
+    {L"Bluetooth device", L"藍牙裝置"}, // BluetoothDevice
+    {L"Network interface", L"網路介面"}, // NetworkInterface
+    {L"Network", L"網路"}, // Network
+    {L"Connected", L"已連接"}, // Connected
+    {L"Disconnected", L"已中斷"}, // Disconnected
+    {L"Removed", L"已移除"}, // Removed
+    {L"Connectivity changed", L"連線狀態已變更"}, // NetworkChanged
+    {L"Windows network connection", L"Windows 網路連線"}, // WindowsNetwork
+    {L"Event details", L"事件詳細資訊"}, // EventDetails
+    {L"Volume mixer", L"音量混音器"}, // VolumeMixer
+    {L"Media playback", L"媒體播放"}, // MediaPlayback
+    {L"System sounds", L"系統音效"}, // SystemSounds
+    {L"Process ", L"處理程序 "}, // ProcessPrefix
+    {L"On", L"開啟"}, // On
+    {L"Off", L"關閉"}, // Off
+};
+static_assert(ARRAYSIZE(kLocalizedText) == static_cast<size_t>(OsdText::Count));
+std::atomic<int> g_displayLanguage{0}; // 0=Auto, 1=English, 2=zh-TW
+bool UseTraditionalChinese() {
+    const int selected = g_displayLanguage.load(std::memory_order_relaxed);
+    if (selected == 2) return true;
+    if (selected == 1) return false;
+    const LANGID lang = GetUserDefaultUILanguage();
+    if (PRIMARYLANGID(lang) != LANG_CHINESE) return false;
+    const WORD sublanguage = SUBLANGID(lang);
+    return sublanguage == SUBLANG_CHINESE_TRADITIONAL ||
+           sublanguage == SUBLANG_CHINESE_HONGKONG ||
+           sublanguage == SUBLANG_CHINESE_MACAU;
+}
+PCWSTR Tr(OsdText id) {
+    const size_t index = static_cast<size_t>(id);
+    if (index >= ARRAYSIZE(kLocalizedText)) return L"";
+    return UseTraditionalChinese() ? kLocalizedText[index].zhTw
+                                   : kLocalizedText[index].en;
+}
+
 std::atomic<bool> g_hideAllNativeOsd{false};
 std::atomic<bool> g_hide[static_cast<int>(Kind::Count)]{};
 std::atomic<bool> g_showCustomNative[static_cast<int>(Kind::Count)]{};
@@ -690,9 +831,28 @@ int g_fadeAlpha = 255;
 std::atomic<bool> g_closing{false};
 std::wstring g_noticeTitle;
 std::wstring g_noticeBody;
+enum class NoticeCategory { Usb, Bluetooth, Network };
+enum class NoticeAction { Connected, Disconnected, Removed, NetworkChanged };
+PCWSTR NoticeCategoryLabel(NoticeCategory category) {
+    switch (category) {
+        case NoticeCategory::Usb: return L"USB";
+        case NoticeCategory::Bluetooth: return Tr(OsdText::Bluetooth);
+        case NoticeCategory::Network: return Tr(OsdText::Network);
+    }
+    return L"";
+}
+PCWSTR NoticeActionLabel(NoticeAction action) {
+    switch (action) {
+        case NoticeAction::Connected: return Tr(OsdText::Connected);
+        case NoticeAction::Disconnected: return Tr(OsdText::Disconnected);
+        case NoticeAction::Removed: return Tr(OsdText::Removed);
+        case NoticeAction::NetworkChanged: return Tr(OsdText::NetworkChanged);
+    }
+    return L"";
+}
 struct NoticeBatch {
-    std::wstring category;
-    std::wstring action;
+    NoticeCategory category = NoticeCategory::Usb;
+    NoticeAction action = NoticeAction::Connected;
     std::vector<std::wstring> names;
     std::unordered_set<std::wstring> identities;
     bool pending = false;
@@ -848,6 +1008,12 @@ int ReadPositionSetting() {
 }
 
 void LoadSettings() {
+    PCWSTR selectedLanguage = Wh_GetStringSetting(L"displayLanguage");
+    const int chosen = selectedLanguage &&
+        _wcsicmp(selectedLanguage, L"zh-TW") == 0 ? 2 :
+        selectedLanguage && _wcsicmp(selectedLanguage, L"en") == 0 ? 1 : 0;
+    g_displayLanguage.store(chosen, std::memory_order_relaxed);
+    Wh_FreeStringSetting(selectedLanguage);
     g_hideAllNativeOsd.store(
         Wh_GetIntSetting(L"NativeHide.hideAllNativeOsd") != 0);
     constexpr PCWSTR names[] = {
@@ -2017,10 +2183,10 @@ void DrawNativeEvent(Gdiplus::Graphics& gfx) {
     std::wstring title, detail;
     switch (ev.kind) {
         case Kind::Keyboard: {
-            title = L"鍵盤背光";
+            title = Tr(OsdText::KeyboardBacklight);
             detail = ev.value >= 0 && ev.value <= 100
                 ? std::to_wstring(ev.value) + L"%" :
-                  L"等級 " + std::to_wstring(ev.value);
+                  std::wstring(Tr(OsdText::Level)) + std::to_wstring(ev.value);
             Gdiplus::GraphicsPath kb;
             AddRoundedRect(kb, 28.0f, 33.0f, 32.0f, 23.0f, 4.0f);
             gfx.DrawPath(&symbol, &kb);
@@ -2033,8 +2199,8 @@ void DrawNativeEvent(Gdiplus::Graphics& gfx) {
             break;
         }
         case Kind::Airplane:
-            title = L"飛航模式";
-            detail = ev.value ? L"已開啟" : L"已關閉";
+            title = Tr(OsdText::AirplaneMode);
+            detail = ev.value ? Tr(OsdText::Enabled) : Tr(OsdText::Disabled);
             gfx.DrawLine(&symbol, 30.0f, 55.0f, 57.0f, 31.0f);
             gfx.DrawLine(&symbol, 44.0f, 42.0f, 28.0f, 37.0f);
             gfx.DrawLine(&symbol, 44.0f, 42.0f, 54.0f, 58.0f);
@@ -2042,9 +2208,9 @@ void DrawNativeEvent(Gdiplus::Graphics& gfx) {
             break;
         case Kind::Camera: {
             const bool access = ev.variant == 1;
-            title = access ? L"相機存取權限" : L"相機";
-            detail = access ? (ev.value ? L"已允許" : L"已封鎖")
-                            : (ev.value ? L"已開啟" : L"已關閉");
+            title = access ? Tr(OsdText::CameraAccess) : Tr(OsdText::Camera);
+            detail = access ? (ev.value ? Tr(OsdText::Allowed) : Tr(OsdText::Blocked))
+                            : (ev.value ? Tr(OsdText::Enabled) : Tr(OsdText::Disabled));
             Gdiplus::GraphicsPath camera;
             AddRoundedRect(camera, 28.0f, 35.0f, 32.0f, 22.0f, 4.0f);
             gfx.DrawPath(&symbol, &camera);
@@ -2052,11 +2218,11 @@ void DrawNativeEvent(Gdiplus::Graphics& gfx) {
             break;
         }
         case Kind::Microphone: {
-            title = L"麥克風";
+            title = Tr(OsdText::Microphone);
             // The non-public API uses an integer state; do not invent device
             // state semantics for values other than conventional 0/1.
-            detail = ev.value == 0 ? L"已解除靜音" :
-                     ev.value == 1 ? L"已靜音" : L"狀態已變更";
+            detail = ev.value == 0 ? Tr(OsdText::Unmuted) :
+                     ev.value == 1 ? Tr(OsdText::Muted) : Tr(OsdText::StatusChanged);
             Gdiplus::GraphicsPath capsule;
             AddRoundedRect(capsule, 38.0f, 30.0f, 13.0f, 23.0f, 6.5f);
             gfx.DrawPath(&symbol, &capsule);
@@ -2068,8 +2234,8 @@ void DrawNativeEvent(Gdiplus::Graphics& gfx) {
             break;
         }
         case Kind::Desktop: {
-            title = L"虛擬桌面";
-            detail = ev.text.empty() ? L"桌面已切換" : ev.text;
+            title = Tr(OsdText::VirtualDesktop);
+            detail = ev.text.empty() ? Tr(OsdText::DesktopSwitched) : ev.text;
             Gdiplus::GraphicsPath desktop;
             AddRoundedRect(desktop, 27.0f, 33.0f, 34.0f, 24.0f, 3.0f);
             gfx.DrawPath(&symbol, &desktop);
@@ -2078,15 +2244,15 @@ void DrawNativeEvent(Gdiplus::Graphics& gfx) {
             break;
         }
         case Kind::Text:
-            title = L"系統提示";
-            detail = ev.text.empty() ? L"狀態已變更" : ev.text;
+            title = Tr(OsdText::SystemNotice);
+            detail = ev.text.empty() ? Tr(OsdText::StatusChanged) : ev.text;
             gfx.DrawLine(&symbol, 31.0f, 34.0f, 57.0f, 34.0f);
             gfx.DrawLine(&symbol, 44.0f, 34.0f, 44.0f, 59.0f);
             gfx.DrawLine(&symbol, 37.0f, 59.0f, 51.0f, 59.0f);
             break;
         default:
-            title = L"系統狀態";
-            detail = L"已變更";
+            title = Tr(OsdText::SystemStatus);
+            detail = Tr(OsdText::StatusChanged);
             break;
     }
     DrawText(gfx, title, 84.0f, 21.0f, 190.0f, 25.0f, 15.0f, fg);
@@ -2325,11 +2491,12 @@ void SetNoticeHitTesting(bool enabled) {
 }
 
 // Input is a single event group, not a new connection check or repeated poll.
-void AddNoticeEvent(std::wstring category, std::wstring action,
+void AddNoticeEvent(NoticeCategory category, NoticeAction action,
                     std::wstring identity, std::wstring label) {
     if (!g_receiveWnd || g_closing.load()) return;
     if (identity.empty()) identity = label;
-    if (label.empty()) label = category + L" 裝置";
+    if (label.empty()) label = std::wstring(NoticeCategoryLabel(category)) +
+        L" " + Tr(OsdText::Device);
     if (g_noticeBatch.pending &&
         (g_noticeBatch.category != category || g_noticeBatch.action != action))
         FlushNoticeBatch();
@@ -2361,14 +2528,15 @@ void FlushNoticeBatch() {
     std::wstring body;
     if (batch.names.size() == 1) {
         title = batch.names[0];
-        body = batch.action;
+        body = NoticeActionLabel(batch.action);
     } else {
-        title = batch.category + L" (" + std::to_wstring(batch.names.size()) +
-                L" 個) " + batch.action;
-        body = L"點擊查看詳細資訊";
+        title = std::wstring(NoticeCategoryLabel(batch.category)) + L" (" +
+                std::to_wstring(batch.names.size()) + L" " + Tr(OsdText::CountUnit) +
+                L") " + NoticeActionLabel(batch.action);
+        body = Tr(OsdText::ViewDetails);
     }
     ShowNotice(std::move(title), std::move(body),
-        batch.category == L"網路" ? DurationKind::Network : DurationKind::Devices);
+        batch.category == NoticeCategory::Network ? DurationKind::Network : DurationKind::Devices);
 }
 
 void ShowNotice(std::wstring title, std::wstring body, DurationKind kind) {
@@ -2389,13 +2557,13 @@ void ShowNotice(std::wstring title, std::wstring body, DurationKind kind) {
 void ProcessClipboard() {
     if (!g_showClipboardOsd.load()) return;
     if (!OpenClipboard(g_receiveWnd)) return;
-    std::wstring title = L"Clipboard", body = L"Content copied";
+    std::wstring title = Tr(OsdText::Clipboard), body = Tr(OsdText::ContentCopied);
     HBITMAP newThumbnail = nullptr;
     if (IsClipboardFormatAvailable(CF_BITMAP) ||
         IsClipboardFormatAvailable(CF_DIB) ||
         IsClipboardFormatAvailable(CF_DIBV5)) {
-        title = L"Image copied";
-        body = L"Clipboard image";
+        title = Tr(OsdText::ImageCopied);
+        body = Tr(OsdText::ClipboardImage);
         if (g_clipboardImagePreview.load()) {
             HBITMAP source = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
             BITMAP bm{};
@@ -2418,8 +2586,8 @@ void ProcessClipboard() {
             }
         }
     } else if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
-        title = L"Text copied";
-        body = L"Clipboard text";
+        title = Tr(OsdText::TextCopied);
+        body = Tr(OsdText::ClipboardText);
         if (g_clipboardTextPreview.load()) {
             HANDLE handle = GetClipboardData(CF_UNICODETEXT);
             SIZE_T cb = handle ? GlobalSize(handle) : 0;
@@ -2439,11 +2607,11 @@ void ProcessClipboard() {
                     GlobalUnlock(handle);
                 }
             }
-            if (body.empty()) body = L"Empty text";
+            if (body.empty()) body = Tr(OsdText::EmptyText);
         }
     } else if (IsClipboardFormatAvailable(CF_HDROP)) {
-        title = L"Files copied";
-        body = L"Clipboard file selection";
+        title = Tr(OsdText::FilesCopied);
+        body = Tr(OsdText::ClipboardFiles);
     }
     CloseClipboard();
     ClearClipboardThumbnail();
@@ -2574,10 +2742,10 @@ void StopDeviceEvents() {
 // preferred on removal. Interface descriptions are not physical-device IDs.
 std::wstring UsbDeviceLabel(const std::wstring& path) {
     HDEVINFO devices = SetupDiCreateDeviceInfoList(nullptr, nullptr);
-    if (devices == INVALID_HANDLE_VALUE) return L"USB 裝置";
+    if (devices == INVALID_HANDLE_VALUE) return Tr(OsdText::UsbDevice);
     SP_DEVICE_INTERFACE_DATA iface{};
     iface.cbSize = sizeof(iface);
-    std::wstring label = L"USB 裝置";
+    std::wstring label = Tr(OsdText::UsbDevice);
     if (SetupDiOpenDeviceInterfaceW(devices, path.c_str(), 0, &iface)) {
         SP_DEVINFO_DATA info{};
         info.cbSize = sizeof(info);
@@ -2610,7 +2778,7 @@ std::wstring BluetoothDeviceLabel(HANDLE radio, ULONGLONG address) {
                     std::min<size_t>(wcslen(info.szName), 80));
         }
     }
-    return L"藍牙裝置";
+    return Tr(OsdText::BluetoothDevice);
 }
 
 // Capture interface transitions on network-hint events. A connectivity hint
@@ -2637,7 +2805,7 @@ std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot() {
         if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
         NetInterfaceState state;
         state.connected = adapter->OperStatus == IfOperStatusUp;
-        state.name = adapter->FriendlyName ? adapter->FriendlyName : L"網路介面";
+        state.name = adapter->FriendlyName ? adapter->FriendlyName : Tr(OsdText::NetworkInterface);
         if (state.name.size() > 80) state.name.resize(80);
         out.emplace_back(adapter->AdapterName ? adapter->AdapterName : "",
                          std::move(state));
@@ -2653,7 +2821,8 @@ bool CaptureNetworkEvents() {
         auto previous = g_networkInterfaces.find(item.first);
         if (previous != g_networkInterfaces.end() &&
             previous->second.connected != item.second.connected) {
-            AddNoticeEvent(L"網路", item.second.connected ? L"已連接" : L"已中斷",
+            AddNoticeEvent(NoticeCategory::Network, item.second.connected ?
+                NoticeAction::Connected : NoticeAction::Disconnected,
                 std::wstring(item.first.begin(), item.first.end()), item.second.name);
             changed = true;
         }
@@ -2692,7 +2861,8 @@ bool HandleDeviceChange(WPARAM type, LPARAM value) {
         } else {
             g_usbNames.erase(path);
         }
-        AddNoticeEvent(L"USB", type == DBT_DEVICEARRIVAL ? L"已連接" : L"已移除",
+        AddNoticeEvent(NoticeCategory::Usb, type == DBT_DEVICEARRIVAL ?
+            NoticeAction::Connected : NoticeAction::Removed,
                        path, label);
         return true;
     }
@@ -2714,7 +2884,8 @@ bool HandleDeviceChange(WPARAM type, LPARAM value) {
             now - existing->second.when < 700) return true;
         if (g_btPrevious.size() >= 64) g_btPrevious.clear();
         g_btPrevious[address] = {connected, now};
-        AddNoticeEvent(L"藍牙", connected ? L"已連接" : L"已中斷",
+        AddNoticeEvent(NoticeCategory::Bluetooth, connected ?
+            NoticeAction::Connected : NoticeAction::Disconnected,
             std::to_wstring(address), BluetoothDeviceLabel(dev->dbch_handle, address));
         return true;
     }
@@ -3645,14 +3816,14 @@ DWORD WINAPI MediaThreadProc(void*) {
 
 // -- Interactive Core Audio session mixer, created/refreshed only on demand.
 std::wstring ProcessTitle(DWORD pid) {
-    if (!pid) return L"System sounds";
+    if (!pid) return Tr(OsdText::SystemSounds);
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!process) return L"Process " + std::to_wstring(pid);
+    if (!process) return std::wstring(Tr(OsdText::ProcessPrefix)) + std::to_wstring(pid);
     WCHAR path[MAX_PATH]{};
     DWORD length = ARRAYSIZE(path);
     bool ok = QueryFullProcessImageNameW(process, 0, path, &length) != FALSE;
     CloseHandle(process);
-    if (!ok) return L"Process " + std::to_wstring(pid);
+    if (!ok) return std::wstring(Tr(OsdText::ProcessPrefix)) + std::to_wstring(pid);
     std::wstring result(path);
     size_t slash = result.find_last_of(L"\\/");
     if (slash != std::wstring::npos) result = result.substr(slash + 1);
@@ -4182,7 +4353,7 @@ void DrawMediaPanel(Gdiplus::Graphics& gfx) {
         DrawText(gfx, L"♫", imgX, imgY, imgW, imgW,
                  32.0f * std::min(layout.contentScale, 1.35f), quiet, true);
     }
-    DrawText(gfx, g_mediaCurrent.title.empty() ? L"Media playback" :
+    DrawText(gfx, g_mediaCurrent.title.empty() ? Tr(OsdText::MediaPlayback) :
              g_mediaCurrent.title, layout.textX, layout.titleY, layout.textWidth,
              27.0f * layout.contentScale,
              16.0f * std::min(layout.contentScale, 1.35f), fg);
@@ -4289,7 +4460,7 @@ void DrawNoticeDetails(Gdiplus::Graphics& gfx) {
     const Gdiplus::Color fg = ToGdiColor(
         g_textMode.load() && g_validCustomText.load() ? g_customText.load()
         : (light ? 0x1C1C20 : 0xFAFAFB));
-    DrawText(gfx, L"事件詳細資訊", 16, 10, 290, 24, 15, fg);
+    DrawText(gfx, Tr(OsdText::EventDetails), 16, 10, 290, 24, 15, fg);
     const int visible = NoticeVisibleRows();
     const int maxStart = std::max<int>(0, static_cast<int>(g_noticeDetails.size()) - visible);
     g_noticeScroll = std::clamp(g_noticeScroll, 0, maxStart);
@@ -4322,7 +4493,7 @@ void DrawMixerPanel(Gdiplus::Graphics& gfx) {
     const Gdiplus::Color fg = ToGdiColor(textRgb);
     Gdiplus::SolidBrush track(ToGdiColor(trackRgb));
     Gdiplus::SolidBrush active(ToGdiColor(accentRgb));
-    DrawText(gfx, L"Volume mixer", horizontal ? 27.0f : 17.0f,
+    DrawText(gfx, Tr(OsdText::VolumeMixer), horizontal ? 27.0f : 17.0f,
              10.0f, width - 55.0f, 30.0f, 15.0f, fg);
     const int rows = MixerVisibleRows();
     const int total = static_cast<int>(g_mixerEntries.size()) + 1;
@@ -4698,7 +4869,7 @@ void DrawLockStatus(Gdiplus::Graphics& gfx) {
              key == 3 ? 12.0f : 21.0f,
              g_lastLockValue ? active : quiet, true);
     DrawText(gfx, names[key], 61, 14, 100, 22, 14, fg);
-    DrawText(gfx, g_lastLockValue ? L"On" : L"Off", 61, 35, 60, 18,
+    DrawText(gfx, g_lastLockValue ? Tr(OsdText::On) : Tr(OsdText::Off), 61, 35, 60, 18,
              12, quiet);
     Gdiplus::GraphicsPath progress;
     AddRoundedRect(progress, 61, 54, 96, 3, 1.5f);
@@ -4840,8 +5011,9 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!changed) {
                 const int level = static_cast<int>(wp);
                 const bool online = level >= 2;
-                AddNoticeEvent(L"網路", online ? L"連線狀態已變更" : L"已中斷",
-                               L"aggregate-connectivity", L"Windows 網路連線");
+                AddNoticeEvent(NoticeCategory::Network, online ?
+                               NoticeAction::NetworkChanged : NoticeAction::Disconnected,
+                               L"aggregate-connectivity", Tr(OsdText::WindowsNetwork));
             }
         }
         return 0;
@@ -5497,7 +5669,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD & Media v1.6.9 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD & Media v1.7.0 initialized (%s)", name);
     return TRUE;
 }
 
