@@ -279,6 +279,19 @@ v1.0.1 branch is unchanged.
 - Vertical layout, full-size progress fill clipping, DWM and production
   mod are untouched.
 
+## v1.0.13 — Symmetric inner gaps around horizontal volume track
+
+- The v1.0.12 screenshot shows nearly equal **outer** card-content margins
+  (about 26px on each side). Remaining imbalance is **inside** the card:
+  icon-to-track ~18px, track-to-number ~27px.
+- Move the horizontal track and its filled region/thumb right by 5 DIP:
+  `trackX = 68` (previously 63). Reduce `kTrackValueGap` by exactly
+  5 DIP to 4 (previously 9). Since their sum is unchanged, the **bar
+  length stays the same**, and its right endpoint moves along with it.
+- The number field, its 28-DIP right margin, vertical layout and the
+  underlying event/DWM systems remain untouched. This is a
+  screenshot-based optical correction pending Windhawk visual testing.
+
 ## Migration gates
 
 1. **Host viability:** Windows compilation, Island activation, show/hide, transparency behavior, DPI, multimonitor placement, nonactivation and clean unloading.
