@@ -44,19 +44,26 @@ Copyright (c) Reg Chen. GPL-3.0.
 // Windows headers define this macro; C++/WinRT's projection uses the name.
 #undef GetCurrentTime
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.UI.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
 // Declare the documented Win32 interop COM interface locally: some Windhawk
 // SDK configurations omit windows.ui.xaml.hosting.desktopwindowxamlsource.h.
-struct __declspec(uuid("3cbcf1bf-2f76-4e9c-96ab-e84b37972554"))
-IDesktopWindowXamlSourceNative : IUnknown {
+struct IDesktopWindowXamlSourceNative : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE AttachToWindow(HWND parentWnd) = 0;
     virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND* child) = 0;
 };
+
+// Windhawk Clang maps __declspec to GNU attributes and ignores uuid.
+// QueryInterface must use the explicit IID instead of __uuidof(local type).
+constexpr GUID kDesktopWindowXamlSourceNativeIID = {
+    0x3cbcf1bf, 0x2f76, 0x4e9c, {0x96, 0xab, 0xe8, 0x4b,
+                                   0x37, 0x97, 0x25, 0x54}};
 
 namespace wx = winrt::Windows::UI::Xaml;
 namespace controls = winrt::Windows::UI::Xaml::Controls;
@@ -248,7 +255,7 @@ DWORD WINAPI ProbeThreadProc(void*) {
                 // C++/WinRT projection metadata for this native interface.
                 auto* unknown = winrt::get_unknown(state.source);
                 winrt::check_hresult(unknown->QueryInterface(
-                    __uuidof(IDesktopWindowXamlSourceNative),
+                    kDesktopWindowXamlSourceNativeIID,
                     reinterpret_cast<void**>(interop.GetAddressOf())));
                 winrt::check_hresult(interop->AttachToWindow(state.host));
                 winrt::check_hresult(interop->get_WindowHandle(&state.island));
