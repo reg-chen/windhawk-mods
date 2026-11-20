@@ -2,7 +2,7 @@
 // @id              fluent-osd-media
 // @name            Fluent OSD & Media
 // @description     Fluent-style Windows 11 OSDs for volume, DDC/CI brightness, media controls, per-app audio mixer, lock keys, clipboard and device events.
-// @version         1.7.0
+// @version         1.7.1
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -153,325 +153,466 @@ trademarks remain the property of their respective owners.
 - NativeHide:
     - hideAllNativeOsd: false
       $name: Hide all supported Windows native OSDs
+      $name:zh-TW: 隱藏所有支援的 Windows 原生 OSD
       $description: Master override for all eight native OSD categories below. Custom Show switches remain independent; disabling this restores individual Hide choices.
+      $description:zh-TW: 優先控制下方八種 Windows 原生 OSD 的隱藏狀態。自訂顯示開關仍各自獨立；停用總開關後會恢復依個別隱藏設定判斷。
     - hideNativeVolume: false
       $name: Hide Windows volume OSD
+      $name:zh-TW: 隱藏 Windows 音量 OSD
     - hideNativeBrightness: false
       $name: Hide Windows native brightness OSD
+      $name:zh-TW: 隱藏 Windows 原生亮度 OSD
     - hideNativeKeyboardBrightness: false
       $name: Hide keyboard brightness OSD
+      $name:zh-TW: 隱藏鍵盤背光 OSD
     - hideNativeAirplane: false
       $name: Hide airplane mode OSD
+      $name:zh-TW: 隱藏飛航模式 OSD
     - hideNativeCamera: false
       $name: Hide camera OSD
+      $name:zh-TW: 隱藏相機 OSD
     - hideNativeMicrophone: false
       $name: Hide microphone OSD
+      $name:zh-TW: 隱藏麥克風 OSD
     - hideNativeText: false
       $name: Hide miscellaneous text OSD
+      $name:zh-TW: 隱藏其他系統文字 OSD
     - hideNativeVirtualDesktop: false
       $name: Hide virtual desktop name OSD
+      $name:zh-TW: 隱藏虛擬桌面名稱 OSD
   $name: 1. Windows native OSD — Hide switches
+  $name:zh-TW: 1. Windows 原生 OSD — 隱藏開關
   $description: All native Hide switches default to off. The master switch hides all supported native OSDs; individual switches apply independently when the master is off. Show custom switches never affect native visibility.
+  $description:zh-TW: 原生 OSD 隱藏開關預設全部關閉。總開關可隱藏所有支援類別；總開關關閉後，各項隱藏設定獨立生效。自訂 OSD 顯示開關不影響原生顯示。
 - CustomOSD:
     - Switches:
         - showCustomVolume: false
           $name: Show custom Windows volume OSD
+          $name:zh-TW: 顯示自訂 Windows 音量 OSD
           $description: The only switch that enables the custom Windows volume indicator. Media card, mixer arrow, and vertical layout only customize it and never enable it implicitly.
+          $description:zh-TW: 只有此開關會啟用自訂 Windows 音量提示。媒體卡片、混音器箭頭及垂直版面只調整外觀，不會間接啟用音量 OSD。
         - showCustomBrightness: false
           $name: Show custom Windows brightness OSD
+          $name:zh-TW: 顯示自訂 Windows 亮度 OSD
           $description: Enabled only by this switch; vertical layout changes appearance without enabling it implicitly.
+          $description:zh-TW: 只有此開關會啟用自訂 Windows 亮度提示；垂直版面僅改變呈現方式，不會間接啟用。
         - showCustomKeyboardBrightness: false
           $name: Show custom keyboard backlight OSD
+          $name:zh-TW: 顯示自訂鍵盤背光 OSD
         - showCustomAirplane: false
           $name: Show custom airplane mode OSD
+          $name:zh-TW: 顯示自訂飛航模式 OSD
         - showCustomCamera: false
           $name: Show custom camera OSD
+          $name:zh-TW: 顯示自訂相機 OSD
           $description: Includes camera use and camera access state; labels distinguish the two.
+          $description:zh-TW: 包含相機使用狀態與相機存取權限，兩種情況會顯示不同文字。
         - showCustomMicrophone: false
           $name: Show custom microphone mute OSD
+          $name:zh-TW: 顯示自訂麥克風靜音 OSD
         - showCustomText: false
           $name: Show custom miscellaneous text OSD
+          $name:zh-TW: 顯示自訂其他系統文字 OSD
         - showCustomVirtualDesktop: false
           $name: Show custom virtual desktop name OSD
+          $name:zh-TW: 顯示自訂虛擬桌面名稱 OSD
           $description: Shows the text provided by Windows when available; desktop routing is best effort and depends on shell symbols.
+          $description:zh-TW: 可用時顯示 Windows 提供的文字；虛擬桌面事件的對應屬盡力支援，取決於 Shell 內部符號。
         - showDdcBrightness: true
           $name: Show custom DDC/CI brightness OSD
+          $name:zh-TW: 顯示自訂 DDC/CI 亮度 OSD
           $description: Independent of Windows native brightness Hide. Enabled by default for existing DDC/CI functionality.
+          $description:zh-TW: 與隱藏 Windows 原生亮度 OSD 相互獨立。預設啟用以保留既有 DDC/CI 功能。
         - showSmtcOnVolume: true
           $name: Show SMTC media card on volume change
+          $name:zh-TW: 音量變更時顯示 SMTC 媒體卡片
           $description: Show playing media title, artist, artwork and controls beside the volume OSD, if the player provides SMTC data.
+          $description:zh-TW: 若播放器有提供 SMTC 資料，音量 OSD 旁會顯示歌曲名稱、演出者、專輯圖片與播放控制。
         - showVolumeMixerArrow: true
           $name: Show per-app volume mixer expand arrow
+          $name:zh-TW: 顯示各程式音量混音器展開箭頭
           $description: Click the arrow to adjust Core Audio session volumes in an interactive popup.
+          $description:zh-TW: 點擊箭頭以展開互動式面板，調整個別 Core Audio 工作階段音量。
         - showCapsLockOsd: true
           $name: Show custom Caps Lock OSD
+          $name:zh-TW: 顯示自訂 Caps Lock OSD
         - showNumLockOsd: true
           $name: Show custom Num Lock OSD
+          $name:zh-TW: 顯示自訂 Num Lock OSD
         - showScrollLockOsd: true
           $name: Show custom Scroll Lock OSD
+          $name:zh-TW: 顯示自訂 Scroll Lock OSD
         - showInsertOsd: false
           $name: Show custom Insert OSD
+          $name:zh-TW: 顯示自訂 Insert OSD
           $description: Insert state is not a system-wide toggle on every application; this indicator tracks its key presses only.
+          $description:zh-TW: 並非所有應用程式都將 Insert 視為全系統切換狀態；此提示僅追蹤按鍵動作。
         - showClipboardOsd: false
           $name: Show clipboard OSD (opt-in)
+          $name:zh-TW: 顯示剪貼簿 OSD（需自行啟用）
           $description: Disabled by default for privacy. Only processes clipboard updates after you enable it.
+          $description:zh-TW: 考量隱私，預設關閉。只有啟用後才會處理剪貼簿更新。
         - showUsbEvents: false
           $name: Show USB connection/disconnection OSD
+          $name:zh-TW: 顯示 USB 連接／移除 OSD
           $description: USB device-interface arrivals/removals; multiple interfaces from one physical device are coalesced.
+          $description:zh-TW: 監聽 USB 裝置介面新增與移除事件；同一實體裝置的多個介面事件會合併。
         - showBluetoothEvents: false
           $name: Show Bluetooth connection OSD (Classic HCI)
+          $name:zh-TW: 顯示藍牙連線 OSD（傳統藍牙 HCI）
           $description: Bluetooth radio HCI ACL link events; may not cover BLE logical/device profile connections.
+          $description:zh-TW: 監聽藍牙無線電 HCI ACL 連線事件；未必涵蓋 BLE 邏輯連線或裝置 Profile 連線。
         - showNetworkEvents: false
           $name: Show network connectivity OSD
+          $name:zh-TW: 顯示網路連線狀態 OSD
           $description: Windows aggregate connectivity hints, not ping or per-VPN connectivity verification.
+          $description:zh-TW: 顯示 Windows 彙總網路連線提示，不執行 Ping，也不個別驗證 VPN 連線。
       $name: Individual OSD switches
+      $name:zh-TW: 各項 OSD 開關
     - AudioAndMedia:
         - showMediaArtwork: true
           $name: Show SMTC thumbnail
+          $name:zh-TW: 顯示 SMTC 專輯縮圖
         - showMediaControls: true
           $name: Show previous / play-pause / next buttons
+          $name:zh-TW: 顯示上一首／播放暫停／下一首按鈕
         - mediaControlSizePercent: 125
           $name: SMTC playback button size (%)
+          $name:zh-TW: SMTC 播放控制按鈕大小（%）
           $description: Scales both the button circles and their icons, default 125%. Mouse hit regions follow the drawn buttons.
+          $description:zh-TW: 同步縮放按鈕圓形與圖示，預設 125%；滑鼠點擊範圍隨顯示大小調整。
           #! $min: 90
           #! $max: 135
           #! $format: slider
         - mixerMaxRows: 6
           $name: Visible mixer rows
+          $name:zh-TW: 混音器可見列數
           #! $min: 3
           #! $max: 16
           #! $format: slider
       $name: Media and audio mixer
+      $name:zh-TW: 媒體與音量混音器
     - ClipboardAndDevices:
         - clipboardTextPreview: false
           $name: Show copied text excerpt
+          $name:zh-TW: 顯示複製文字摘要
           $description: May expose passwords and private text on screen. Disabled by default.
+          $description:zh-TW: 可能在畫面上顯露密碼及私人文字，預設關閉。
         - clipboardImagePreview: true
           $name: Show copied image thumbnail
+          $name:zh-TW: 顯示複製圖片縮圖
           $description: Displays a larger image-first preview fitted to available space without distortion; currently requires a usable bitmap clipboard format.
+          $description:zh-TW: 將圖片依可用空間等比縮放為較大的預覽，不會拉伸變形；目前需有可用的位圖剪貼簿格式。
         - clipboardMaxChars: 48
           $name: Maximum copied-text preview characters
+          $name:zh-TW: 複製文字預覽的最大字數
           #! $min: 12
           #! $max: 100
       $name: Clipboard and device event details
+      $name:zh-TW: 剪貼簿與裝置事件詳情
     - BrightnessSources:
         - ddcFromExplorer: true
           $name: Monitor Taskbar Scroll Actions (explorer.exe)
+          $name:zh-TW: 監聽 Taskbar Scroll Actions（explorer.exe）
         - ddcFromTwinkle: true
           $name: Monitor Twinkle Tray
+          $name:zh-TW: 監聽 Twinkle Tray
         - ddcVcpCode: 16
           $name: Brightness VCP code (decimal; default 16 = 0x10)
+          $name:zh-TW: 亮度 VCP 代碼（十進位；預設 16 = 0x10）
       $name: DDC/CI sources
+      $name:zh-TW: DDC/CI 事件來源
     - Appearance:
         - ddcTheme: system
           $name: Custom OSD theme
+          $name:zh-TW: 自訂 OSD 主題
           $options:
           - system: Follow Windows app theme
           - light: Light
           - dark: Dark
+          $options:zh-TW:
+          - system: 跟隨 Windows 應用程式主題
+          - light: 淺色
+          - dark: 深色
         - ddcBorderless: true
           $name: Borderless DDC/CI OSD (no outline or shadow)
+          $name:zh-TW: 無邊框 DDC/CI OSD（無外框或陰影）
           $description: Matches the border/shadow behavior of Notification Center Styler's Borderless theme. Only this custom OSD is affected; no automatic cross-mod theme sync.
+          $description:zh-TW: 外框／陰影行為參考 Notification Center Styler 的 Borderless 主題。只影響此自訂 OSD，不會自動與其他 Mod 同步主題。
         - ddcAccentMode: system
           $name: Progress bar color source
+          $name:zh-TW: 進度條顏色來源
           $options:
           - system: Windows system accent color (automatic)
           - custom: Custom color
+          $options:zh-TW:
+          - system: Windows 系統強調色（自動）
+          - custom: 自訂顏色
         - ddcCustomAccent: "#B97DFF"
           $name: Custom progress color (#RRGGBB)
+          $name:zh-TW: 自訂進度顏色（#RRGGBB）
           $description: Used only when Progress bar color source = Custom. Invalid hex falls back to system accent.
+          $description:zh-TW: 只有進度條顏色來源設為自訂時才使用。無效的十六進位色碼會回退至系統強調色。
           #! $showIf: {ddcAccentMode: custom}
           #! $format: colorRgb
         - ddcBackgroundMode: system
           $name: Background color source
+          $name:zh-TW: 背景顏色來源
           $options:
           - system: Follow light/dark theme
           - custom: Custom color
+          $options:zh-TW:
+          - system: 跟隨淺色／深色主題
+          - custom: 自訂顏色
         - ddcCustomBackground: "#28282C"
           $name: Custom background color (#RRGGBB)
+          $name:zh-TW: 自訂背景顏色（#RRGGBB）
           #! $showIf: {ddcBackgroundMode: custom}
           #! $format: colorRgb
         - ddcTextMode: system
           $name: Text and icon color (Light theme defaults to dark text)
+          $name:zh-TW: 文字及圖示顏色（淺色主題預設使用深色文字）
           $options:
           - system: Follow light/dark theme
           - custom: Custom color
+          $options:zh-TW:
+          - system: 跟隨淺色／深色主題
+          - custom: 自訂顏色
         - ddcCustomText: "#FAFAFA"
           $name: Custom text and icon color (#RRGGBB)
+          $name:zh-TW: 自訂文字及圖示顏色（#RRGGBB）
           #! $showIf: {ddcTextMode: custom}
           #! $format: colorRgb
         - ddcTrackMode: system
           $name: Progress track color
+          $name:zh-TW: 進度軌道顏色
           $options:
           - system: Follow light/dark theme
           - custom: Custom color
+          $options:zh-TW:
+          - system: 跟隨淺色／深色主題
+          - custom: 自訂顏色
         - ddcCustomTrack: "#5A5A60"
           $name: Custom track color (#RRGGBB)
+          $name:zh-TW: 自訂軌道顏色（#RRGGBB）
           #! $showIf: {ddcTrackMode: custom}
           #! $format: colorRgb
         - ddcBackgroundOpacity: 96
           $name: Background opacity (%)
+          $name:zh-TW: 背景不透明度（%）
           #! $min: 0
           #! $max: 100
           #! $format: slider
         - ddcCornerRadius: 17
           $name: Card corner radius (logical px)
+          $name:zh-TW: 卡片圓角半徑（邏輯像素）
           #! $min: 0
           #! $max: 34
           #! $format: slider
         - ddcBarThickness: 8
           $name: Bar thickness (logical px)
+          $name:zh-TW: 進度條厚度（邏輯像素）
           #! $min: 2
           #! $max: 18
           #! $format: slider
         - ddcThumbDiameter: 11
           $name: Thumb diameter (0 = hidden)
+          $name:zh-TW: 滑塊直徑（0 = 隱藏）
           #! $min: 0
           #! $max: 20
           #! $format: slider
         - ddcFontSize: 15
           $name: Value font size (logical px)
+          $name:zh-TW: 數值字體大小（邏輯像素）
           #! $min: 10
           #! $max: 24
           #! $format: slider
         - ddcIconSize: 16
           $name: Vertical OSD icon size (logical px)
+          $name:zh-TW: 垂直 OSD 圖示大小（邏輯像素）
           $description: Same bounding box for the speaker and sun icons. Defaults to a compact 16px before DPI and overall size scaling.
+          $description:zh-TW: 喇叭與太陽圖示共用相同的邊界尺寸；預設為套用 DPI 與整體縮放前的 16 像素。
           #! $min: 10
           #! $max: 24
           #! $format: slider
         - ddcIconStrokeWidth: 2
           $name: Vertical OSD icon stroke width (logical px)
+          $name:zh-TW: 垂直 OSD 圖示線條粗細（邏輯像素）
           $description: One stroke width is shared by both icon types, independent of speaker volume level.
+          $description:zh-TW: 兩類圖示共用線條粗細設定，不受喇叭音量大小影響。
           #! $min: 1
           #! $max: 3
           #! $format: slider
         - ddcShowSun: true
           $name: Show sun icon
+          $name:zh-TW: 顯示太陽圖示
         - ddcShowValue: true
           $name: Show brightness value
+          $name:zh-TW: 顯示亮度數值
         - ddcInnerPadding: 14
           $name: Vertical OSD interior padding (logical px)
+          $name:zh-TW: 垂直 OSD 內容內距（邏輯像素）
           #! $min: 6
           #! $max: 22
           #! $format: slider
       $name: Fluent appearance
+      $name:zh-TW: Fluent 外觀
     - Timing:
         - globalDurationMs: 3000
           $name: Global OSD visibility (ms)
+          $name:zh-TW: 全域 OSD 顯示時間（毫秒）
           $description: Shared by every custom OSD, unless individual durations are enabled. The fade animation is configured separately.
+          $description:zh-TW: 除非啟用個別顯示時間，否則所有自訂 OSD 共用此值。淡入淡出動畫時間另行設定。
           #! $min: 500
           #! $max: 20000
         - individualDurations: false
           $name: Override individual OSD durations
+          $name:zh-TW: 個別設定各 OSD 顯示時間
           $description: Disabled by default. Turn on to configure the categories below; otherwise every category inherits the global duration.
+          $description:zh-TW: 預設停用。啟用後可分別設定下方各類別的時間；否則都沿用全域時間。
         - volumeDurationMs: 1250
           $name: Volume without SMTC (ms)
+          $name:zh-TW: 無 SMTC 的音量 OSD（毫秒）
           #! $showIf: {individualDurations: true}
           #! $min: 500
           #! $max: 20000
         - mediaDurationMs: 4000
           $name: Volume with SMTC media (ms)
+          $name:zh-TW: 包含 SMTC 媒體的音量 OSD（毫秒）
           #! $showIf: {individualDurations: true}
           #! $min: 500
           #! $max: 20000
         - nativeBrightnessDurationMs: 1250
           $name: Windows brightness (ms)
+          $name:zh-TW: Windows 亮度（毫秒）
           #! $showIf: {individualDurations: true}
           #! $min: 500
           #! $max: 20000
         - ddcBrightnessDurationMs: 1250
           $name: DDC/CI brightness (ms)
+          $name:zh-TW: DDC/CI 亮度（毫秒）
           #! $showIf: {individualDurations: true}
           #! $min: 500
           #! $max: 20000
         - nativeEventDurationMs: 1250
           $name: Other Windows native OSD replacements (ms)
+          $name:zh-TW: 其他 Windows 原生 OSD 替代提示（毫秒）
           #! $showIf: {individualDurations: true}
           #! $min: 500
           #! $max: 20000
         - lockDurationMs: 1250
           $name: Caps / Num / Scroll / Insert (ms)
+          $name:zh-TW: Caps／Num／Scroll／Insert（毫秒）
           #! $showIf: {individualDurations: true}
           #! $min: 500
           #! $max: 20000
         - clipboardDurationMs: 2100
           $name: Clipboard notification (ms)
+          $name:zh-TW: 剪貼簿通知（毫秒）
           #! $showIf: {individualDurations: true}
           #! $min: 500
           #! $max: 20000
         - deviceDurationMs: 2100
           $name: USB and Bluetooth notifications (ms)
+          $name:zh-TW: USB 與藍牙通知（毫秒）
           #! $showIf: {individualDurations: true}
           #! $min: 500
           #! $max: 20000
         - networkDurationMs: 2100
           $name: Network notification (ms)
+          $name:zh-TW: 網路通知（毫秒）
           #! $showIf: {individualDurations: true}
           #! $min: 500
           #! $max: 20000
         - interactiveDurationMs: 8000
           $name: Expanded Mixer / media / details (ms)
+          $name:zh-TW: 展開的混音器／媒體／詳情（毫秒）
           $description: Inactivity timeout after an interactive action. While hovering an interactive panel, auto-hide is paused and restarts on mouse leave.
+          $description:zh-TW: 互動後的閒置逾時。滑鼠停留在互動面板上會暫停自動隱藏，移出後重新計時。
           #! $showIf: {individualDurations: true}
           #! $min: 500
           #! $max: 20000
       $name: OSD timing
+      $name:zh-TW: OSD 顯示時間
     - MainOSDSize:
             - horizontalOsdWidth: 336
               $name: Horizontal OSD width (logical px)
+              $name:zh-TW: 水平 OSD 寬度（邏輯像素）
               $description: Main volume and brightness OSD canvas width. SMTC and Mixer inherit this width in horizontal layout.
+              $description:zh-TW: 主音量及亮度 OSD 的畫布寬度；在水平版面中，SMTC 與混音器繼承此寬度。
               #! $min: 300
               #! $max: 650
             - horizontalOsdHeight: 92
               $name: Horizontal OSD height (logical px)
+              $name:zh-TW: 水平 OSD 高度（邏輯像素）
               $description: Main volume and brightness OSD canvas height. SMTC and Mixer use an independently adjustable expanded height.
+              $description:zh-TW: 主音量及亮度 OSD 的畫布高度；SMTC 與混音器使用獨立可調的展開高度。
               #! $min: 80
               #! $max: 220
             - verticalOsdWidth: 72
               $name: Vertical OSD width (logical px)
+              $name:zh-TW: 垂直 OSD 寬度（邏輯像素）
               $description: Main volume and brightness OSD canvas width. Expanded SMTC and Mixer use an independent width.
+              $description:zh-TW: 主音量及亮度 OSD 的畫布寬度；垂直版面的 SMTC 與混音器使用獨立寬度。
               #! $min: 72
               #! $max: 180
             - verticalOsdHeight: 176
               $name: Vertical OSD height (logical px)
+              $name:zh-TW: 垂直 OSD 高度（邏輯像素）
               $description: Main volume and brightness OSD canvas height. SMTC and Mixer inherit this height in vertical layout.
+              $description:zh-TW: 主音量及亮度 OSD 的畫布高度；垂直版面的 SMTC 與混音器繼承此高度。
               #! $min: 160
               #! $max: 430
       $name: Main OSD dimensions
+      $name:zh-TW: 主 OSD 尺寸
     - ExpandedPanelSize:
             - horizontalSmtcHeight: 176
               $name: Horizontal SMTC height (logical px)
+              $name:zh-TW: 水平 SMTC 高度（邏輯像素）
               $description: SMTC width inherits horizontal main OSD width; only its height is independent.
+              $description:zh-TW: SMTC 繼承水平主 OSD 寬度，只有高度獨立設定。
               #! $min: 176
               #! $max: 480
             - horizontalMixerHeight: 176
               $name: Horizontal Mixer height (logical px)
+              $name:zh-TW: 水平混音器高度（邏輯像素）
               $description: Mixer width inherits horizontal main OSD width; only its height is independent.
+              $description:zh-TW: 混音器繼承水平主 OSD 寬度，只有高度獨立設定。
               #! $min: 176
               #! $max: 480
             - verticalSmtcWidth: 340
               $name: Vertical SMTC width (logical px)
+              $name:zh-TW: 垂直 SMTC 寬度（邏輯像素）
               $description: SMTC height inherits vertical main OSD height; only its width is independent.
+              $description:zh-TW: SMTC 繼承垂直主 OSD 高度，只有寬度獨立設定。
               #! $min: 300
               #! $max: 650
             - verticalMixerWidth: 340
               $name: Vertical Mixer width (logical px)
+              $name:zh-TW: 垂直混音器寬度（邏輯像素）
               $description: Mixer height inherits vertical main OSD height; only its width is independent.
+              $description:zh-TW: 混音器繼承垂直主 OSD 高度，只有寬度獨立設定。
               #! $min: 300
               #! $max: 650
       $name: SMTC / Mixer dimensions
+      $name:zh-TW: SMTC／混音器尺寸
     - Layout:
         - verticalVolumeBrightness: false
           $name: Use vertical volume and brightness layout
+          $name:zh-TW: 使用垂直音量與亮度版面
           $description: Layout only; it does not enable Windows custom volume or brightness OSDs. Other native-event replacements retain compact icon-and-state cards.
+          $description:zh-TW: 此選項只改變版面，不會啟用自訂 Windows 音量或亮度 OSD。其他原生事件的自訂提示仍維持精簡圖示及狀態卡片。
         - fadeOsd: true
           $name: Enable custom OSD fade animation
+          $name:zh-TW: 啟用自訂 OSD 淡入淡出動畫
         - ddcSizePercent: 75
           $name: Custom OSD size (%)
+          $name:zh-TW: 自訂 OSD 大小（%）
           $description: Overall uniform scale applied after the configurable logical width/height and monitor DPI. Does not change the aspect ratio of either layout.
+          $description:zh-TW: 在可設定的邏輯寬高及螢幕 DPI 之後套用整體等比縮放，不會改變任何版面的長寬比例。
         - ddcPosition: bottomCenter
           $name: OSD position
+          $name:zh-TW: OSD 位置
           $options:
           - topLeft: Top left
           - topCenter: Top center
@@ -482,21 +623,37 @@ trademarks remain the property of their respective owners.
           - bottomLeft: Bottom left
           - bottomCenter: Bottom center (default)
           - bottomRight: Bottom right
+          $options:zh-TW:
+          - topLeft: 左上
+          - topCenter: 上方中央
+          - topRight: 右上
+          - centerLeft: 左側中央
+          - center: 中央
+          - centerRight: 右側中央
+          - bottomLeft: 左下
+          - bottomCenter: 下方中央（預設）
+          - bottomRight: 右下
         - ddcOffsetX: 0
           $name: Horizontal offset (logical px, right positive)
+          $name:zh-TW: 水平位移（邏輯像素；向右為正）
           #! $min: -500
           #! $max: 500
         - ddcOffsetY: 0
           $name: Vertical offset (logical px, down positive)
+          $name:zh-TW: 垂直位移（邏輯像素；向下為正）
           #! $min: -500
           #! $max: 500
         - fadeDurationMs: 160
           $name: Fade duration (ms)
+          $name:zh-TW: 淡入淡出時間（毫秒）
           #! $min: 60
           #! $max: 450
       $name: Position and size
+      $name:zh-TW: 位置與大小
   $name: 2. Custom OSD
+  $name:zh-TW: 2. 自訂 OSD
   $description: A Show switch controls only its own custom flyout. Native visibility is controlled exclusively by the native Hide switches above; when Hide is off and Show is on, both native and custom OSDs will appear.
+  $description:zh-TW: 每個顯示開關只控制對應的自訂提示；原生提示則完全由上方的隱藏開關管理。隱藏關閉、顯示開啟時，原生與自訂提示會同時出現。
 */
 // ==/WindhawkModSettings==
 
@@ -5669,7 +5826,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD & Media v1.7.0 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD & Media v1.7.1 initialized (%s)", name);
     return TRUE;
 }
 
