@@ -2,7 +2,7 @@
 // @id              fluent-osd-media
 // @name            Fluent OSD & Media
 // @description     Fluent-style Windows 11 OSDs for volume, DDC/CI brightness, media controls, per-app audio mixer, lock keys, clipboard and device events.
-// @version         1.7.6
+// @version         1.7.7
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -65,8 +65,11 @@ indicators may require different display positions.
 - **Clipboard (opt-in):** Shortened text or image-first preview. Text previews
   are separately configurable; bitmap support depends on the data format.
 - **USB:** Device-interface arrival/removal, with available friendly names.
-- **Bluetooth:** Classic Bluetooth ACL connection/disconnection events.
-  BLE HID mice/keyboards are not covered; BLE monitoring is deferred.
+- **Bluetooth (opt-in):** Windows DeviceWatcher observes paired Classic
+  and Bluetooth LE association endpoints, including supported HID mice
+  and keyboards. Uses AEP IsConnected transitions without GATT scanning
+  or hand-written WinRT ABI. Some devices/drivers do not publish every
+  sleep/disconnect transition; pairing alone is not a connection.
 - **Network:** Windows connectivity-hint and interface-state changes, which
   do not independently establish Internet access or VPN/SSID identity.
 
@@ -251,29 +254,29 @@ trademarks remain the property of their respective owners.
           $name:zh-TW: 顯示自訂虛擬桌面名稱 OSD
           $description: Shows the text provided by Windows when available; desktop routing is best effort and depends on shell symbols.
           $description:zh-TW: 可用時顯示 Windows 提供的文字；虛擬桌面事件的對應屬盡力支援，取決於 Shell 內部符號。
-        - showDdcBrightness: true
+        - showDdcBrightness: false
           $name: Show custom DDC/CI brightness OSD
           $name:zh-TW: 顯示自訂 DDC/CI 亮度 OSD
-          $description: Independent of Windows native brightness Hide. Enabled by default for existing DDC/CI functionality.
-          $description:zh-TW: 與隱藏 Windows 原生亮度 OSD 相互獨立。預設啟用以保留既有 DDC/CI 功能。
-        - showSmtcOnVolume: true
+          $description: Independent of Windows native brightness Hide. Disabled by default; enable this switch to show DDC/CI brightness changes.
+          $description:zh-TW: 與隱藏 Windows 原生亮度 OSD 相互獨立。預設關閉；啟用後才顯示 DDC/CI 亮度變更提示。
+        - showSmtcOnVolume: false
           $name: Show SMTC media card on volume change
           $name:zh-TW: 音量變更時顯示 SMTC 媒體卡片
           $description: Show playing media title, artist, artwork and controls beside the volume OSD, if the player provides SMTC data.
           $description:zh-TW: 若播放器有提供 SMTC 資料，音量 OSD 旁會顯示歌曲名稱、演出者、專輯圖片與播放控制。
-        - showVolumeMixerArrow: true
+        - showVolumeMixerArrow: false
           $name: Show per-app volume mixer expand arrow
           $name:zh-TW: 顯示各程式音量混音器展開箭頭
           $description: Click the arrow to adjust Core Audio session volumes in an interactive popup.
           $description:zh-TW: 點擊箭頭以展開互動式面板，調整個別 Core Audio 工作階段音量。
         - LockKeys:
-            - showCapsLockOsd: true
+            - showCapsLockOsd: false
               $name: Show custom Caps Lock OSD
               $name:zh-TW: 顯示自訂 Caps Lock OSD
-            - showNumLockOsd: true
+            - showNumLockOsd: false
               $name: Show custom Num Lock OSD
               $name:zh-TW: 顯示自訂 Num Lock OSD
-            - showScrollLockOsd: true
+            - showScrollLockOsd: false
               $name: Show custom Scroll Lock OSD
               $name:zh-TW: 顯示自訂 Scroll Lock OSD
             - showInsertOsd: false
@@ -294,10 +297,10 @@ trademarks remain the property of their respective owners.
           $description: USB device-interface arrivals/removals; multiple interfaces from one physical device are coalesced.
           $description:zh-TW: 監聽 USB 裝置介面新增與移除事件；同一實體裝置的多個介面事件會合併。
         - showBluetoothEvents: false
-          $name: Show Bluetooth connection OSD (Classic HCI)
-          $name:zh-TW: 顯示藍牙連線 OSD（傳統藍牙 HCI）
-          $description: Bluetooth radio HCI ACL link events; may not cover BLE logical/device profile connections.
-          $description:zh-TW: 監聽藍牙無線電 HCI ACL 連線事件；未必涵蓋 BLE 邏輯連線或裝置 Profile 連線。
+          $name: Show Bluetooth connection OSD (Classic + LE)
+          $name:zh-TW: 顯示藍牙連線 OSD（傳統藍牙及 BLE）
+          $description: Monitors paired Bluetooth Classic and LE devices through Windows association-endpoint IsConnected changes. Device/driver support varies.
+          $description:zh-TW: 透過 Windows 配對裝置端點的 IsConnected 狀態監聽傳統藍牙與 BLE；實際通知取決於裝置及驅動程式。
         - showNetworkEvents: false
           $name: Show network connectivity OSD
           $name:zh-TW: 顯示網路連線狀態 OSD
@@ -312,11 +315,11 @@ trademarks remain the property of their respective owners.
         - showMediaControls: true
           $name: Show previous / play-pause / next buttons
           $name:zh-TW: 顯示上一首／播放暫停／下一首按鈕
-        - mediaControlSizePercent: 125
+        - mediaControlSizePercent: 100
           $name: SMTC playback button size (%)
           $name:zh-TW: SMTC 播放控制按鈕大小（%）
-          $description: Scales both the button circles and their icons, default 125%. Mouse hit regions follow the drawn buttons.
-          $description:zh-TW: 同步縮放按鈕圓形與圖示，預設 125%；滑鼠點擊範圍隨顯示大小調整。
+          $description: Scales both the button circles and their icons, default 100%. Mouse hit regions follow the drawn buttons.
+          $description:zh-TW: 同步縮放按鈕圓形與圖示，預設 100%；滑鼠點擊範圍隨顯示大小調整。
           #! $min: 90
           #! $max: 135
           #! $format: slider
@@ -571,14 +574,14 @@ trademarks remain the property of their respective owners.
       $name: OSD timing
       $name:zh-TW: OSD 顯示時間
     - MainOSDSize:
-            - horizontalOsdWidth: 336
+            - horizontalOsdWidth: 380
               $name: Horizontal OSD width (logical px)
               $name:zh-TW: 水平 OSD 寬度（邏輯像素）
               $description: Main volume and brightness OSD canvas width. SMTC and Mixer inherit this width in horizontal layout.
               $description:zh-TW: 主音量及亮度 OSD 的畫布寬度；在水平版面中，SMTC 與混音器繼承此寬度。
               #! $min: 300
               #! $max: 650
-            - horizontalOsdHeight: 92
+            - horizontalOsdHeight: 72
               $name: Horizontal OSD height (logical px)
               $name:zh-TW: 水平 OSD 高度（邏輯像素）
               $description: Main volume and brightness OSD canvas height. SMTC and Mixer use an independently adjustable expanded height.
@@ -592,7 +595,7 @@ trademarks remain the property of their respective owners.
               $description:zh-TW: 主音量及亮度 OSD 的畫布寬度；垂直版面的 SMTC 與混音器使用獨立寬度。
               #! $min: 72
               #! $max: 180
-            - verticalOsdHeight: 176
+            - verticalOsdHeight: 200
               $name: Vertical OSD height (logical px)
               $name:zh-TW: 垂直 OSD 高度（邏輯像素）
               $description: Main volume and brightness OSD canvas height. SMTC and Mixer inherit this height in vertical layout.
@@ -602,28 +605,28 @@ trademarks remain the property of their respective owners.
       $name: Main OSD dimensions
       $name:zh-TW: 主 OSD 尺寸
     - ExpandedPanelSize:
-            - horizontalSmtcHeight: 176
+            - horizontalSmtcHeight: 200
               $name: Horizontal SMTC height (logical px)
               $name:zh-TW: 水平 SMTC 高度（邏輯像素）
               $description: SMTC width inherits horizontal main OSD width; only its height is independent.
               $description:zh-TW: SMTC 繼承水平主 OSD 寬度，只有高度獨立設定。
               #! $min: 176
               #! $max: 480
-            - horizontalMixerHeight: 176
+            - horizontalMixerHeight: 200
               $name: Horizontal Mixer height (logical px)
               $name:zh-TW: 水平混音器高度（邏輯像素）
               $description: Mixer width inherits horizontal main OSD width; only its height is independent.
               $description:zh-TW: 混音器繼承水平主 OSD 寬度，只有高度獨立設定。
               #! $min: 176
               #! $max: 480
-            - verticalSmtcWidth: 340
+            - verticalSmtcWidth: 380
               $name: Vertical SMTC width (logical px)
               $name:zh-TW: 垂直 SMTC 寬度（邏輯像素）
               $description: SMTC height inherits vertical main OSD height; only its width is independent.
               $description:zh-TW: SMTC 繼承垂直主 OSD 高度，只有寬度獨立設定。
               #! $min: 300
               #! $max: 650
-            - verticalMixerWidth: 340
+            - verticalMixerWidth: 380
               $name: Vertical Mixer width (logical px)
               $name:zh-TW: 垂直混音器寬度（邏輯像素）
               $description: Mixer height inherits vertical main OSD height; only its width is independent.
@@ -633,7 +636,7 @@ trademarks remain the property of their respective owners.
       $name: SMTC / Mixer dimensions
       $name:zh-TW: SMTC／混音器尺寸
     - Layout:
-        - verticalVolumeBrightness: false
+        - verticalVolumeBrightness: true
           $name: Use vertical volume and brightness layout
           $name:zh-TW: 使用垂直音量與亮度版面
           $description: Layout only; it does not enable Windows custom volume or brightness OSDs. Other native-event replacements retain compact icon-and-state cards.
@@ -669,28 +672,28 @@ trademarks remain the property of their respective owners.
           #! $showIf: {displayOutputMode: selected}
           #! $min: 1
           #! $max: 16
-        - ddcPosition: bottomCenter
+        - ddcPosition: topLeft
           $name: OSD position
           $name:zh-TW: OSD 位置
           $options:
-          - topLeft: Top left
+          - topLeft: Top left (default)
           - topCenter: Top center
           - topRight: Top right
           - centerLeft: Center left
           - center: Center
           - centerRight: Center right
           - bottomLeft: Bottom left
-          - bottomCenter: Bottom center (default)
+          - bottomCenter: Bottom center
           - bottomRight: Bottom right
           $options:zh-TW:
-          - topLeft: 左上
+          - topLeft: 左上（預設）
           - topCenter: 上方中央
           - topRight: 右上
           - centerLeft: 左側中央
           - center: 中央
           - centerRight: 右側中央
           - bottomLeft: 左下
-          - bottomCenter: 下方中央（預設）
+          - bottomCenter: 下方中央
           - bottomRight: 右下
         - ddcOffsetX: 0
           $name: Horizontal offset (logical px, right positive)
@@ -720,11 +723,9 @@ trademarks remain the property of their respective owners.
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <dbt.h>
-#include <bluetoothapis.h>
 #include <setupapi.h>
 #include <iphlpapi.h>
 #include <shellapi.h>
-#include <bthdef.h>
 #include <windhawk_utils.h>
 #include <highlevelmonitorconfigurationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
@@ -750,6 +751,11 @@ trademarks remain the property of their respective owners.
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.h>
 #include <winrt/Windows.Media.Control.h>
+#include <winrt/Windows.Devices.Bluetooth.h>
+#include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <array>
+#include <mutex>
 #include <winrt/Windows.Storage.Streams.h>
 #include <vector>
 #include <memory>
@@ -771,6 +777,8 @@ constexpr UINT kMediaAnimationIntervalMs = 100;
 constexpr ULONGLONG kMediaFeedbackMs = 240;
 constexpr ULONGLONG kMediaRefreshIntervalMs = 3000;
 constexpr UINT kBrightnessWheelResultMessage = WM_APP + 326;
+constexpr UINT kBluetoothQueueMessage = WM_APP + 327;
+constexpr UINT kBluetoothConfigMessage = WM_APP + 328;
 constexpr int kWheelStepPercent = 5;  // One standard notch; leave high-res deltas accumulated.
 constexpr UINT kNativeOsdMessage = WM_APP + 320;
 constexpr UINT kMediaUpdateMessage = WM_APP + 321;
@@ -784,6 +792,91 @@ enum class Kind : int {
     Volume, Brightness, Keyboard, Airplane, Camera, Microphone,
     Text, Desktop, Count
 };
+
+enum class DurationKind : int {
+    Volume, Media, NativeBrightness, DdcBrightness, NativeEvents, LockKeys,
+    Clipboard, Devices, Network, Interactive, Count
+};
+enum class NoticeCategory { Usb, Bluetooth, Network };
+enum class NoticeAction { Connected, Disconnected, Removed, NetworkChanged };
+enum class PanelMode { None, Media, Mixer, Details };
+enum class PopupKind { DdcBrightness, NativeBrightness, NativeVolume, NativeEvent, LockStatus, Notification };
+enum class FlyoutDirection { Left, Right, Up, Down };
+
+// --- Immutable IDs, limits and drawing geometry ---
+constexpr GUID kIUiSettings3 = {
+    0x03021be4, 0x5254, 0x4781,
+    {0x81, 0x94, 0x51, 0x68, 0xf7, 0xd0, 0x6d, 0x7b}
+};
+constexpr GUID kUsbDeviceInterface = {0xa5dcbf10,0x6530,0x11d2,
+    {0x90,0x1f,0x00,0xc0,0x4f,0xb9,0x51,0xed}};
+constexpr WCHAR kUiSettingsRuntimeClass[] = L"Windows.UI.ViewManagement.UISettings";
+constexpr GUID kWmiLocatorClsid = {0x4590f811, 0x1d3a, 0x11d0,
+    {0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24}};
+constexpr GUID kWmiLocatorIid = {0xdc12a687, 0x737f, 0x11cf,
+    {0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24}};
+constexpr size_t kMaxMirrorOutputs = 7; // At most 8 displays including master.
+constexpr size_t kMaxDdcTargets = 16;
+constexpr wchar_t kConnectedProperty[] = L"System.Devices.Aep.IsConnected";
+constexpr size_t kMaxQueuedEvents = 128;
+constexpr size_t kMaxKnownDevices = 256;
+constexpr size_t kMaxMediaTextChars = 4096;
+constexpr INT64 kMaxMediaLag100ns = INT64(24) * 60 * 60 * 10000000;
+constexpr uint32_t kMaxArtworkBytes = 1024u * 1024u;
+constexpr DWORD kMaxVcpValue = 0xFFFF;
+constexpr float kClipboardImageCanvasW = 264.0f;
+constexpr float kClipboardImageCanvasH = 224.0f;
+constexpr float kClipboardImageMaxW = 224.0f;
+constexpr float kClipboardImageMaxH = 164.0f;
+constexpr float kMixerRowStep = 30.0f;
+constexpr float kMixerFirstRowY = 45.0f;
+constexpr float kMixerTrackStart = 62.0f;
+constexpr float kMixerTrackLength = 216.0f;
+constexpr float kMixerTrackHeight = 7.0f;
+constexpr int kLockVk[4] = {VK_CAPITAL, VK_NUMLOCK, VK_SCROLL, VK_INSERT};
+constexpr int kLogicalWidth = 380;
+constexpr int kLogicalHeight = 72;
+constexpr float kHorizontalArrowRadius = 12.5f;
+constexpr float kVerticalArrowRadius = 11.5f;
+constexpr float kArrowHitDiameter = 30.0f;
+constexpr float kTau = 6.28318530718f;
+
+// --- Stable setting key tables (same ordinal as their state arrays) ---
+constexpr PCWSTR kNativeHideSettingKeys[] = {
+    L"NativeHide.hideNativeVolume", L"NativeHide.hideNativeBrightness", L"NativeHide.hideNativeKeyboardBrightness",
+    L"NativeHide.hideNativeAirplane", L"NativeHide.hideNativeCamera", L"NativeHide.hideNativeMicrophone",
+    L"NativeHide.hideNativeText", L"NativeHide.hideNativeVirtualDesktop"
+};
+constexpr PCWSTR kCustomNativeSettingKeys[] = {
+    L"CustomOSD.Switches.showCustomVolume",
+    L"CustomOSD.Switches.showCustomBrightness",
+    L"CustomOSD.Switches.showCustomKeyboardBrightness",
+    L"CustomOSD.Switches.showCustomAirplane",
+    L"CustomOSD.Switches.showCustomCamera",
+    L"CustomOSD.Switches.showCustomMicrophone",
+    L"CustomOSD.Switches.showCustomText",
+    L"CustomOSD.Switches.showCustomVirtualDesktop"
+};
+constexpr PCWSTR kDurationSettingKeys[] = {
+    L"volumeDurationMs", L"mediaDurationMs",
+    L"nativeBrightnessDurationMs", L"ddcBrightnessDurationMs",
+    L"nativeEventDurationMs", L"lockDurationMs", L"clipboardDurationMs",
+    L"deviceDurationMs", L"networkDurationMs",
+    L"interactiveDurationMs"
+};
+constexpr PCWSTR kLockSettingKeys[] = {
+    L"CustomOSD.Switches.LockKeys.showCapsLockOsd", L"CustomOSD.Switches.LockKeys.showNumLockOsd",
+    L"CustomOSD.Switches.LockKeys.showScrollLockOsd", L"CustomOSD.Switches.LockKeys.showInsertOsd"
+};
+
+static_assert(ARRAYSIZE(kNativeHideSettingKeys) == static_cast<size_t>(Kind::Count));
+static_assert(ARRAYSIZE(kCustomNativeSettingKeys) == static_cast<size_t>(Kind::Count));
+static_assert(ARRAYSIZE(kDurationSettingKeys) == static_cast<size_t>(DurationKind::Count));
+static_assert(ARRAYSIZE(kLockSettingKeys) == 4);
+
+// --- Input glyphs and labels (custom string table follows) ---
+constexpr PCWSTR kLockDisplayNames[] = {L"Caps Lock", L"Num Lock", L"Scroll Lock", L"Insert"};
+constexpr PCWSTR kLockGlyphs[] = {L"A", L"1", L"↕", L"Ins"};
 
 // Localized custom OSD strings. Event identities do not depend on UI text.
 enum class OsdText : size_t {
@@ -885,37 +978,76 @@ constexpr LocalizedText kLocalizedText[] = {
     {L"Off", L"關閉"}, // Off
 };
 static_assert(ARRAYSIZE(kLocalizedText) == static_cast<size_t>(OsdText::Count));
-std::atomic<int> g_displayLanguage{0}; // 0=Auto, 1=English, 2=zh-TW
-bool UseTraditionalChinese() {
-    const int selected = g_displayLanguage.load(std::memory_order_relaxed);
-    if (selected == 2) return true;
-    if (selected == 1) return false;
-    const LANGID lang = GetUserDefaultUILanguage();
-    if (PRIMARYLANGID(lang) != LANG_CHINESE) return false;
-    const WORD sublanguage = SUBLANGID(lang);
-    return sublanguage == SUBLANG_CHINESE_TRADITIONAL ||
-           sublanguage == SUBLANG_CHINESE_HONGKONG ||
-           sublanguage == SUBLANG_CHINESE_MACAU;
-}
-PCWSTR Tr(OsdText id) {
-    const size_t index = static_cast<size_t>(id);
-    if (index >= ARRAYSIZE(kLocalizedText)) return L"";
-    return UseTraditionalChinese() ? kLocalizedText[index].zhTw
-                                   : kLocalizedText[index].en;
-}
+// ============================================================
+// Shared declarations: payload types, API facades and states
+// ============================================================
+// A transient native OSD event is not the underlying hardware state.
+struct NativeEventInfo {
+    Kind kind = Kind::Keyboard;
+    int value = 0;
+    int variant = 0; // 1 = camera access (not camera activity)
+    std::wstring text;
+};
 
+struct PhysicalInfo {
+    WCHAR device[CCHDEVICENAME]{}; // GDI display, e.g. \\.\DISPLAY2
+    DWORD physicalIndex = 0;
+    DWORD minimum = 0;
+    DWORD maximum = 0; // 0 = unknown, do not pretend raw=percent
+};
+
+// Wire format: no process-local HANDLE or pointer crosses WM_COPYDATA.
+struct BrightnessEvent {
+    DWORD magic;
+    WCHAR device[CCHDEVICENAME];
+    DWORD physicalIndex;
+    DWORD value;
+    DWORD minimum;
+    DWORD maximum;
+    DWORD producerPid;
+};
+static_assert(sizeof(BrightnessEvent) < 512);
+// Twinkle Tray emits an independent write for each physical monitor.
+// Keep a per-target batch: a single "latest" slot silently discards other
+// monitors' values, and a mirrored image duplicates the wrong percentage.
+struct DdcTargetState {
+    BrightnessEvent event{};
+    ULONGLONG expiresAt = 0;
+};
+
+struct BrightnessWheelTask {
+    bool native = false;
+    DWORD generation = 0;
+    int value = 0;                // Native: 0..100; DDC: device raw value
+    BrightnessEvent monitor{};   // Only display ID/physical index, no handles
+};
+
+// UISettings3 GetColorValue is read-only; the IID matches WinRT metadata.
+struct UiColor {
+    BYTE a, r, g, b;
+};
+struct IUiSettings3Raw : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetIids(ULONG*, GUID**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetRuntimeClassName(void**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetTrustLevel(int*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetColorValue(int, UiColor*) = 0;
+};
+using RoInitialize_t = HRESULT(WINAPI*)(int);
+using RoUninitialize_t = void(WINAPI*)();
+using WindowsCreateString_t = HRESULT(WINAPI*)(PCWSTR, UINT, void**);
+using WindowsDeleteString_t = HRESULT(WINAPI*)(void*);
+using RoActivateInstance_t = HRESULT(WINAPI*)(void*, IUnknown**);
+
+// --- Settings / UI / device state ---
+std::atomic<int> g_displayLanguage{0}; // 0=Auto, 1=English, 2=zh-TW
 std::atomic<bool> g_hideAllNativeOsd{false};
 std::atomic<bool> g_hide[static_cast<int>(Kind::Count)]{};
 std::atomic<bool> g_showCustomNative[static_cast<int>(Kind::Count)]{};
-std::atomic<bool> g_showDdcBrightness{true};
-std::atomic<bool> g_verticalVolumeBrightness{false};
+std::atomic<bool> g_showDdcBrightness{false};
+std::atomic<bool> g_verticalVolumeBrightness{true};
 std::atomic<bool> g_fromExplorer{true};
 std::atomic<bool> g_fromTwinkle{true};
 std::atomic<int> g_vcpCode{16};
-enum class DurationKind : int {
-    Volume, Media, NativeBrightness, DdcBrightness, NativeEvents, LockKeys,
-    Clipboard, Devices, Network, Interactive, Count
-};
 
 std::atomic<int> g_globalDurationMs{3000};
 std::atomic<bool> g_individualDurations{false};
@@ -923,30 +1055,23 @@ std::atomic<int> g_durationOverrides[static_cast<int>(DurationKind::Count)]{};
 // Only the dedicated OSD UI thread reads/writes this current category.
 DurationKind g_activeDurationKind = DurationKind::Volume;
 
-UINT OsdDuration(DurationKind kind) {
-    if (!g_individualDurations.load(std::memory_order_relaxed))
-        return static_cast<UINT>(g_globalDurationMs.load(std::memory_order_relaxed));
-    return static_cast<UINT>(g_durationOverrides[static_cast<int>(kind)]
-        .load(std::memory_order_relaxed));
-}
-
 std::atomic<int> g_ddcTheme{0};
 std::atomic<int> g_ddcSizePercent{75};
 // Independent logical dimensions; global DPI and size % are applied later.
-std::atomic<int> g_horizontalOsdWidth{336};
-std::atomic<int> g_horizontalOsdHeight{92};
+std::atomic<int> g_horizontalOsdWidth{380};
+std::atomic<int> g_horizontalOsdHeight{72};
 std::atomic<int> g_verticalOsdWidth{72};
-std::atomic<int> g_verticalOsdHeight{176};
-std::atomic<int> g_horizontalSmtcHeight{176};
-std::atomic<int> g_horizontalMixerHeight{176};
-std::atomic<int> g_verticalSmtcWidth{340};
-std::atomic<int> g_verticalMixerWidth{340};
+std::atomic<int> g_verticalOsdHeight{200};
+std::atomic<int> g_horizontalSmtcHeight{200};
+std::atomic<int> g_horizontalMixerHeight{200};
+std::atomic<int> g_verticalSmtcWidth{380};
+std::atomic<int> g_verticalMixerWidth{380};
 std::atomic<bool> g_ddcBorderless{true};
-std::atomic<bool> g_showSmtcOnVolume{true};
+std::atomic<bool> g_showSmtcOnVolume{false};
 std::atomic<bool> g_showMediaArtwork{true};
 std::atomic<bool> g_showMediaControls{true};
-std::atomic<int> g_mediaControlSizePercent{125};
-std::atomic<bool> g_showMixerArrow{true};
+std::atomic<int> g_mediaControlSizePercent{100};
+std::atomic<bool> g_showMixerArrow{false};
 std::atomic<int> g_mixerMaxRows{6};
 std::atomic<bool> g_showLockKeys[4]{};
 std::atomic<int> g_innerPadding{14};
@@ -985,36 +1110,9 @@ std::atomic<bool> g_showValue{true};
 // 0=source, 1=primary, 2=selected DISPLAYn, 3=all screens
 std::atomic<int> g_displayOutputMode{0};
 std::atomic<int> g_displayOutputNumber{1};
-std::atomic<int> g_position{0};
+std::atomic<int> g_position{5};
 std::atomic<int> g_offsetX{0};
 std::atomic<int> g_offsetY{0};
-
-bool ParseRgbHex(PCWSTR str, DWORD& rgb) {
-    if (!str) return false;
-    if (*str == L'#') ++str;
-    if (wcslen(str) != 6) return false;
-    DWORD value = 0;
-    for (int i = 0; i < 6; ++i) {
-        wchar_t c = str[i];
-        int nibble = (c >= L'0' && c <= L'9') ? c - L'0' :
-                     (c >= L'a' && c <= L'f') ? c - L'a' + 10 :
-                     (c >= L'A' && c <= L'F') ? c - L'A' + 10 : -1;
-        if (nibble < 0) return false;
-        value = (value << 4) | static_cast<DWORD>(nibble);
-    }
-    rgb = value;
-    return true;
-}
-
-void LoadHexSetting(PCWSTR setting, std::atomic<DWORD>& rgb,
-                    std::atomic<bool>& valid) {
-    PCWSTR input = Wh_GetStringSetting(setting);
-    DWORD parsed = 0;
-    bool ok = ParseRgbHex(input, parsed);
-    Wh_FreeStringSetting(input);
-    rgb.store(parsed, std::memory_order_relaxed);
-    valid.store(ok, std::memory_order_relaxed);
-}
 
 bool g_isExplorer = false;
 HMODULE g_ddcDll = nullptr;
@@ -1033,7 +1131,6 @@ struct MirrorOutput {
     float scale = 1.0f;
 };
 std::vector<MirrorOutput> g_mirrorOutputs; // UI thread only
-constexpr size_t kMaxMirrorOutputs = 7; // At most 8 displays including master. 
 HWND g_panelWnd = nullptr;
 HWND g_arrowWnd = nullptr;
 // Hover and press state belong to the Explorer UI thread, like the flyouts.
@@ -1052,9 +1149,6 @@ int g_lastConfirmedNativeBrightness = -1;
 DWORD g_lastConfirmedDdcBrightness = 0;
 bool g_clipboardListener = false;
 HDEVNOTIFY g_usbNotification = nullptr;
-std::vector<HDEVNOTIFY> g_bluetoothNotifications;
-std::vector<HANDLE> g_bluetoothRadios;
-HMODULE g_bluetoothDll = nullptr;
 HMODULE g_networkDll = nullptr;
 HANDLE g_networkNotification = nullptr;
 std::atomic<int> g_networkPreviousLevel{-1};
@@ -1068,25 +1162,6 @@ int g_fadeAlpha = 255;
 std::atomic<bool> g_closing{false};
 std::wstring g_noticeTitle;
 std::wstring g_noticeBody;
-enum class NoticeCategory { Usb, Bluetooth, Network };
-enum class NoticeAction { Connected, Disconnected, Removed, NetworkChanged };
-PCWSTR NoticeCategoryLabel(NoticeCategory category) {
-    switch (category) {
-        case NoticeCategory::Usb: return L"USB";
-        case NoticeCategory::Bluetooth: return Tr(OsdText::Bluetooth);
-        case NoticeCategory::Network: return Tr(OsdText::Network);
-    }
-    return L"";
-}
-PCWSTR NoticeActionLabel(NoticeAction action) {
-    switch (action) {
-        case NoticeAction::Connected: return Tr(OsdText::Connected);
-        case NoticeAction::Disconnected: return Tr(OsdText::Disconnected);
-        case NoticeAction::Removed: return Tr(OsdText::Removed);
-        case NoticeAction::NetworkChanged: return Tr(OsdText::NetworkChanged);
-    }
-    return L"";
-}
 struct NoticeBatch {
     NoticeCategory category = NoticeCategory::Usb;
     NoticeAction action = NoticeAction::Connected;
@@ -1105,14 +1180,8 @@ std::unordered_map<std::string, NetInterfaceState> g_networkInterfaces;
 // Owned thumbnail, created only when the user enables clipboard previews.
 // Its dimensions are bounded before display; never store clipboard data.
 HBITMAP g_clipboardThumbnail = nullptr;
-constexpr float kClipboardImageCanvasW = 264.0f;
-constexpr float kClipboardImageCanvasH = 224.0f;
-constexpr float kClipboardImageMaxW = 224.0f;
-constexpr float kClipboardImageMaxH = 164.0f;
 DWORD g_usbLastEvent = 0;
 WPARAM g_usbLastEventType = 0;
-struct BtPreviousEvent { bool connected; DWORD when; };
-std::unordered_map<ULONGLONG, BtPreviousEvent> g_btPrevious;
 
 // The SMTC worker never touches HWND/GDI+/CoreAudio objects directly.
 struct MediaSnapshot {
@@ -1166,7 +1235,6 @@ struct MediaCommand {
 };
 std::vector<MediaCommand> g_mediaCommands; // Bounded, worker-owned after swap.
 
-enum class PanelMode { None, Media, Mixer, Details };
 PanelMode g_panelMode = PanelMode::None;  // Explorer UI thread only
 float g_scale = 1.0f;
 int g_panelWidth = 0;
@@ -1190,12 +1258,121 @@ int g_barWheelRemainder = 0;
 int g_barWheelKind = -1;
 float g_mixerMasterLevel = 0;
 bool g_mixerMasterMuted = false;
-constexpr float kMixerRowStep = 30.0f;
-constexpr float kMixerFirstRowY = 45.0f;
-// Shared by painting, hit-testing and drag calculations. App icons occupy
-// approximately x=25..44, followed by an 18px gap to the volume track.
-constexpr float kMixerTrackStart = 62.0f;
-constexpr float kMixerTrackLength = 216.0f;
+// Hook callback and UI message loop share the same dedicated UI thread.
+HHOOK g_lockHook = nullptr;
+bool g_lockPressed[4]{};
+bool g_lockToggle[4]{};
+int g_lastLock = 0;
+bool g_lastLockValue = false;
+
+// --- Event state and worker coordination ---
+SRWLOCK g_nativeEventLock = SRWLOCK_INIT;
+NativeEventInfo g_nativeEventPending;
+bool g_nativeEventPosted = false;
+
+SRWLOCK g_handleLock = SRWLOCK_INIT;
+std::unordered_map<ULONG_PTR, PhysicalInfo> g_handles;
+
+std::vector<BrightnessEvent> g_ddcBatchEvents;  // UI thread only
+std::vector<DdcTargetState> g_ddcTargets;      // UI thread only
+bool g_ddcBatchPending = false;
+WCHAR g_ddcLastUnresolved[CCHDEVICENAME]{}; // UI thread, log only changed failures
+WCHAR g_ddcLastTarget[CCHDEVICENAME]{}; // UI thread, log target transitions
+
+SRWLOCK g_wheelWriteLock = SRWLOCK_INIT;
+BrightnessWheelTask g_wheelWritePending;
+bool g_wheelWriteHasPending = false;
+HANDLE g_wheelWriteWake = nullptr;
+HANDLE g_wheelWriteThread = nullptr;
+std::atomic<bool> g_wheelWriteStop{false};
+std::atomic<DWORD> g_wheelWriteLatest{0};
+
+HMODULE g_combase = nullptr;               // UI thread only
+RoUninitialize_t g_roUninitialize = nullptr;
+bool g_roInitialized = false;
+IUiSettings3Raw* g_uiSettings = nullptr;    // UI thread only
+
+// --- Active master flyout state (dedicated UI thread) ---
+BrightnessEvent g_visible{};  // UI thread only
+PopupKind g_popupKind = PopupKind::DdcBrightness; // UI thread only
+NativeEventInfo g_nativeEventCurrent;         // UI thread only
+int g_nativePercent = 0;                        // UI thread only
+bool g_nativePercentKnown = false;              // UI thread only
+bool g_nativeMuted = false;                     // UI thread only
+int g_width = kLogicalWidth;
+int g_height = kLogicalHeight;
+ULONG_PTR g_gdiplusToken = 0;
+
+// ============================================================
+// Shared helpers: localization, settings, UI state and geometry
+// ============================================================
+
+bool UseTraditionalChinese() {
+    const int selected = g_displayLanguage.load(std::memory_order_relaxed);
+    if (selected == 2) return true;
+    if (selected == 1) return false;
+    const LANGID lang = GetUserDefaultUILanguage();
+    if (PRIMARYLANGID(lang) != LANG_CHINESE) return false;
+    const WORD sublanguage = SUBLANGID(lang);
+    return sublanguage == SUBLANG_CHINESE_TRADITIONAL ||
+           sublanguage == SUBLANG_CHINESE_HONGKONG ||
+           sublanguage == SUBLANG_CHINESE_MACAU;
+}
+PCWSTR Tr(OsdText id) {
+    const size_t index = static_cast<size_t>(id);
+    if (index >= ARRAYSIZE(kLocalizedText)) return L"";
+    return UseTraditionalChinese() ? kLocalizedText[index].zhTw
+                                   : kLocalizedText[index].en;
+}
+UINT OsdDuration(DurationKind kind) {
+    if (!g_individualDurations.load(std::memory_order_relaxed))
+        return static_cast<UINT>(g_globalDurationMs.load(std::memory_order_relaxed));
+    return static_cast<UINT>(g_durationOverrides[static_cast<int>(kind)]
+        .load(std::memory_order_relaxed));
+}
+bool ParseRgbHex(PCWSTR str, DWORD& rgb) {
+    if (!str) return false;
+    if (*str == L'#') ++str;
+    if (wcslen(str) != 6) return false;
+    DWORD value = 0;
+    for (int i = 0; i < 6; ++i) {
+        wchar_t c = str[i];
+        int nibble = (c >= L'0' && c <= L'9') ? c - L'0' :
+                     (c >= L'a' && c <= L'f') ? c - L'a' + 10 :
+                     (c >= L'A' && c <= L'F') ? c - L'A' + 10 : -1;
+        if (nibble < 0) return false;
+        value = (value << 4) | static_cast<DWORD>(nibble);
+    }
+    rgb = value;
+    return true;
+}
+
+void LoadHexSetting(PCWSTR setting, std::atomic<DWORD>& rgb,
+                    std::atomic<bool>& valid) {
+    PCWSTR input = Wh_GetStringSetting(setting);
+    DWORD parsed = 0;
+    bool ok = ParseRgbHex(input, parsed);
+    Wh_FreeStringSetting(input);
+    rgb.store(parsed, std::memory_order_relaxed);
+    valid.store(ok, std::memory_order_relaxed);
+}
+PCWSTR NoticeCategoryLabel(NoticeCategory category) {
+    switch (category) {
+        case NoticeCategory::Usb: return L"USB";
+        case NoticeCategory::Bluetooth: return Tr(OsdText::Bluetooth);
+        case NoticeCategory::Network: return Tr(OsdText::Network);
+    }
+    return L"";
+}
+PCWSTR NoticeActionLabel(NoticeAction action) {
+    switch (action) {
+        case NoticeAction::Connected: return Tr(OsdText::Connected);
+        case NoticeAction::Disconnected: return Tr(OsdText::Disconnected);
+        case NoticeAction::Removed: return Tr(OsdText::Removed);
+        case NoticeAction::NetworkChanged: return Tr(OsdText::NetworkChanged);
+    }
+    return L"";
+}
 float MixerTrackLength() {
     if (g_panelWidth <= 0 || g_scale <= 0.0f) return kMixerTrackLength;
     const float w = g_panelWidth / g_scale;
@@ -1203,7 +1380,6 @@ float MixerTrackLength() {
     return std::max(110.0f, w -
         (g_verticalVolumeBrightness.load() ? 124.0f : 120.0f));
 }
-constexpr float kMixerTrackHeight = 7.0f;
 int MixerVisibleRows() {
     if (g_panelHeight <= 0) return 1;
     const float h = g_panelHeight / g_scale;
@@ -1216,16 +1392,6 @@ int MixerMaximumScroll() {
 void ClampMixerScroll() {
     g_mixerScroll = std::clamp(g_mixerScroll, 0, MixerMaximumScroll());
 }
-
-
-// Hook callback and UI message loop share the same dedicated UI thread.
-HHOOK g_lockHook = nullptr;
-bool g_lockPressed[4]{};
-bool g_lockToggle[4]{};
-int g_lastLock = 0;
-bool g_lastLockValue = false;
-constexpr int kLockVk[4] = {VK_CAPITAL, VK_NUMLOCK, VK_SCROLL, VK_INSERT};
-
 bool IsCustomMode(PCWSTR name) {
     PCWSTR value = Wh_GetStringSetting(name);
     const bool custom = value && _wcsicmp(value, L"custom") == 0;
@@ -1235,7 +1401,7 @@ bool IsCustomMode(PCWSTR name) {
 
 int ReadPositionSetting() {
     PCWSTR value = Wh_GetStringSetting(L"CustomOSD.Layout.ddcPosition");
-    int result = 0; // bottomCenter
+    int result = 5; // topLeft (fallback on missing/unknown setting)
     if (value) {
         if (_wcsicmp(value, L"bottomLeft") == 0) result = 1;
         else if (_wcsicmp(value, L"bottomRight") == 0) result = 2;
@@ -1250,6 +1416,168 @@ int ReadPositionSetting() {
     return result;
 }
 
+template <size_t N>
+void LoadBoolSettings(std::atomic<bool> (&target)[N],
+                      PCWSTR const (&keys)[N]) {
+    for (size_t i = 0; i < N; ++i)
+        target[i].store(Wh_GetIntSetting(keys[i]) != 0);
+}
+
+// Preserve 32-bit top-down BI_RGB backing storage for premultiplied BGRA.
+HBITMAP CreateArgbDib(HDC screen, int width, int height, void** pixels) {
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    return CreateDIBSection(screen, &bitmapInfo, DIB_RGB_COLORS,
+                            pixels, nullptr, 0);
+}
+
+BYTE OsdBackgroundAlpha() {
+    return static_cast<BYTE>((g_backgroundOpacity.load() * 255 + 50) / 100);
+}
+
+// A single direction and anchor rule drives panel placement and chevrons.
+// --- Common placement, sizing and monitor identity ---
+float MainLogicalWidth() {
+    return static_cast<float>(g_verticalVolumeBrightness.load()
+        ? g_verticalOsdWidth.load() : g_horizontalOsdWidth.load());
+}
+float MainLogicalHeight() {
+    return static_cast<float>(g_verticalVolumeBrightness.load()
+        ? g_verticalOsdHeight.load() : g_horizontalOsdHeight.load());
+}
+float MainCenterY() { return MainLogicalHeight() / 2.0f - 2.0f; }
+float HorizontalChevronX() { return MainLogicalWidth() - 33.0f; }
+float HorizontalChevronY() { return MainCenterY(); }
+float VerticalChevronX() { return MainLogicalWidth() / 2.0f; }
+float VerticalChevronY() { return MainLogicalHeight() - 25.0f; }
+FlyoutDirection InverseDirection(FlyoutDirection dir) {
+    switch (dir) {
+        case FlyoutDirection::Left: return FlyoutDirection::Right;
+        case FlyoutDirection::Right: return FlyoutDirection::Left;
+        case FlyoutDirection::Up: return FlyoutDirection::Down;
+        case FlyoutDirection::Down: return FlyoutDirection::Up;
+    }
+    return FlyoutDirection::Right;
+}
+bool PositionIsTop(int pos) {
+    return pos == 3 || pos == 5 || pos == 6;
+}
+bool PositionIsBottom(int pos) {
+    return pos == 0 || pos == 1 || pos == 2;
+}
+bool PositionIsLeft(int pos) {
+    return pos == 1 || pos == 5 || pos == 7;
+}
+bool PositionIsRight(int pos) {
+    return pos == 2 || pos == 6 || pos == 8;
+}
+
+FlyoutDirection GetFlyoutDirection() {
+    const int pos = g_position.load(std::memory_order_relaxed);
+    const bool vertical = g_verticalVolumeBrightness.load(
+        std::memory_order_relaxed);
+    if (vertical) {
+        if (PositionIsLeft(pos)) return FlyoutDirection::Right;
+        if (PositionIsRight(pos)) return FlyoutDirection::Left;
+    } else {
+        if (PositionIsTop(pos)) return FlyoutDirection::Down;
+        if (PositionIsBottom(pos)) return FlyoutDirection::Up;
+    }
+
+    // Centered anchors have no intrinsic direction; use the side with the
+    // most room. Media/Mixer panel dimensions are separately configurable.
+    RECT main{};
+    MONITORINFO mi{sizeof(mi)};
+    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &main) ||
+        !GetMonitorInfoW(MonitorFromWindow(g_popupWnd,
+                                         MONITOR_DEFAULTTONEAREST), &mi))
+        return vertical ? FlyoutDirection::Right : FlyoutDirection::Down;
+    const RECT& work = mi.rcWork;
+    if (vertical) {
+        const int freeRight = work.right - main.right;
+        const int freeLeft = main.left - work.left;
+        return freeRight >= freeLeft ? FlyoutDirection::Right
+                                     : FlyoutDirection::Left;
+    }
+    const int freeDown = work.bottom - main.bottom;
+    const int freeUp = main.top - work.top;
+    return freeDown >= freeUp ? FlyoutDirection::Down
+                              : FlyoutDirection::Up;
+}
+struct FindDisplay {
+    WCHAR name[CCHDEVICENAME]{};
+    HMONITOR monitor = nullptr;
+};
+BOOL CALLBACK FindDisplayCallback(HMONITOR m, HDC, LPRECT, LPARAM context) {
+    auto* f = reinterpret_cast<FindDisplay*>(context);
+    MONITORINFOEXW mi{sizeof(mi)};
+    if (GetMonitorInfoW(m, &mi) &&
+        _wcsicmp(mi.szDevice, f->name) == 0) {
+        f->monitor = m;
+        return FALSE;
+    }
+    return TRUE;
+}
+// One GDI-name lookup for DDC events, selected DISPLAYn and popup routing.
+// Unknown identities stay unresolved, rather than silently identifying
+// the primary monitor as the event target.
+HMONITOR FindMonitorByDeviceName(PCWSTR device) {
+    if (!device || !device[0]) return nullptr;
+    FindDisplay result{};
+    wcscpy_s(result.name, device);
+    EnumDisplayMonitors(nullptr, nullptr, FindDisplayCallback,
+                        reinterpret_cast<LPARAM>(&result));
+    return result.monitor;
+}
+
+bool PublishArgbLayer(HWND window, HDC screen, HDC memory,
+                      int width, int height) {
+    SIZE size{width, height};
+    POINT origin{0, 0};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0,
+                        static_cast<BYTE>(g_fadeAlpha), AC_SRC_ALPHA};
+    return UpdateLayeredWindow(window, screen, nullptr, &size,
+                               memory, &origin, 0, &blend, ULW_ALPHA) != FALSE;
+}
+
+// ============================================================
+// Forward declarations: cross-feature callbacks and UI entrypoints
+// ============================================================
+void DrawText(Gdiplus::Graphics&, const std::wstring&, float, float, float,
+              float, float, Gdiplus::Color, bool = false, bool = false);
+void DrawHorizontalVolume(Gdiplus::Graphics&);
+void DrawLockStatus(Gdiplus::Graphics&);
+void DrawNotification(Gdiplus::Graphics&);
+void DrawExpandChevron(Gdiplus::Graphics&, float, float, Gdiplus::Color);
+void ShowPopupAnimated();
+void RenderPopup();
+void RenderPanel();
+void RenderMirroredFrame(HDC, void*, int, int, bool);
+void RenderDdcTargetPeers();
+void MovePopupToDisplay(const BrightnessEvent&);
+void SetPopupInteractive(bool);
+void ResetHideTimer(UINT);
+void ResetHideTimerFor(DurationKind);
+void ClosePanel();
+void HideMirroredWindows(bool);
+void DestroyMirroredWindows();
+void UpdateArrowHitWindow();
+void UpdateSpeakerHitWindow();
+void FlushNoticeBatch();
+void ShowPanel();
+void ShowNotice(std::wstring, std::wstring, DurationKind);
+std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot();
+namespace bt_monitor {
+    void Start();
+    void Stop();
+    void Drain();
+} // namespace bt_monitor
+
 void LoadSettings() {
     PCWSTR selectedLanguage = Wh_GetStringSetting(L"displayLanguage");
     const int chosen = selectedLanguage &&
@@ -1259,26 +1587,8 @@ void LoadSettings() {
     Wh_FreeStringSetting(selectedLanguage);
     g_hideAllNativeOsd.store(
         Wh_GetIntSetting(L"NativeHide.hideAllNativeOsd") != 0);
-    constexpr PCWSTR names[] = {
-        L"NativeHide.hideNativeVolume", L"NativeHide.hideNativeBrightness", L"NativeHide.hideNativeKeyboardBrightness",
-        L"NativeHide.hideNativeAirplane", L"NativeHide.hideNativeCamera", L"NativeHide.hideNativeMicrophone",
-        L"NativeHide.hideNativeText", L"NativeHide.hideNativeVirtualDesktop"
-    };
-    for (int i = 0; i < static_cast<int>(Kind::Count); ++i)
-        g_hide[i].store(Wh_GetIntSetting(names[i]) != 0);
-    constexpr PCWSTR customKeys[] = {
-        L"CustomOSD.Switches.showCustomVolume",
-        L"CustomOSD.Switches.showCustomBrightness",
-        L"CustomOSD.Switches.showCustomKeyboardBrightness",
-        L"CustomOSD.Switches.showCustomAirplane",
-        L"CustomOSD.Switches.showCustomCamera",
-        L"CustomOSD.Switches.showCustomMicrophone",
-        L"CustomOSD.Switches.showCustomText",
-        L"CustomOSD.Switches.showCustomVirtualDesktop"
-    };
-    static_assert(ARRAYSIZE(customKeys) == static_cast<int>(Kind::Count));
-    for (int i = 0; i < static_cast<int>(Kind::Count); ++i)
-        g_showCustomNative[i].store(Wh_GetIntSetting(customKeys[i]) != 0);
+    LoadBoolSettings(g_hide, kNativeHideSettingKeys);
+    LoadBoolSettings(g_showCustomNative, kCustomNativeSettingKeys);
     g_showDdcBrightness.store(Wh_GetIntSetting(L"CustomOSD.Switches.showDdcBrightness") != 0);
     g_verticalVolumeBrightness.store(Wh_GetIntSetting(L"CustomOSD.Layout.verticalVolumeBrightness") != 0);
     g_fromExplorer.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromExplorer") != 0);
@@ -1288,17 +1598,9 @@ void LoadSettings() {
         Wh_GetIntSetting(L"CustomOSD.Timing.globalDurationMs"), 500, 20000));
     g_individualDurations.store(
         Wh_GetIntSetting(L"CustomOSD.Timing.individualDurations") != 0);
-    constexpr PCWSTR durationKeys[] = {
-        L"volumeDurationMs", L"mediaDurationMs",
-        L"nativeBrightnessDurationMs", L"ddcBrightnessDurationMs",
-        L"nativeEventDurationMs", L"lockDurationMs", L"clipboardDurationMs",
-        L"deviceDurationMs", L"networkDurationMs",
-        L"interactiveDurationMs"
-    };
-    static_assert(ARRAYSIZE(durationKeys) == static_cast<int>(DurationKind::Count));
     for (int i = 0; i < static_cast<int>(DurationKind::Count); ++i) {
         std::wstring path = L"CustomOSD.Timing.";
-        path += durationKeys[i];
+        path += kDurationSettingKeys[i];
         g_durationOverrides[i].store(std::clamp(
             Wh_GetIntSetting(path.c_str()), 500, 20000));
     }
@@ -1312,7 +1614,7 @@ void LoadSettings() {
     Wh_FreeStringSetting(selectedTheme);
     g_ddcSizePercent.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcSizePercent"), 55, 120));
     g_horizontalOsdWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdWidth"), 300, 650));
-    g_horizontalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdHeight"), 80, 220));
+    g_horizontalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdHeight"), 72, 220));
     g_verticalOsdWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.verticalOsdWidth"), 72, 180));
     g_verticalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.verticalOsdHeight"), 160, 430));
     g_horizontalSmtcHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.horizontalSmtcHeight"), 176, 480));
@@ -1327,12 +1629,7 @@ void LoadSettings() {
         Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.mediaControlSizePercent"), 90, 135));
     g_showMixerArrow.store(Wh_GetIntSetting(L"CustomOSD.Switches.showVolumeMixerArrow") != 0);
     g_mixerMaxRows.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.mixerMaxRows"), 3, 16));
-    constexpr PCWSTR lockNames[] = {
-        L"CustomOSD.Switches.LockKeys.showCapsLockOsd", L"CustomOSD.Switches.LockKeys.showNumLockOsd",
-        L"CustomOSD.Switches.LockKeys.showScrollLockOsd", L"CustomOSD.Switches.LockKeys.showInsertOsd"
-    };
-    for (int i = 0; i < 4; ++i)
-        g_showLockKeys[i].store(Wh_GetIntSetting(lockNames[i]) != 0);
+    LoadBoolSettings(g_showLockKeys, kLockSettingKeys);
     g_innerPadding.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcInnerPadding"), 6, 22));
     g_showClipboardOsd.store(Wh_GetIntSetting(L"CustomOSD.Switches.showClipboardOsd") != 0);
     g_clipboardTextPreview.store(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardTextPreview") != 0);
@@ -1373,24 +1670,15 @@ void LoadSettings() {
     g_offsetY.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetY"), -500, 500));
 }
 
+// ============================================================
+// Native shell hooks and event routing
+// ============================================================
 bool Hidden(Kind k) {
     // Hide never changes whether the custom OSD is displayed. A master
     // override hides all native categories, even if their local Hide is off.
     return g_hideAllNativeOsd.load(std::memory_order_relaxed) ||
            g_hide[static_cast<int>(k)].load(std::memory_order_relaxed);
 }
-
-// A transient native display request is not the underlying system state.
-// The shell hook never draws a window or performs device I/O.
-struct NativeEventInfo {
-    Kind kind = Kind::Keyboard;
-    int value = 0;
-    int variant = 0; // 1 = camera access (not camera activity)
-    std::wstring text;
-};
-SRWLOCK g_nativeEventLock = SRWLOCK_INIT;
-NativeEventInfo g_nativeEventPending;
-bool g_nativeEventPosted = false;
 
 bool ShowCustomNative(Kind kind) {
     return g_showCustomNative[static_cast<int>(kind)].load(
@@ -1574,16 +1862,10 @@ void HookNativeOsd() {
            MicrophoneOriginal != nullptr, TextOriginal != nullptr);
 }
 
+// ============================================================
+// DDC source hooks, target cache and cross-process events
+// ============================================================
 // --- DDC hooks and per-process HANDLE -> display identity / range cache ---
-struct PhysicalInfo {
-    WCHAR device[CCHDEVICENAME]{}; // GDI display, e.g. \\.\DISPLAY2
-    DWORD physicalIndex = 0;
-    DWORD minimum = 0;
-    DWORD maximum = 0; // 0 = unknown, do not pretend raw=percent
-};
-SRWLOCK g_handleLock = SRWLOCK_INIT;
-std::unordered_map<ULONG_PTR, PhysicalInfo> g_handles;
-
 PhysicalInfo GetPhysicalInfo(HANDLE handle) {
     AcquireSRWLockShared(&g_handleLock);
     auto it = g_handles.find(reinterpret_cast<ULONG_PTR>(handle));
@@ -1663,45 +1945,6 @@ BOOL WINAPI GetVcpHook(HANDLE handle, BYTE code, LPMC_VCP_CODE_TYPE type,
     return ok;
 }
 
-// The wire format contains no HANDLE or pointers: physical HANDLEs are
-// process-local and cannot be interpreted in explorer.exe.
-struct BrightnessEvent {
-    DWORD magic;
-    WCHAR device[CCHDEVICENAME];
-    DWORD physicalIndex;
-    DWORD value;
-    DWORD minimum;
-    DWORD maximum;
-    DWORD producerPid;
-};
-static_assert(sizeof(BrightnessEvent) < 512);
-// Twinkle Tray emits an independent write for each physical monitor.
-// Keep a per-target batch: a single "latest" slot silently discards other
-// monitors' values, and a mirrored image duplicates the wrong percentage.
-constexpr size_t kMaxDdcTargets = 16;
-struct DdcTargetState {
-    BrightnessEvent event{};
-    ULONGLONG expiresAt = 0;
-};
-std::vector<BrightnessEvent> g_ddcBatchEvents;  // UI thread only
-std::vector<DdcTargetState> g_ddcTargets;      // UI thread only
-bool g_ddcBatchPending = false;
-WCHAR g_ddcLastUnresolved[CCHDEVICENAME]{}; // UI thread, log only changed failures
-WCHAR g_ddcLastTarget[CCHDEVICENAME]{}; // UI thread, log target transitions
-
-struct BrightnessWheelTask {
-    bool native = false;
-    DWORD generation = 0;
-    int value = 0;                // Native: 0..100; DDC: device raw value
-    BrightnessEvent monitor{};   // Only display ID/physical index, no handles
-};
-SRWLOCK g_wheelWriteLock = SRWLOCK_INIT;
-BrightnessWheelTask g_wheelWritePending;
-bool g_wheelWriteHasPending = false;
-HANDLE g_wheelWriteWake = nullptr;
-HANDLE g_wheelWriteThread = nullptr;
-std::atomic<bool> g_wheelWriteStop{false};
-std::atomic<DWORD> g_wheelWriteLatest{0};
 void QueueBrightnessWheelTask(const BrightnessWheelTask& task) {
     if (!g_wheelWriteWake || g_wheelWriteStop.load()) return;
     AcquireSRWLockExclusive(&g_wheelWriteLock);
@@ -1796,156 +2039,9 @@ void HookDdc() {
     }
 }
 
-// --- Non-activating Windows 11-like OSD, Explorer UI thread only ---
-// Per-pixel alpha + antialiased GDI+ rendering. This resembles the native
-// Win11 flyout; it is intentionally NOT a claim of real WinUI/Acrylic blur.
-BrightnessEvent g_visible{};  // UI thread only
-constexpr int kLogicalWidth = 336;
-constexpr int kLogicalHeight = 92;
-// User-configured canvases retain these dimensions as defaults; painting,
-// scroll input and panel sizes depend on the live setting values.
-float MainLogicalWidth() {
-    return static_cast<float>(g_verticalVolumeBrightness.load()
-        ? g_verticalOsdWidth.load() : g_horizontalOsdWidth.load());
-}
-float MainLogicalHeight() {
-    return static_cast<float>(g_verticalVolumeBrightness.load()
-        ? g_verticalOsdHeight.load() : g_horizontalOsdHeight.load());
-}
-float MainCenterY() { return MainLogicalHeight() / 2.0f - 2.0f; }
-float HorizontalChevronX() { return MainLogicalWidth() - 33.0f; }
-float HorizontalChevronY() { return MainCenterY(); }
-float VerticalChevronX() { return MainLogicalWidth() / 2.0f; }
-float VerticalChevronY() { return MainLogicalHeight() - 25.0f; }
-enum class PopupKind { DdcBrightness, NativeBrightness, NativeVolume, NativeEvent, LockStatus, Notification };
-PopupKind g_popupKind = PopupKind::DdcBrightness; // UI thread only
-NativeEventInfo g_nativeEventCurrent;         // UI thread only
-int g_nativePercent = 0;                        // UI thread only
-bool g_nativePercentKnown = false;              // UI thread only
-bool g_nativeMuted = false;                     // UI thread only
-int g_width = kLogicalWidth;
-int g_height = kLogicalHeight;
-ULONG_PTR g_gdiplusToken = 0;
-
-// A single direction and set of anchors drives BOTH flyout placement and
-// the chevron. Independent panel heights never change the anchoring rule.
-enum class FlyoutDirection { Left, Right, Up, Down };
-FlyoutDirection InverseDirection(FlyoutDirection dir) {
-    switch (dir) {
-        case FlyoutDirection::Left: return FlyoutDirection::Right;
-        case FlyoutDirection::Right: return FlyoutDirection::Left;
-        case FlyoutDirection::Up: return FlyoutDirection::Down;
-        case FlyoutDirection::Down: return FlyoutDirection::Up;
-    }
-    return FlyoutDirection::Right;
-}
-// The chevron follows the configurable main canvas edges. Its drawn center
-// is shared with UpdateArrowHitWindow() to keep click targets aligned.
-constexpr float kHorizontalArrowRadius = 12.5f;
-constexpr float kVerticalArrowRadius = 11.5f;
-// The transparent interaction target is slightly larger than the visible button.
-constexpr float kArrowHitDiameter = 30.0f;
-
-bool PositionIsTop(int pos) {
-    return pos == 3 || pos == 5 || pos == 6;
-}
-bool PositionIsBottom(int pos) {
-    return pos == 0 || pos == 1 || pos == 2;
-}
-bool PositionIsLeft(int pos) {
-    return pos == 1 || pos == 5 || pos == 7;
-}
-bool PositionIsRight(int pos) {
-    return pos == 2 || pos == 6 || pos == 8;
-}
-
-FlyoutDirection GetFlyoutDirection() {
-    const int pos = g_position.load(std::memory_order_relaxed);
-    const bool vertical = g_verticalVolumeBrightness.load(
-        std::memory_order_relaxed);
-    if (vertical) {
-        if (PositionIsLeft(pos)) return FlyoutDirection::Right;
-        if (PositionIsRight(pos)) return FlyoutDirection::Left;
-    } else {
-        if (PositionIsTop(pos)) return FlyoutDirection::Down;
-        if (PositionIsBottom(pos)) return FlyoutDirection::Up;
-    }
-
-    // Centered anchors have no intrinsic direction; use the side with the
-    // most room. Media/Mixer panel dimensions are separately configurable.
-    RECT main{};
-    MONITORINFO mi{sizeof(mi)};
-    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &main) ||
-        !GetMonitorInfoW(MonitorFromWindow(g_popupWnd,
-                                         MONITOR_DEFAULTTONEAREST), &mi))
-        return vertical ? FlyoutDirection::Right : FlyoutDirection::Down;
-    const RECT& work = mi.rcWork;
-    if (vertical) {
-        const int freeRight = work.right - main.right;
-        const int freeLeft = main.left - work.left;
-        return freeRight >= freeLeft ? FlyoutDirection::Right
-                                     : FlyoutDirection::Left;
-    }
-    const int freeDown = work.bottom - main.bottom;
-    const int freeUp = main.top - work.top;
-    return freeDown >= freeUp ? FlyoutDirection::Down
-                              : FlyoutDirection::Up;
-}
-
-struct FindDisplay {
-    WCHAR name[CCHDEVICENAME]{};
-    HMONITOR monitor = nullptr;
-};
-BOOL CALLBACK FindDisplayCallback(HMONITOR m, HDC, LPRECT, LPARAM context) {
-    auto* f = reinterpret_cast<FindDisplay*>(context);
-    MONITORINFOEXW mi{sizeof(mi)};
-    if (GetMonitorInfoW(m, &mi) &&
-        _wcsicmp(mi.szDevice, f->name) == 0) {
-        f->monitor = m;
-        return FALSE;
-    }
-    return TRUE;
-}
-// One GDI-name lookup for DDC events, selected DISPLAYn and popup routing.
-// Unknown identities stay unresolved, rather than silently identifying
-// the primary monitor as the event target.
-HMONITOR FindMonitorByDeviceName(PCWSTR device) {
-    if (!device || !device[0]) return nullptr;
-    FindDisplay result{};
-    wcscpy_s(result.name, device);
-    EnumDisplayMonitors(nullptr, nullptr, FindDisplayCallback,
-                        reinterpret_cast<LPARAM>(&result));
-    return result.monitor;
-}
-
-// UISettings.GetColorValue(UIColorType.Accent): actual user-configured
-// Windows UI accent, not DWM's distinct glass composition color.
-// Raw WinRT ABI avoids a dependency on the C++/WinRT header package in the
-// Windhawk compiler. IUISettings3 IID and method order follow WinRT metadata.
-struct UiColor {
-    BYTE a, r, g, b;
-};
-struct IUiSettings3Raw : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE GetIids(ULONG*, GUID**) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetRuntimeClassName(void**) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetTrustLevel(int*) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetColorValue(int, UiColor*) = 0;
-};
-constexpr GUID kIUiSettings3 = {
-    0x03021be4, 0x5254, 0x4781,
-    {0x81, 0x94, 0x51, 0x68, 0xf7, 0xd0, 0x6d, 0x7b}
-};
-using RoInitialize_t = HRESULT(WINAPI*)(int);
-using RoUninitialize_t = void(WINAPI*)();
-using WindowsCreateString_t = HRESULT(WINAPI*)(PCWSTR, UINT, void**);
-using WindowsDeleteString_t = HRESULT(WINAPI*)(void*);
-using RoActivateInstance_t = HRESULT(WINAPI*)(void*, IUnknown**);
-
-HMODULE g_combase = nullptr;               // UI thread only
-RoUninitialize_t g_roUninitialize = nullptr;
-bool g_roInitialized = false;
-IUiSettings3Raw* g_uiSettings = nullptr;    // UI thread only
-
+// ============================================================
+// Windows accent/theme helpers
+// ============================================================
 void InitWindowsAccentProvider() {
     g_combase = LoadLibraryExW(L"combase.dll", nullptr,
                                LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -1967,9 +2063,8 @@ void InitWindowsAccentProvider() {
     HRESULT hr = roInit(1); // RO_INIT_MULTITHREADED
     if (FAILED(hr)) return;
     g_roInitialized = true;
-    constexpr WCHAR className[] = L"Windows.UI.ViewManagement.UISettings";
     void* classId = nullptr;
-    if (FAILED(createString(className, ARRAYSIZE(className) - 1, &classId)))
+    if (FAILED(createString(kUiSettingsRuntimeClass, ARRAYSIZE(kUiSettingsRuntimeClass) - 1, &classId)))
         return;
     IUnknown* object = nullptr;
     hr = activate(classId, &object);
@@ -2163,10 +2258,6 @@ bool ReadDefaultAudioVolume(int& percent, bool& muted) {
     return ok;
 }
 
-void RenderPopup();
-void RenderPanel();
-void ResetHideTimerFor(DurationKind kind);
-
 bool AdjustDefaultAudioWheel(int steps) {
     if (!steps) return false;
     Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
@@ -2249,6 +2340,9 @@ bool ToggleDefaultAudioMute() {
 // 20 x 20 coordinate space. Both symbols use the same size, stroke width and
 // visual anchor. Speaker detail follows the current volume level; both
 // symbols are locally drawn vector paths, with no external glyph assets.
+// ============================================================
+// Shared vector drawing and main OSD painters
+// ============================================================
 void DrawUniformStatusIcon(Gdiplus::Graphics& gfx,
                            Gdiplus::Color color,
                            float centerX, float centerY,
@@ -2290,11 +2384,10 @@ void DrawUniformStatusIcon(Gdiplus::Graphics& gfx,
                             8.2f * unit, 13.2f * unit, -62.0f, 124.0f);
         }
     } else {
-        constexpr float tau = 6.28318530718f;
         gfx.DrawEllipse(&pen, X(7.1f), Y(7.1f),
                         5.8f * unit, 5.8f * unit);
         for (int i = 0; i < 8; ++i) {
-            const float angle = tau * static_cast<float>(i) / 8.0f;
+            const float angle = kTau * static_cast<float>(i) / 8.0f;
             const float dx = std::cos(angle), dy = std::sin(angle);
             gfx.DrawLine(&pen,
                 X(10.0f + dx * 6.0f), Y(10.0f + dy * 6.0f),
@@ -2330,8 +2423,7 @@ void DrawVerticalPopup(Gdiplus::Graphics& gfx, const BrightnessEvent& brightness
     const DWORD textRgb = OsdTextRgb(light);
     const DWORD trackRgb = OsdTrackRgb(light);
     const DWORD accentRgb = OsdAccentRgb();
-    const BYTE opacity = static_cast<BYTE>(
-        (g_backgroundOpacity.load() * 255 + 50) / 100);
+    const BYTE opacity = OsdBackgroundAlpha();
     const Gdiplus::Color foreground = ToGdiColor(textRgb);
     const Gdiplus::Color accent = ToGdiColor(accentRgb);
     const Gdiplus::Color trackColor = ToGdiColor(trackRgb);
@@ -2457,27 +2549,8 @@ void DrawVerticalPopup(Gdiplus::Graphics& gfx, const BrightnessEvent& brightness
         DrawExpandChevron(gfx, VerticalChevronX(),
                           VerticalChevronY(), foreground);
 }
-// Draws to premultiplied BGRA pixels, then sends them to UpdateLayeredWindow.
 
 // --- Event notifications & shared animation state ---
-void DrawText(Gdiplus::Graphics&, const std::wstring&, float, float, float,
-              float, float, Gdiplus::Color, bool = false, bool = false);
-void ShowPopupAnimated();
-void RenderPopup();
-void RenderPanel();
-void MovePopupToDisplay(const BrightnessEvent&);
-void SetPopupInteractive(bool enabled);
-void ResetHideTimer(UINT milliseconds);
-void ResetHideTimerFor(DurationKind kind);
-void ClosePanel();
-void HideMirroredWindows(bool onlyPanel);
-void DestroyMirroredWindows();
-void UpdateArrowHitWindow();
-void UpdateSpeakerHitWindow();
-void FlushNoticeBatch();
-void ShowPanel();
-void ShowNotice(std::wstring, std::wstring, DurationKind);
-
 void ClearClipboardThumbnail() {
     if (g_clipboardThumbnail) {
         DeleteObject(g_clipboardThumbnail);
@@ -2499,8 +2572,7 @@ void DrawNativeEvent(Gdiplus::Graphics& gfx) {
     Gdiplus::GraphicsPath card;
     AddRoundedRect(card, 8.0f, 7.0f, 280.0f, 77.0f,
                    static_cast<float>(g_cornerRadius.load()));
-    Gdiplus::SolidBrush background(ToGdiColor(bgRgb, static_cast<BYTE>(
-        (g_backgroundOpacity.load() * 255 + 50) / 100)));
+    Gdiplus::SolidBrush background(ToGdiColor(bgRgb, OsdBackgroundAlpha()));
     gfx.FillPath(&background, &card);
     Gdiplus::GraphicsPath tile;
     AddRoundedRect(tile, 18.0f, 19.0f, 52.0f, 52.0f, 10.0f);
@@ -2607,7 +2679,7 @@ void DrawNotification(Gdiplus::Graphics& gfx) {
                        kClipboardImageCanvasH - 14.0f,
                        static_cast<float>(g_cornerRadius.load()));
         Gdiplus::SolidBrush background(ToGdiColor(bg,
-            static_cast<BYTE>((g_backgroundOpacity.load() * 255 + 50) / 100)));
+            OsdBackgroundAlpha()));
         gfx.FillPath(&background, &card);
 
         constexpr float left = 20.0f;
@@ -2645,7 +2717,7 @@ void DrawNotification(Gdiplus::Graphics& gfx) {
     AddRoundedRect(body, 8, 7, 280, 77,
                    static_cast<float>(g_cornerRadius.load()));
     Gdiplus::SolidBrush bgBrush(ToGdiColor(bg,
-        static_cast<BYTE>((g_backgroundOpacity.load() * 255 + 50) / 100)));
+        OsdBackgroundAlpha()));
     gfx.FillPath(&bgBrush, &body);
     const float iconX = 18.0f, iconY = 19.0f, iconW = 52.0f;
     Gdiplus::GraphicsPath tile;
@@ -2663,6 +2735,9 @@ void DrawNotification(Gdiplus::Graphics& gfx) {
 // Windows 11 layered GDI+ windows use UpdateLayeredWindow (premultiplied
 // alpha). NEVER mix SetLayeredWindowAttributes on the popup/panel: doing so
 // would break subsequent UpdateLayeredWindow calls.
+// ============================================================
+// Popup lifetime, hide/fade and input geometry
+// ============================================================
 void FinishPopupHide() {
     HideMirroredWindows(false);
     g_ddcTargets.clear(); // Release per-monitor values after visibility ends.
@@ -2888,6 +2963,9 @@ void ShowNotice(std::wstring title, std::wstring body, DurationKind kind) {
     ResetHideTimerFor(kind);
 }
 
+// ============================================================
+// Clipboard event processing
+// ============================================================
 void ProcessClipboard() {
     if (!g_showClipboardOsd.load()) return;
     if (!OpenClipboard(g_receiveWnd)) return;
@@ -2956,12 +3034,11 @@ void ProcessClipboard() {
     ShowNotice(std::move(title), std::move(body), DurationKind::Clipboard);
 }
 
-// Event-based USB interface notifications, Bluetooth classic radio HCI
-// notifications and OS aggregate network connectivity hints.
-constexpr GUID kUsbDeviceInterface = {0xa5dcbf10,0x6530,0x11d2,
-    {0x90,0x1f,0x00,0xc0,0x4f,0xb9,0x51,0xed}};
-constexpr GUID kBtHciEvent = {0xfc240062,0x1541,0x49be,
-    {0xb4,0x63,0x84,0xc4,0xdc,0xd7,0xbf,0x7f}};
+// ============================================================
+// USB, network and Bluetooth device event handlers
+// ============================================================
+// Event-based USB interface notifications and OS connectivity hints.
+// Bluetooth uses typed Windows DeviceWatcher projections below.
 
 // The network APIs were introduced in Windows 10 2004. Win32 ABI avoids
 // depending on newer MinGW header definitions on an older Windhawk compiler.
@@ -2987,7 +3064,6 @@ void WINAPI NetworkChanged(void*, NetworkHintAbi hint) {
                                static_cast<WPARAM>(hint.connectivityLevel), 0);
 }
 
-std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot();
 void CaptureNetworkBaseline() {
     g_networkInterfaces.clear();
     for (auto& item : GetNetworkSnapshot())
@@ -3017,51 +3093,14 @@ void InitDeviceEvents() {
     usb.dbcc_classguid = kUsbDeviceInterface;
     g_usbNotification = RegisterDeviceNotificationW(
         g_receiveWnd, &usb, DEVICE_NOTIFY_WINDOW_HANDLE);
-
-    g_bluetoothDll = LoadLibraryExW(L"bthprops.cpl", nullptr,
-                                    LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!g_bluetoothDll) return;
-    using FirstRadio = HBLUETOOTH_RADIO_FIND (WINAPI*)(
-        const BLUETOOTH_FIND_RADIO_PARAMS*, HANDLE*);
-    using NextRadio = BOOL (WINAPI*)(HBLUETOOTH_RADIO_FIND, HANDLE*);
-    using CloseFind = BOOL (WINAPI*)(HBLUETOOTH_RADIO_FIND);
-    const auto first = reinterpret_cast<FirstRadio>(
-        GetProcAddress(g_bluetoothDll, "BluetoothFindFirstRadio"));
-    const auto next = reinterpret_cast<NextRadio>(
-        GetProcAddress(g_bluetoothDll, "BluetoothFindNextRadio"));
-    const auto finish = reinterpret_cast<CloseFind>(
-        GetProcAddress(g_bluetoothDll, "BluetoothFindRadioClose"));
-    if (!first || !next || !finish) return;
-    BLUETOOTH_FIND_RADIO_PARAMS search{};
-    search.dwSize = sizeof(search);
-    HANDLE radio = nullptr;
-    HBLUETOOTH_RADIO_FIND iteration = first(&search, &radio);
-    if (!iteration) return;
-    do {
-        if (radio && radio != INVALID_HANDLE_VALUE) {
-            DEV_BROADCAST_HANDLE filter{};
-            filter.dbch_size = sizeof(filter);
-            filter.dbch_devicetype = DBT_DEVTYP_HANDLE;
-            filter.dbch_handle = radio;
-            HDEVNOTIFY notify = RegisterDeviceNotificationW(
-                g_receiveWnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
-            if (notify) g_bluetoothNotifications.push_back(notify);
-            g_bluetoothRadios.push_back(radio);
-        }
-        radio = nullptr;
-    } while (next(iteration, &radio));
-    finish(iteration);
+    bt_monitor::Start(); // No-op unless opt-in is enabled.
 }
 
 void StopDeviceEvents() {
+    // Revoke WinRT callbacks before destroying the UI receiver or COM MTA.
+    bt_monitor::Stop();
     if (g_usbNotification) UnregisterDeviceNotification(g_usbNotification);
     g_usbNotification = nullptr;
-    for (auto notify : g_bluetoothNotifications) UnregisterDeviceNotification(notify);
-    g_bluetoothNotifications.clear();
-    for (HANDLE radio : g_bluetoothRadios) CloseHandle(radio);
-    g_bluetoothRadios.clear();
-    if (g_bluetoothDll) FreeLibrary(g_bluetoothDll);
-    g_bluetoothDll = nullptr;
     if (g_networkNotification && g_networkDll) {
         const auto cancel = reinterpret_cast<CancelNetworkHint>(
             GetProcAddress(g_networkDll, "CancelMibChangeNotify2"));
@@ -3096,23 +3135,6 @@ std::wstring UsbDeviceLabel(const std::wstring& path) {
     }
     SetupDiDestroyDeviceInfoList(devices);
     return label;
-}
-
-std::wstring BluetoothDeviceLabel(HANDLE radio, ULONGLONG address) {
-    using GetBtInfo = DWORD (WINAPI*)(HANDLE, BLUETOOTH_DEVICE_INFO*);
-    if (g_bluetoothDll) {
-        auto getInfo = reinterpret_cast<GetBtInfo>(
-            GetProcAddress(g_bluetoothDll, "BluetoothGetDeviceInfo"));
-        if (getInfo) {
-            BLUETOOTH_DEVICE_INFO info{};
-            info.dwSize = sizeof(info);
-            info.Address.ullLong = address;
-            if (getInfo(radio, &info) == ERROR_SUCCESS && info.szName[0])
-                return std::wstring(info.szName,
-                    std::min<size_t>(wcslen(info.szName), 80));
-        }
-    }
-    return Tr(OsdText::BluetoothDevice);
 }
 
 // Capture interface transitions on network-hint events. A connectivity hint
@@ -3200,46 +3222,275 @@ bool HandleDeviceChange(WPARAM type, LPARAM value) {
                        path, label);
         return true;
     }
-    if (header->dbch_devicetype == DBT_DEVTYP_HANDLE &&
-        type == DBT_CUSTOMEVENT && g_showBluetoothEvents.load() &&
-        header->dbch_size >= offsetof(DEV_BROADCAST_HANDLE, dbch_data) +
-                             sizeof(BTH_HCI_EVENT_INFO)) {
-        const auto* dev = reinterpret_cast<const DEV_BROADCAST_HANDLE*>(value);
-        if (!IsEqualGUID(dev->dbch_eventguid, kBtHciEvent)) return false;
-        BTH_HCI_EVENT_INFO event{};
-        memcpy(&event, dev->dbch_data, sizeof(event));
-        if (event.connectionType != 1 /* HCI_CONNECTION_TYPE_ACL */) return true;
-        const DWORD now = GetTickCount();
-        const ULONGLONG address = event.bthAddress;
-        const bool connected = event.connected != 0;
-        const auto existing = g_btPrevious.find(address);
-        if (existing != g_btPrevious.end() &&
-            existing->second.connected == connected &&
-            now - existing->second.when < 700) return true;
-        if (g_btPrevious.size() >= 64) g_btPrevious.clear();
-        g_btPrevious[address] = {connected, now};
-        AddNoticeEvent(NoticeCategory::Bluetooth, connected ?
-            NoticeAction::Connected : NoticeAction::Disconnected,
-            std::to_wstring(address), BluetoothDeviceLabel(dev->dbch_handle, address));
-        return true;
-    }
     return false;
 }
 
+// --- Bluetooth AEP watcher (Classic + LE), UI-thread-owned WinRT objects. ---
+// The old v1.7.6 crash experiment built its own IInspectable delegates and
+// guessed vtable slots. Here the Windows projection owns all COM ABI details.
+// Callbacks NEVER touch HWND/GDI+, native Bluetooth handles or notification UI.
+namespace bt_monitor {
+namespace de = winrt::Windows::Devices::Enumeration;
+namespace db = winrt::Windows::Devices::Bluetooth;
+namespace fc = winrt::Windows::Foundation::Collections;
+
+
+enum class Change : uint8_t { Added, Updated, Removed, Completed };
+struct Event {
+    int transport = 0; // 0=Bluetooth Classic, 1=Bluetooth LE.
+    Change change = Change::Added;
+    std::wstring id, name;
+    bool connectionPresent = false, connected = false;
+};
+struct DeviceState {
+    std::wstring name;
+    bool connectionKnown = false, connected = false;
+};
+struct CallbackGate {
+    std::atomic<bool> enabled{true};
+    std::atomic<unsigned> inFlight{0};
+};
+struct Watcher {
+    de::DeviceWatcher value{nullptr};
+    winrt::event_token added{}, updated{}, removed{}, enumerated{};
+    std::shared_ptr<CallbackGate> gate;
+};
+
+// The receive window owns all device states. Callback threads only append to
+// this short, bounded queue, then post a zero-payload message to the OSD UI.
+[[clang::no_destroy]] std::mutex queueMutex;
+[[clang::no_destroy]] std::vector<Event> queue;
+[[clang::no_destroy]] std::unordered_map<std::wstring, DeviceState> known;
+[[clang::no_destroy]] std::array<std::unique_ptr<Watcher>, 2> watchers;
+std::array<bool, 2> enumerationComplete{};
+std::atomic<HWND> receiver{nullptr};
+std::atomic<bool> accepting{false};
+
+std::wstring Limited(winrt::hstring const& input, size_t maxChars) {
+    return {input.c_str(), std::min<size_t>(input.size(), maxChars)};
+}
+
+bool TryConnected(fc::IMapView<winrt::hstring, winrt::Windows::Foundation::IInspectable>
+                  const& properties, bool& connected) {
+    if (!properties || !properties.HasKey(kConnectedProperty)) return false;
+    auto value = properties.Lookup(kConnectedProperty);
+    if (!value) return false;
+    connected = winrt::unbox_value<bool>(value);
+    return true;
+}
+
+void Post(Event&& event) {
+    if (!accepting.load(std::memory_order_acquire) ||
+        g_closing.load(std::memory_order_relaxed)) return;
+    HWND target = receiver.load(std::memory_order_acquire);
+    if (!target) return;
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        queued = accepting.load(std::memory_order_relaxed) &&
+                 queue.size() < kMaxQueuedEvents;
+        if (queued) queue.emplace_back(std::move(event));
+    }
+    // A failed PostMessage leaves the event in the queue. Any later callback
+    // will retry; there is no heap pointer stranded in a destroyed HWND.
+    if (queued) (void)PostMessageW(target, kBluetoothQueueMessage, 0, 0);
+}
+
+template <typename Fn>
+void WithGate(std::weak_ptr<CallbackGate> const& weak, Fn&& action) noexcept {
+    auto gate = weak.lock();
+    if (!gate) return;
+    gate->inFlight.fetch_add(1, std::memory_order_acq_rel);
+    if (gate->enabled.load(std::memory_order_acquire)) {
+        try { action(); } catch (...) {
+            // A broken device property is not allowed to cross WinRT's ABI.
+        }
+    }
+    gate->inFlight.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void Stop() {
+    accepting.store(false, std::memory_order_release);
+    receiver.store(nullptr, std::memory_order_release);
+    for (auto& watcher : watchers) {
+        if (!watcher) continue;
+        watcher->gate->enabled.store(false, std::memory_order_release);
+        try {
+            // Revoke every callback before Stop, especially during mod unload.
+            if (watcher->added.value) watcher->value.Added(watcher->added);
+            if (watcher->updated.value) watcher->value.Updated(watcher->updated);
+            if (watcher->removed.value) watcher->value.Removed(watcher->removed);
+            if (watcher->enumerated.value)
+                watcher->value.EnumerationCompleted(watcher->enumerated);
+            auto status = watcher->value.Status();
+            if (status == de::DeviceWatcherStatus::Started ||
+                status == de::DeviceWatcherStatus::EnumerationCompleted)
+                watcher->value.Stop();
+        } catch (...) {
+            // Release the projection objects regardless of device removal.
+        }
+    }
+    for (auto& watcher : watchers) {
+        if (!watcher) continue;
+        // All callbacks are bounded to a property read and a queue append.
+        // They cannot call user callbacks or wait for the OSD message loop.
+        while (watcher->gate->inFlight.load(std::memory_order_acquire))
+            Sleep(1);
+        watcher.reset();
+    }
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        queue.clear();
+    }
+    known.clear();
+    enumerationComplete = {false, false};
+}
+
+void StartOne(int transport, winrt::hstring const& selector) {
+    auto item = std::make_unique<Watcher>();
+    item->gate = std::make_shared<CallbackGate>();
+    auto weak = std::weak_ptr<CallbackGate>(item->gate);
+    auto properties = winrt::single_threaded_vector<winrt::hstring>(
+        std::vector<winrt::hstring>{kConnectedProperty});
+    item->value = de::DeviceInformation::CreateWatcher(
+        selector, properties, de::DeviceInformationKind::AssociationEndpoint);
+
+    item->added = item->value.Added([weak, transport](
+        de::DeviceWatcher const&, de::DeviceInformation const& info) {
+        WithGate(weak, [&] {
+            Event event;
+            event.transport = transport;
+            event.change = Change::Added;
+            event.id = Limited(info.Id(), 512);
+            if (event.id.empty()) return;
+            event.name = Limited(info.Name(), 80);
+            event.connectionPresent = TryConnected(info.Properties(), event.connected);
+            Post(std::move(event));
+        });
+    });
+    item->updated = item->value.Updated([weak, transport](
+        de::DeviceWatcher const&, de::DeviceInformationUpdate const& info) {
+        WithGate(weak, [&] {
+            Event event;
+            event.transport = transport;
+            event.change = Change::Updated;
+            event.id = Limited(info.Id(), 512);
+            if (event.id.empty()) return;
+            // Updated is a partial property bag: missing IsConnected must
+            // never be interpreted as a disconnection.
+            event.connectionPresent = TryConnected(info.Properties(), event.connected);
+            if (event.connectionPresent) Post(std::move(event));
+        });
+    });
+    item->removed = item->value.Removed([weak, transport](
+        de::DeviceWatcher const&, de::DeviceInformationUpdate const& info) {
+        WithGate(weak, [&] {
+            Event event;
+            event.transport = transport;
+            event.change = Change::Removed;
+            event.id = Limited(info.Id(), 512);
+            if (!event.id.empty()) Post(std::move(event));
+        });
+    });
+    item->enumerated = item->value.EnumerationCompleted([weak, transport](
+        de::DeviceWatcher const&, winrt::Windows::Foundation::IInspectable const&) {
+        WithGate(weak, [&] {
+            Event event;
+            event.transport = transport;
+            event.change = Change::Completed;
+            Post(std::move(event));
+        });
+    });
+    // Ownership precedes Start; an early callback can only enqueue a message.
+    watchers[transport] = std::move(item);
+    watchers[transport]->value.Start();
+}
+
+void Start() {
+    if (!g_receiveWnd || g_closing.load() ||
+        !g_showBluetoothEvents.load()) return;
+    if (watchers[0] || watchers[1]) return;
+    receiver.store(g_receiveWnd, std::memory_order_release);
+    accepting.store(true, std::memory_order_release);
+    try {
+        // Paired-only selectors do not trigger scans for arbitrary unpaired
+        // nearby BLE devices. Classic and LE are both tracked as AEPs.
+        StartOne(0, db::BluetoothDevice::GetDeviceSelectorFromPairingState(true));
+    } catch (winrt::hresult_error const& error) {
+        Wh_Log(L"Bluetooth Classic watcher failed: 0x%08lX",
+               static_cast<unsigned long>(error.code().value));
+    } catch (...) { Wh_Log(L"Bluetooth Classic watcher failed"); }
+    try {
+        StartOne(1, db::BluetoothLEDevice::GetDeviceSelectorFromPairingState(true));
+    } catch (winrt::hresult_error const& error) {
+        Wh_Log(L"Bluetooth LE watcher failed: 0x%08lX",
+               static_cast<unsigned long>(error.code().value));
+    } catch (...) { Wh_Log(L"Bluetooth LE watcher failed"); }
+    if (!watchers[0] && !watchers[1]) Stop();
+}
+
+void Drain() {
+    std::vector<Event> events;
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        events.swap(queue);
+    }
+    if (!accepting.load(std::memory_order_acquire)) return;
+
+    for (auto& event : events) {
+        if (event.transport < 0 || event.transport > 1) continue;
+        const size_t transport = static_cast<size_t>(event.transport);
+        if (event.change == Change::Completed) {
+            enumerationComplete[transport] = true; // Initial scan is silent.
+            continue;
+        }
+        if (event.id.empty()) continue;
+        const std::wstring id = (transport ? L"ble:" : L"classic:") + event.id;
+        auto previous = known.find(id);
+        if (event.change == Change::Removed) {
+            if (previous != known.end()) {
+                if (enumerationComplete[transport] &&
+                    previous->second.connectionKnown && previous->second.connected &&
+                    g_showBluetoothEvents.load())
+                    AddNoticeEvent(NoticeCategory::Bluetooth,
+                        NoticeAction::Disconnected, id,
+                        previous->second.name.empty() ? Tr(OsdText::BluetoothDevice)
+                                                      : previous->second.name);
+                known.erase(previous);
+            }
+            continue;
+        }
+        if (previous == known.end()) {
+            if (known.size() >= kMaxKnownDevices) continue;
+            previous = known.emplace(id, DeviceState{}).first;
+        }
+        auto& current = previous->second;
+        if (!event.name.empty()) current.name = std::move(event.name);
+        if (!event.connectionPresent) continue;
+        const bool changed = !current.connectionKnown ||
+                             current.connected != event.connected;
+        // A first Updated state may be a late initial snapshot. Report only
+        // known-state changes, or a newly Added connected device after scan.
+        // A first false observation is never a disconnection transition.
+        const bool shouldNotify = enumerationComplete[transport] && changed &&
+                                  (current.connectionKnown ||
+                                   (event.change == Change::Added && event.connected));
+        current.connected = event.connected;
+        current.connectionKnown = true;
+        if (shouldNotify && g_showBluetoothEvents.load())
+            AddNoticeEvent(NoticeCategory::Bluetooth,
+                event.connected ? NoticeAction::Connected : NoticeAction::Disconnected,
+                id, current.name.empty() ? Tr(OsdText::BluetoothDevice)
+                                         : current.name);
+    }
+}
+} // namespace bt_monitor
+
+// ============================================================
+// Master and multi-display rendering
+// ============================================================
 // No DDC or monitor I/O, timers or extra worker threads in this renderer.
-// Forward declarations for the new UI renderer.
-void DrawHorizontalVolume(Gdiplus::Graphics& gfx);
-void DrawLockStatus(Gdiplus::Graphics& gfx);
-void DrawNotification(Gdiplus::Graphics& gfx);
-void DrawExpandChevron(Gdiplus::Graphics& gfx, float x, float y,
-                       Gdiplus::Color color);
-
-void RenderMirroredFrame(HDC screen, void* pixels, int sourceWidth,
-                         int sourceHeight, bool panel);
-void RenderDdcTargetPeers();
-void HideMirroredWindows(bool onlyPanel);
-void DestroyMirroredWindows();
-
+// Draw to premultiplied BGRA pixels before publishing a layered surface.
 struct PopupFrame {
     HWND window = nullptr;
     int width = 0, height = 0;
@@ -3259,16 +3510,8 @@ bool RenderPopupFrame(const PopupFrame& frame, bool publishMirrors) {
     if (!memory) { ReleaseDC(nullptr, screen); return false; }
     bool published = false;
 
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = frame.width;
-    bi.bmiHeader.biHeight = -frame.height;  // top-down
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
     void* pixels = nullptr;
-    HBITMAP bitmap = CreateDIBSection(screen, &bi, DIB_RGB_COLORS,
-                                      &pixels, nullptr, 0);
+    HBITMAP bitmap = CreateArgbDib(screen, frame.width, frame.height, &pixels);
     if (bitmap && pixels) {
         HGDIOBJ previous = SelectObject(memory, bitmap);
         {
@@ -3301,8 +3544,7 @@ bool RenderPopupFrame(const PopupFrame& frame, bool publishMirrors) {
                 OsdTrackRgb(light);
             const DWORD accentRgb =
                 OsdAccentRgb();
-            const BYTE backgroundAlpha = static_cast<BYTE>(
-                (g_backgroundOpacity.load() * 255 + 50) / 100);
+            const BYTE backgroundAlpha = OsdBackgroundAlpha();
             const Gdiplus::Color card =
                 ToGdiColor(backgroundRgb, backgroundAlpha);
             const Gdiplus::Color foreground = ToGdiColor(textRgb);
@@ -3352,9 +3594,8 @@ bool RenderPopupFrame(const PopupFrame& frame, bool publishMirrors) {
             sunPen.SetStartCap(Gdiplus::LineCapRound);
             sunPen.SetEndCap(Gdiplus::LineCapRound);
             gfx.DrawEllipse(&sunPen, 44.5f, centerY - 6.0f, 12.0f, 12.0f);
-            constexpr float tau = 6.28318530718f;
             for (int i = 0; i < 8; ++i) {
-                const float a = tau * i / 8.0f;
+                const float a = kTau * i / 8.0f;
                 const float sx = std::cos(a), sy = std::sin(a);
                 gfx.DrawLine(&sunPen, 50.5f + sx * 9.6f,
                              centerY + sy * 9.6f,
@@ -3430,11 +3671,8 @@ bool RenderPopupFrame(const PopupFrame& frame, bool publishMirrors) {
             } // g_showValue
             } // horizontal renderer
         }
-        SIZE size{frame.width, frame.height};
-        POINT origin{0, 0};
-        BLENDFUNCTION blend{AC_SRC_OVER, 0, static_cast<BYTE>(g_fadeAlpha), AC_SRC_ALPHA};
-        if (!UpdateLayeredWindow(frame.window, screen, nullptr, &size,
-                                 memory, &origin, 0, &blend, ULW_ALPHA)) {
+        if (!PublishArgbLayer(frame.window, screen, memory,
+                              frame.width, frame.height)) {
             Wh_Log(L"UpdateLayeredWindow failed: %lu", GetLastError());
         } else {
             published = true;
@@ -3712,16 +3950,8 @@ void RenderMirroredFrame(HDC screen, void* pixels, int sourceWidth,
         }
         HDC targetDC = CreateCompatibleDC(screen);
         if (!targetDC) continue;
-        BITMAPINFO bi{};
-        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-        bi.bmiHeader.biWidth = width;
-        bi.bmiHeader.biHeight = -height;
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
         void* targetPixels = nullptr;
-        HBITMAP bitmap = CreateDIBSection(screen, &bi, DIB_RGB_COLORS,
-                                          &targetPixels, nullptr, 0);
+        HBITMAP bitmap = CreateArgbDib(screen, width, height, &targetPixels);
         if (bitmap && targetPixels) {
             HGDIOBJ previous = SelectObject(targetDC, bitmap);
             {
@@ -3733,12 +3963,8 @@ void RenderMirroredFrame(HDC screen, void* pixels, int sourceWidth,
                     Gdiplus::InterpolationModeHighQualityBicubic);
                 graphics.DrawImage(&source, Gdiplus::Rect(0, 0, width, height));
             }
-            SIZE size{width, height};
-            POINT origin{0, 0};
-            BLENDFUNCTION blend{AC_SRC_OVER, 0,
-                static_cast<BYTE>(g_fadeAlpha), AC_SRC_ALPHA};
-            if (UpdateLayeredWindow(mirror, screen, nullptr, &size,
-                                    targetDC, &origin, 0, &blend, ULW_ALPHA))
+            if (PublishArgbLayer(mirror, screen, targetDC,
+                                 width, height))
                 ShowWindow(mirror, SW_SHOWNOACTIVATE);
             SelectObject(targetDC, previous);
             DeleteObject(bitmap);
@@ -3860,6 +4086,9 @@ void DisplayDdcBatch() {
     ResetHideTimerFor(DurationKind::DdcBrightness);
 }
 
+// ============================================================
+// Brightness writer worker and bar interaction
+// ============================================================
 // Brightness writes never execute on the OSD UI thread. Firmware DDC/CI
 // can be slow, so a single sleeping worker coalesces wheel updates. This
 // worker does not poll monitors and starts only in explorer.exe.
@@ -3875,12 +4104,8 @@ bool WriteNativeBrightnessWmi(BYTE percent) {
     // IWbemServices calls run on the separate worker with its own MTA.
     IWbemLocator* locator = nullptr;
     // Inline COM GUIDs avoid requiring wbemuuid.lib in Windhawk/MinGW.
-    constexpr GUID clsid = {0x4590f811, 0x1d3a, 0x11d0,
-        {0x89,0x1f,0x00,0xaa,0x00,0x4b,0x2e,0x24}};
-    constexpr GUID iid = {0xdc12a687, 0x737f, 0x11cf,
-        {0x88,0x4d,0x00,0xaa,0x00,0x4b,0x2e,0x24}};
-    if (FAILED(CoCreateInstance(clsid, nullptr, CLSCTX_INPROC_SERVER,
-            iid, reinterpret_cast<void**>(&locator))) || !locator)
+    if (FAILED(CoCreateInstance(kWmiLocatorClsid, nullptr, CLSCTX_INPROC_SERVER,
+            kWmiLocatorIid, reinterpret_cast<void**>(&locator))) || !locator)
         return false;
     ScopedBstr ns(L"ROOT\\WMI");
     IWbemServices* service = nullptr;
@@ -4144,6 +4369,9 @@ void HandleMainBarWheel(int delta) {
 // No synchronous WinRT waits or media metadata calls run on Explorer's UI
 // thread. Poll async completion with a bounded wait so Windhawk unload joins
 // cannot be held indefinitely by media-player or broker operations.
+// ============================================================
+// SMTC WinRT projection and media worker
+// ============================================================
 namespace smtc_projection {
 namespace wf = winrt::Windows::Foundation;
 namespace mc = winrt::Windows::Media::Control;
@@ -4174,8 +4402,7 @@ bool ResultOf(wf::IAsyncOperation<bool> const& task) {
 
 // Media metadata is untrusted. Cap UTF-16 size, keeping surrogate pairs intact.
 std::wstring MediaText(winrt::hstring const& value) {
-    constexpr size_t kMaxChars = 4096;
-    size_t count = std::min<size_t>(value.size(), kMaxChars);
+    size_t count = std::min<size_t>(value.size(), kMaxMediaTextChars);
     const wchar_t* ptr = value.c_str();
     if (count < value.size() && count &&
         ptr[count - 1] >= 0xD800 && ptr[count - 1] <= 0xDBFF)
@@ -4249,9 +4476,8 @@ void ReadTimeline(Session const& session, MediaSnapshot& snapshot) {
         ULARGE_INTEGER absolute{};
         absolute.LowPart = now.dwLowDateTime;
         absolute.HighPart = now.dwHighDateTime;
-        constexpr INT64 kMaxLag = INT64(24) * 60 * 60 * 10000000;
         const INT64 now100ns = static_cast<INT64>(absolute.QuadPart);
-        if (now100ns >= updated && now100ns - updated <= kMaxLag)
+        if (now100ns >= updated && now100ns - updated <= kMaxMediaLag100ns)
             position += std::min(end - position, now100ns - updated);
     }
     snapshot.hasTimeline = true;
@@ -4269,15 +4495,14 @@ void ReadArtwork(streams::IRandomAccessStreamReference const& thumbnail,
     if (!AwaitReady(open)) return;
     auto stream = open.get();
     if (!stream) return;
-    constexpr uint32_t kMaxArtwork = 1024u * 1024u;
     const uint64_t size = stream.Size();
-    if (!size || size > kMaxArtwork) return;
+    if (!size || size > kMaxArtworkBytes) return;
     const auto count = static_cast<uint32_t>(size);
     streams::Buffer buffer(count);
     auto read = stream.ReadAsync(buffer, count, streams::InputStreamOptions::None);
     if (!AwaitReady(read)) return;
     auto bytes = read.get();
-    if (!bytes || !bytes.Length() || bytes.Length() > kMaxArtwork) return;
+    if (!bytes || !bytes.Length() || bytes.Length() > kMaxArtworkBytes) return;
     output.resize(bytes.Length());
     auto reader = streams::DataReader::FromBuffer(bytes);
     reader.ReadBytes(winrt::array_view<uint8_t>(
@@ -4426,6 +4651,9 @@ DWORD WINAPI MediaThreadProc(void*) {
 }
 
 // -- Interactive Core Audio session mixer, created/refreshed only on demand.
+// ============================================================
+// Audio mixer and per-session controls
+// ============================================================
 std::wstring ProcessTitle(DWORD pid) {
     if (!pid) return Tr(OsdText::SystemSounds);
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -4643,6 +4871,9 @@ void ToggleMixerMute(int index) {
     ResetHideTimerFor(DurationKind::Interactive);
 }
 
+// ============================================================
+// Expanded media/mixer/details panel rendering
+// ============================================================
 void DrawText(Gdiplus::Graphics& gfx, const std::wstring& str,
               float x, float y, float w, float h, float size,
               Gdiplus::Color color, bool centered,
@@ -4665,8 +4896,8 @@ void DrawText(Gdiplus::Graphics& gfx, const std::wstring& str,
 }
 
 // Draw tiny Fluent-like transport controls at one fixed visual scale.
-// Glyphs use the exact same user scale as the button's hit box. The default
-// 125% produces 40px logical circles and ~16px transport symbols.
+// Glyphs use the exact same user scale as the button's hit box.
+// At the default 100%, circles are 32px logical and symbols ~13px.
 void DrawMediaControl(Gdiplus::Graphics& gfx, float cx, float cy,
                       int action, bool playing, Gdiplus::Color color,
                       float pressScale = 1.0f) {
@@ -4701,7 +4932,7 @@ void DrawPanelCard(Gdiplus::Graphics& gfx, float width, float height,
                    bool alignToMainVolume = false) {
     bool light = IsLightTheme();
     DWORD bg = OsdBackgroundRgb(light);
-    BYTE alpha = static_cast<BYTE>((g_backgroundOpacity.load() * 255 + 50) / 100);
+    BYTE alpha = OsdBackgroundAlpha();
     const bool vertical = g_verticalVolumeBrightness.load();
     const float topInset = vertical ? 6.0f : 10.0f;
     const float bottomInset = vertical ? 6.0f : 13.0f;
@@ -5278,16 +5509,8 @@ void RenderPanel() {
     if (!screen) return;
     HDC memory = CreateCompatibleDC(screen);
     if (!memory) { ReleaseDC(nullptr, screen); return; }
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
     void* pixels = nullptr;
-    HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS,
-                                   &pixels, nullptr, 0);
+    HBITMAP bmp = CreateArgbDib(screen, w, h, &pixels);
     if (bmp && pixels) {
         HGDIOBJ old = SelectObject(memory, bmp);
         {
@@ -5302,10 +5525,7 @@ void RenderPanel() {
             else if (g_panelMode == PanelMode::Mixer) DrawMixerPanel(gfx);
             else DrawNoticeDetails(gfx);
         }
-        SIZE sz{w,h}; POINT origin{0,0};
-        BLENDFUNCTION blend{AC_SRC_OVER, 0, static_cast<BYTE>(g_fadeAlpha), AC_SRC_ALPHA};
-        UpdateLayeredWindow(g_panelWnd, screen, nullptr, &sz,
-                            memory, &origin, 0, &blend, ULW_ALPHA);
+        (void)PublishArgbLayer(g_panelWnd, screen, memory, w, h);
         if (g_displayOutputMode.load(std::memory_order_relaxed) == 3)
             RenderMirroredFrame(screen, pixels, w, h, true);
         SelectObject(memory, old);
@@ -5509,7 +5729,7 @@ void DrawHorizontalVolume(Gdiplus::Graphics& gfx) {
     AddRoundedRect(body, 13.0f, 10.0f, logicalW - 26.0f,
                    logicalH - 23.0f, static_cast<float>(g_cornerRadius.load()));
     Gdiplus::SolidBrush base(ToGdiColor(bg,
-        static_cast<BYTE>((g_backgroundOpacity.load() * 255 + 50) / 100)));
+        OsdBackgroundAlpha()));
     gfx.FillPath(&base, &body);
     Gdiplus::Color fg = ToGdiColor(fgRgb);
     float speakerX = 0.0f, speakerY = 0.0f;
@@ -5557,8 +5777,6 @@ void DrawLockStatus(Gdiplus::Graphics& gfx) {
     const Gdiplus::Color fg = ToGdiColor(rgb);
     const Gdiplus::Color quiet(168, fg.GetR(), fg.GetG(), fg.GetB());
     const int key = std::clamp(g_lastLock, 0, 3);
-    constexpr PCWSTR names[] = {L"Caps Lock", L"Num Lock", L"Scroll Lock", L"Insert"};
-    constexpr PCWSTR glyphs[] = {L"A", L"1", L"↕", L"Ins"};
     const Gdiplus::Color active = ToGdiColor(accentRgb);
     const Gdiplus::Color faded(130, active.GetR(), active.GetG(), active.GetB());
     Gdiplus::GraphicsPath tile;
@@ -5566,10 +5784,10 @@ void DrawLockStatus(Gdiplus::Graphics& gfx) {
     Gdiplus::SolidBrush tileBrush(light ? Gdiplus::Color(255,234,235,239)
                                          : Gdiplus::Color(255,66,67,72));
     gfx.FillPath(&tileBrush, &tile);
-    DrawText(gfx, glyphs[key], 14, 13, 36, 34,
+    DrawText(gfx, kLockGlyphs[key], 14, 13, 36, 34,
              key == 3 ? 12.0f : 21.0f,
              g_lastLockValue ? active : quiet, true);
-    DrawText(gfx, names[key], 61, 14, 100, 22, 14, fg);
+    DrawText(gfx, kLockDisplayNames[key], 61, 14, 100, 22, 14, fg);
     DrawText(gfx, g_lastLockValue ? Tr(OsdText::On) : Tr(OsdText::Off), 61, 35, 60, 18,
              12, quiet);
     Gdiplus::GraphicsPath progress;
@@ -5580,6 +5798,9 @@ void DrawLockStatus(Gdiplus::Graphics& gfx) {
 
 // Low-level keyboard hook: event-driven and no keyboard polling. Toggle state
 // is tracked on first key down (not repeated autorepeat key-down messages).
+// ============================================================
+// Input hit surfaces, UI event dispatch and thread
+// ============================================================
 LRESULT CALLBACK LockKeyProc(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && lp) {
         const auto* event = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
@@ -5736,6 +5957,15 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (hwnd == g_receiveWnd && msg == WM_DEVICECHANGE) {
         if (HandleDeviceChange(wp, lp)) return TRUE;
     }
+    if (hwnd == g_receiveWnd && msg == kBluetoothQueueMessage) {
+        bt_monitor::Drain();
+        return 0;
+    }
+    if (hwnd == g_receiveWnd && msg == kBluetoothConfigMessage) {
+        if (g_showBluetoothEvents.load()) bt_monitor::Start();
+        else bt_monitor::Stop();
+        return 0;
+    }
     if (hwnd == g_receiveWnd && msg == kNetworkNoticeMessage) {
         if (g_showNetworkEvents.load()) {
             const bool changed = CaptureNetworkEvents();
@@ -5869,7 +6099,6 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!terminator || g_closing.load()) return FALSE;
         // DDC/CI VCP values are 16-bit. Reject malformed cross-process
         // notices before their values can influence slider geometry.
-        constexpr DWORD kMaxVcpValue = 0xFFFF;
         if (ev.physicalIndex >= 32 ||
             ev.value > kMaxVcpValue || ev.minimum > kMaxVcpValue ||
             ev.maximum > kMaxVcpValue ||
@@ -6487,6 +6716,9 @@ DWORD WINAPI UiThreadProc(void*) {
 
 } // namespace
 
+// ============================================================
+// Windhawk module entrypoints and shutdown lifecycle
+// ============================================================
 BOOL Wh_ModInit() {
     WCHAR exe[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe))) return FALSE;
@@ -6498,7 +6730,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD & Media v1.7.6 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD & Media v1.7.7 initialized (%s)", name);
     return TRUE;
 }
 
@@ -6543,6 +6775,10 @@ void Wh_ModAfterInit() {
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
+    // Windhawk's settings callback is not the OSD UI thread.
+    HWND target = g_networkReceiver.load(std::memory_order_acquire);
+    if (g_isExplorer && target && !g_closing.load())
+        (void)PostMessageW(target, kBluetoothConfigMessage, 0, 0);
     // Refresh the next OSD using the newly selected theme. Settings never
     // force an unexpected brightness write or background monitor read.
 }
