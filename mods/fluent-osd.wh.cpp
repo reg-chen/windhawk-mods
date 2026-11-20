@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.14
+// @version         1.0.15
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.14)
+## XAML migration experiment (v1.0.15)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -769,11 +769,71 @@ struct State {
     shapes::Rectangle fill{nullptr};
     media::RectangleGeometry fillClip{nullptr};
     shapes::Ellipse thumb{nullptr};
+
+    // Intrinsic size of *all possible* speaker and volume-value states.
+    // These change only with the corresponding font size; neither text
+    // changes nor mute/volume events may change progress-track geometry.
+    int measuredIconFontSize = -1;
+    int measuredValueFontSize = -1;
+    double iconSlotWidth = 0.0, iconSlotHeight = 0.0;
+    double valueSlotWidth = 0.0, valueSlotHeight = 0.0;
 };
 media::SolidColorBrush Brush(DWORD rgb) {
     return media::SolidColorBrush(winrt::Windows::UI::Color{
         255, static_cast<BYTE>(rgb >> 16), static_cast<BYTE>(rgb >> 8),
         static_cast<BYTE>(rgb)});
+}
+
+// Dynamic-font measurement, but stable across all runtime values.
+// Use the actual visible XAML controls to guarantee matching typography.
+// Only recalculate when a font-size setting changes; otherwise changing
+// 98% to 100% (or toggling mute) must never shorten the track.
+void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
+    const winrt::Windows::Foundation::Size unconstrained{
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity()};
+    const double autoWidth = std::numeric_limits<double>::quiet_NaN();
+
+    if (state.measuredIconFontSize != iconFontSize) {
+        const winrt::hstring current = state.icon.Text();
+        state.icon.Width(autoWidth);
+        state.iconSlotWidth = 0.0;
+        state.iconSlotHeight = 0.0;
+        // Both volume/mute glyphs affect intrinsic TextBlock dimensions.
+        constexpr const wchar_t* kSpeakerGlyphs[] = {L"\uE74F", L"\uE767"};
+        for (const auto glyph : kSpeakerGlyphs) {
+            state.icon.Text(glyph);
+            state.icon.Measure(unconstrained);
+            const auto desired = state.icon.DesiredSize();
+            state.iconSlotWidth = std::max(
+                state.iconSlotWidth, static_cast<double>(desired.Width));
+            state.iconSlotHeight = std::max(
+                state.iconSlotHeight, static_cast<double>(desired.Height));
+        }
+        state.icon.Text(current);
+        state.measuredIconFontSize = iconFontSize;
+    }
+
+    if (state.measuredValueFontSize != valueFontSize) {
+        const winrt::hstring current = state.value.Text();
+        state.value.Width(autoWidth);
+        state.valueSlotWidth = 0.0;
+        state.valueSlotHeight = 0.0;
+        // Actual maximum over *all* possible labels, not an arbitrary
+        // text-box width or an assumption that "100%" is widest.
+        for (int percent = 0; percent <= 100; ++percent) {
+            state.value.Text(winrt::hstring(
+                std::to_wstring(percent) + L"%"));
+            state.value.Measure(unconstrained);
+            const auto desired = state.value.DesiredSize();
+            state.valueSlotWidth = std::max(
+                state.valueSlotWidth, static_cast<double>(desired.Width));
+            state.valueSlotHeight = std::max(
+                state.valueSlotHeight, static_cast<double>(desired.Height));
+        }
+        state.value.Text(current);
+        state.measuredValueFontSize = valueFontSize;
+    }
 }
 void DrawSnapshot(State& state) {
     if (!state.host || !state.card || !state.canvas ||
@@ -813,9 +873,11 @@ void DrawSnapshot(State& state) {
     const int percent = std::clamp(value.percent, 0, 100);
     // Segoe Fluent Icons is provided by Windows; no external font assets.
     state.icon.Text(value.muted || percent == 0 ? L"\uE74F" : L"\uE767");
-    state.icon.FontSize(std::clamp(value.iconSize, 10, 24));
+    const int iconFontSize = std::clamp(value.iconSize, 10, 24);
+    const int numberFontSize = std::clamp(value.fontSize, 10, 24);
+    state.icon.FontSize(iconFontSize);
     state.value.Text(winrt::hstring(std::to_wstring(percent) + L"%"));
-    state.value.FontSize(std::clamp(value.fontSize, 10, 24));
+    state.value.FontSize(numberFontSize);
     state.value.Visibility(value.showValue
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
 
@@ -824,20 +886,16 @@ void DrawSnapshot(State& state) {
     const double wantedThumb =
         static_cast<double>(std::clamp(value.thumbDiameter, 0, 20));
 
-    // Both axes use the actual XAML text metrics, not fixed glyph widths,
-    // track offsets or percentage-field reservations.
-    // Reset Width: the vertical branch uses a full-width centered label.
-    state.value.Width(std::numeric_limits<double>::quiet_NaN());
-    const winrt::Windows::Foundation::Size available{
-        static_cast<float>(bodyW), static_cast<float>(bodyH)};
-    state.icon.Measure(available);
-    state.value.Measure(available);
-    const double iconW = state.icon.DesiredSize().Width;
-    const double iconH = state.icon.DesiredSize().Height;
-    const double labelW = value.showValue
-        ? state.value.DesiredSize().Width : 0.0;
-    const double labelH = value.showValue
-        ? state.value.DesiredSize().Height : 0.0;
+    // Measure the intrinsic maximum among possible glyphs and labels.
+    // Do not base the available track width on the *current* percentage.
+    UpdateTextSlots(state, iconFontSize, numberFontSize);
+    const double iconW = state.iconSlotWidth;
+    const double iconH = state.iconSlotHeight;
+    const double labelW = value.showValue ? state.valueSlotWidth : 0.0;
+    const double labelH = value.showValue ? state.valueSlotHeight : 0.0;
+    // A single centered icon slot keeps speaker/mute glyph changes stable.
+    state.icon.Width(iconW);
+    state.icon.TextAlignment(wx::TextAlignment::Center);
     const double inner = std::max(0.0, static_cast<double>(value.innerPadding));
 
     if (value.vertical) {
@@ -961,7 +1019,7 @@ void DrawSnapshot(State& state) {
 
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.14: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.15: show failed (%lu)", GetLastError());
         return;
     }
     KillTimer(state.host, kHideTimer);
@@ -982,13 +1040,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DrawSnapshot(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.14: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.15: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.14: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.15: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
@@ -1116,7 +1174,7 @@ DWORD WINAPI ThreadProc(void*) {
             const HRESULT borderHr = DwmSetWindowAttribute(
                 state.host, DWMWA_BORDER_COLOR,
                 &noBorder, sizeof(noBorder));
-            Wh_Log(L"XAML v1.0.14: DWM round=0x%08lX border-none=0x%08lX",
+            Wh_Log(L"XAML v1.0.15: DWM round=0x%08lX border-none=0x%08lX",
                    static_cast<unsigned long>(dwm),
                    static_cast<unsigned long>(borderHr));
             if (!g_stopping.load()) {
@@ -1135,7 +1193,7 @@ DWORD WINAPI ThreadProc(void*) {
                     winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
                 CreateContent(state);
                 g_ready.store(state.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.14: renderer ready");
+                Wh_Log(L"XAML v1.0.15: renderer ready");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -1144,11 +1202,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.14: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.15: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.14: startup exception");
+        Wh_Log(L"XAML v1.0.15: startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -1164,12 +1222,12 @@ DWORD WINAPI ThreadProc(void*) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.14: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.15: island close failed"); }
         state.source = nullptr;
     }
     if (state.manager) {
         try { state.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.14: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.15: manager close failed"); }
         state.manager = nullptr;
     }
     if (state.host) DestroyWindow(state.host);
@@ -1184,7 +1242,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.14: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.15: STA creation failed (%lu)", GetLastError());
     }
 }
 bool Show(const Snapshot& snapshot) {
@@ -7144,7 +7202,7 @@ void ShowNativeVolumePopup() {
 
         RECT target{};
         if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-            Wh_Log(L"Fluent OSD v1.0.14: XAML volume not delivered (missing anchor HWND)");
+            Wh_Log(L"Fluent OSD v1.0.15: XAML volume not delivered (missing anchor HWND)");
             return;
         }
         const bool light = IsLightTheme();
@@ -7170,12 +7228,12 @@ void ShowNativeVolumePopup() {
         static bool loggedXamlUnavailable = false;
         if (xaml_volume::Show(data)) {
             if (!loggedXamlRouting) {
-                Wh_Log(L"Fluent OSD v1.0.14: native volume -> XAML only");
+                Wh_Log(L"Fluent OSD v1.0.15: native volume -> XAML only");
                 loggedXamlRouting = true;
             }
             loggedXamlUnavailable = false;
         } else if (!loggedXamlUnavailable) {
-            Wh_Log(L"Fluent OSD v1.0.14: XAML volume unavailable; NO GDI+ fallback");
+            Wh_Log(L"Fluent OSD v1.0.15: XAML volume unavailable; NO GDI+ fallback");
             loggedXamlUnavailable = true;
         }
         return;
@@ -8115,7 +8173,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.14 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.15 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
