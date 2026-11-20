@@ -1,15 +1,15 @@
 // ==WindhawkMod==
 // @id              fluent-osd
-// @name            Fluent OSD
+// @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.1
+// @version         1.0.2
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
 // @include         Twinkle Tray.exe
 // @architecture    x86-64
-// @compilerOptions -lgdi32 -luser32 -lgdiplus -lshcore -ladvapi32 -lole32 -luuid -lshell32 -lsetupapi -liphlpapi -loleaut32 -lruntimeobject -lwindowsapp
+// @compilerOptions -lgdi32 -luser32 -lgdiplus -lshcore -ladvapi32 -lole32 -luuid -lshell32 -lsetupapi -liphlpapi -loleaut32 -lruntimeobject -lwindowsapp -ldwmapi
 // @license         GPL-3.0
 // ==/WindhawkMod==
 
@@ -19,6 +19,15 @@
 
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
+
+## XAML migration experiment (v1.0.2)
+
+Branch-only, opt-in XAML volume backend. It routes **plain horizontal
+volume events** through a dedicated STA XAML Island while keeping the
+existing HardwareConfirmator hooks and Core Audio event data. Media,
+mixer, vertical, multi-monitor mirror modes and failed XAML activation
+fall back to GDI+. The XAML view is initially noninteractive and does
+not yet implement full animation, layout or opacity parity.
 
 ## Features
 
@@ -117,6 +126,11 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
           $name:zh-TW: 顯示自訂 Windows 音量 OSD
           $description: The only switch that enables the custom Windows volume indicator. Media card, mixer arrow, and vertical layout only customize it and never enable it implicitly.
           $description:zh-TW: 只有此開關會啟用自訂 Windows 音量提示。媒體卡片、混音器箭頭及垂直版面只調整外觀，不會間接啟用音量 OSD。
+        - experimentalXamlVolume: false
+          $name: Experimental XAML volume backend (horizontal only)
+          $name:zh-TW: 實驗性 XAML 音量後端（僅水平布局）
+          $description: Opt-in XAML Island for plain horizontal volume. SMTC, mixer, vertical, mirrored and unavailable XAML fall back to GDI+. Does not enable custom volume itself.
+          $description:zh-TW: 純水平音量 OSD 可選用 XAML Island；SMTC、Mixer、垂直、鏡像或無法啟用 XAML 時使用 GDI+。不會自行啟用音量 OSD。
         - showCustomBrightness: false
           $name: Show custom Windows brightness OSD
           $name:zh-TW: 顯示自訂 Windows 亮度 OSD
@@ -648,6 +662,7 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #include <cstring>
 #include <cmath>
 #include <gdiplus.h>
+#include <dwmapi.h>
 #include <shellscalingapi.h>
 #include <cstdint>
 #include <cstddef>
@@ -660,7 +675,14 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #include <new>
 #include <wrl/client.h>
 #include <winrt/base.h>
+#undef GetCurrentTime
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.UI.h>
+#include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Hosting.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.Media.h>
 #include <winrt/Windows.Media.Control.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
@@ -1006,6 +1028,7 @@ std::atomic<int> g_displayLanguage{0}; // 0=Auto, 1=English, 2=zh-TW
 std::atomic<bool> g_hideAllNativeOsd{false};
 std::atomic<bool> g_hide[static_cast<int>(Kind::Count)]{};
 std::atomic<bool> g_showCustomNative[static_cast<int>(Kind::Count)]{};
+std::atomic<bool> g_experimentalXamlVolume{false};
 std::atomic<bool> g_showDdcBrightness{false};
 std::atomic<bool> g_verticalVolumeBrightness{true};
 std::atomic<bool> g_fromExplorer{true};
@@ -1663,6 +1686,8 @@ void LoadSettings() {
         Wh_GetIntSetting(L"NativeHide.hideAllNativeOsd") != 0);
     LoadBoolSettings(g_hide, kNativeHideSettingKeys);
     LoadBoolSettings(g_showCustomNative, kCustomNativeSettingKeys);
+    g_experimentalXamlVolume.store(
+        Wh_GetIntSetting(L"CustomOSD.Switches.experimentalXamlVolume") != 0);
     g_showDdcBrightness.store(Wh_GetIntSetting(L"CustomOSD.Switches.showDdcBrightness") != 0);
     g_verticalVolumeBrightness.store(Wh_GetIntSetting(L"CustomOSD.Layout.verticalVolumeBrightness") != 0);
     g_fromExplorer.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromExplorer") != 0);
