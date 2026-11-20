@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.9
+// @version         1.0.10
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.9)
+## XAML migration experiment (v1.0.10)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -748,7 +748,6 @@ struct Snapshot {
     float scale = 1.0f;     // Original DPI * user-defined scale.
     bool vertical = false;
     bool showValue = true;
-    bool showMixerArrow = false; // Layout reservation only; no button yet.
     int iconSize = 16, fontSize = 15, barThickness = 8, thumbDiameter = 11;
     DWORD background = 0x232327, text = 0xf8f8fc;
     DWORD accent = 0x67acff, track = 0x56565c;
@@ -873,12 +872,14 @@ void DrawSnapshot(State& state) {
         // icon center at x=49, track at x=76 and number near right.
         const double midY = bodyH / 2.0;
         const double trackX = 63.0; // 76 - 13
-        // Derive the progress width from the SAME right-aligned number box.
-        // The previous independent "logicalW - 169" left extra unused space.
+        // Reserve no space for the unimplemented XAML mixer arrow.
+        // The previous conditional 32-DIP right gap created empty space
+        // only in horizontal mode; vertical mode never made that reservation.
+        // The value and track share the same 7-DIP right alignment baseline.
         constexpr double kValueFieldWidth = 54.0;
         constexpr double kTrackValueGap = 9.0;
-        const double rightGap = value.showMixerArrow ? 32.0 : 7.0;
-        const double fieldLeft = bodyW - kValueFieldWidth - rightGap;
+        constexpr double kValueRightGap = 7.0;
+        const double fieldLeft = bodyW - kValueFieldWidth - kValueRightGap;
         const double trackW = std::max(12.0,
             fieldLeft - trackX - kTrackValueGap);
         const double filled = trackW * percent / 100.0;
@@ -921,7 +922,7 @@ void DrawSnapshot(State& state) {
 
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.9: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.10: show failed (%lu)", GetLastError());
         return;
     }
     KillTimer(state.host, kHideTimer);
@@ -942,13 +943,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DrawSnapshot(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.9: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.10: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.9: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.10: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
@@ -1076,7 +1077,7 @@ DWORD WINAPI ThreadProc(void*) {
             const HRESULT borderHr = DwmSetWindowAttribute(
                 state.host, DWMWA_BORDER_COLOR,
                 &noBorder, sizeof(noBorder));
-            Wh_Log(L"XAML v1.0.9: DWM round=0x%08lX border-none=0x%08lX",
+            Wh_Log(L"XAML v1.0.10: DWM round=0x%08lX border-none=0x%08lX",
                    static_cast<unsigned long>(dwm),
                    static_cast<unsigned long>(borderHr));
             if (!g_stopping.load()) {
@@ -1095,7 +1096,7 @@ DWORD WINAPI ThreadProc(void*) {
                     winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
                 CreateContent(state);
                 g_ready.store(state.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.9: renderer ready");
+                Wh_Log(L"XAML v1.0.10: renderer ready");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -1104,11 +1105,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.9: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.10: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.9: startup exception");
+        Wh_Log(L"XAML v1.0.10: startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -1124,12 +1125,12 @@ DWORD WINAPI ThreadProc(void*) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.9: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.10: island close failed"); }
         state.source = nullptr;
     }
     if (state.manager) {
         try { state.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.9: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.10: manager close failed"); }
         state.manager = nullptr;
     }
     if (state.host) DestroyWindow(state.host);
@@ -1144,7 +1145,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.9: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.10: STA creation failed (%lu)", GetLastError());
     }
 }
 bool Show(const Snapshot& snapshot) {
@@ -7104,7 +7105,7 @@ void ShowNativeVolumePopup() {
 
         RECT target{};
         if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-            Wh_Log(L"Fluent OSD v1.0.9: XAML volume not delivered (missing anchor HWND)");
+            Wh_Log(L"Fluent OSD v1.0.10: XAML volume not delivered (missing anchor HWND)");
             return;
         }
         const bool light = IsLightTheme();
@@ -7116,7 +7117,6 @@ void ShowNativeVolumePopup() {
         data.scale = g_scale;
         data.vertical = g_verticalVolumeBrightness.load();
         data.showValue = g_showValue.load();
-        data.showMixerArrow = g_showMixerArrow.load();
         data.iconSize = g_iconSize.load();
         data.fontSize = g_fontSize.load();
         data.barThickness = g_barThickness.load();
@@ -7130,12 +7130,12 @@ void ShowNativeVolumePopup() {
         static bool loggedXamlUnavailable = false;
         if (xaml_volume::Show(data)) {
             if (!loggedXamlRouting) {
-                Wh_Log(L"Fluent OSD v1.0.9: native volume -> XAML only");
+                Wh_Log(L"Fluent OSD v1.0.10: native volume -> XAML only");
                 loggedXamlRouting = true;
             }
             loggedXamlUnavailable = false;
         } else if (!loggedXamlUnavailable) {
-            Wh_Log(L"Fluent OSD v1.0.9: XAML volume unavailable; NO GDI+ fallback");
+            Wh_Log(L"Fluent OSD v1.0.10: XAML volume unavailable; NO GDI+ fallback");
             loggedXamlUnavailable = true;
         }
         return;
@@ -8075,7 +8075,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.9 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.10 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
