@@ -2,7 +2,7 @@
 // @id              fluent-osd-media
 // @name            Fluent OSD & Media
 // @description     Fluent-style Windows 11 OSDs for volume, DDC/CI brightness, media controls, per-app audio mixer, lock keys, clipboard and device events.
-// @version         1.7.2
+// @version         1.7.3
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -107,6 +107,12 @@ resources. It does not monitor or intercept system shutdown separately;
 Windows owns process cleanup when Explorer exits. This limits one potential
 source of "GDI+ Window is preventing shutdown" without claiming to resolve
 shutdown blockers originating in other processes.
+
+## Main volume interaction
+
+Click the speaker icon in the horizontal or vertical main volume OSD to
+toggle the default playback endpoint's mute state, preserving its volume
+level. The popup outside the icon remains transparent to mouse clicks.
 
 ## Display language
 
@@ -964,6 +970,8 @@ HWND g_arrowWnd = nullptr;
 // Hover and press state belong to the Explorer UI thread, like the flyouts.
 bool g_arrowHovered = false;
 bool g_arrowPressed = false;
+HWND g_speakerHitWnd = nullptr; // Hit target above the main-volume speaker.
+bool g_speakerPressed = false;  // Dedicated OSD UI thread only.
 HWND g_barWheelWnd = nullptr; // Minimal hit surface over the main OSD's bar.
 // Owned by the UI thread. The same small surface now supports wheel,
 // click-to-position and continuous dragging, without making the OSD opaque.
@@ -2002,6 +2010,7 @@ bool ReadDefaultAudioVolume(int& percent, bool& muted) {
 }
 
 void RenderPopup();
+void RenderPanel();
 void ResetHideTimerFor(DurationKind kind);
 
 bool AdjustDefaultAudioWheel(int steps) {
@@ -2084,6 +2093,50 @@ bool SetDefaultAudioBarPercent(int percent) {
     return true;
 }
 
+// Toggle the default endpoint's mute without changing its stored volume.
+bool ToggleDefaultAudioMute() {
+    if (g_popupKind != PopupKind::NativeVolume || g_closing.load())
+        return false;
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+        reinterpret_cast<void**>(enumerator.GetAddressOf()));
+    if (FAILED(hr) || !enumerator) return false;
+    Microsoft::WRL::ComPtr<IMMDevice> device;
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia,
+                                             device.GetAddressOf());
+    if (FAILED(hr) || !device) {
+        device.Reset();
+        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole,
+                                                 device.GetAddressOf());
+    }
+    if (FAILED(hr) || !device) return false;
+    Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
+    hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
+        nullptr, reinterpret_cast<void**>(volume.GetAddressOf()));
+    if (FAILED(hr) || !volume) return false;
+    BOOL current = FALSE;
+    if (FAILED(volume->GetMute(&current))) return false;
+    const BOOL wanted = current ? FALSE : TRUE;
+    if (FAILED(volume->SetMute(wanted, nullptr))) return false;
+    BOOL actual = wanted;
+    (void)volume->GetMute(&actual);
+    float scalar = 0.0f;
+    if (SUCCEEDED(volume->GetMasterVolumeLevelScalar(&scalar))) {
+        g_nativePercent = static_cast<int>(std::lround(
+            std::clamp(scalar, 0.0f, 1.0f) * 100.0f));
+        g_nativePercentKnown = true;
+    }
+    g_nativeMuted = actual != FALSE;
+    if (g_panelMode == PanelMode::Mixer) {
+        g_mixerMasterMuted = g_nativeMuted;
+        RenderPanel();
+    }
+    RenderPopup();
+    ResetHideTimerFor(g_activeDurationKind);
+    return true;
+}
+
 // Draws independently constructed Fluent-style outline symbols in one shared
 // 20 x 20 coordinate space. Both symbols use the same size, stroke width and
 // visual anchor. Speaker detail follows the current volume level; both
@@ -2147,6 +2200,22 @@ void DrawUniformStatusIcon(Gdiplus::Graphics& gfx,
 // does not add taskbar widgets or depend on a separate UI framework.
 void DrawExpandChevron(Gdiplus::Graphics& gfx, float x, float y,
                        Gdiplus::Color color);
+// Shared painted icon and hit-target anchor, including vertical size settings.
+void MainVolumeIconCenter(float& x, float& y) {
+    if (g_verticalVolumeBrightness.load()) {
+        const float logicalH = MainLogicalHeight();
+        const float glyph = static_cast<float>(g_iconSize.load());
+        x = MainLogicalWidth() / 2.0f;
+        y = g_showMixerArrow.load() ?
+            logicalH - 42.0f - glyph / 2.0f :
+            logicalH - 6.0f - static_cast<float>(g_innerPadding.load()) -
+                glyph / 2.0f;
+    } else {
+        x = 49.0f;
+        y = MainCenterY();
+    }
+}
+
 void DrawVerticalPopup(Gdiplus::Graphics& gfx) {
     const bool light = IsLightTheme();
     const DWORD defaultBg = light ? 0xFAFAFC : 0x26262A;
@@ -2278,10 +2347,13 @@ void DrawVerticalPopup(Gdiplus::Graphics& gfx) {
     if (showIcon) {
         // Put the volume icon ABOVE its dedicated bottom chevron, while
         // retaining the same size and stroke as the brightness icon.
-        const float iconY = hasChevron
+        float iconX = centerX;
+        float iconY = hasChevron
             ? (iconBottom - glyphSize / 2.0f)
             : (logicalH - 6.0f - edge - glyphSize / 2.0f);
-        DrawUniformStatusIcon(gfx, foreground, centerX, iconY,
+        if (g_popupKind == PopupKind::NativeVolume)
+            MainVolumeIconCenter(iconX, iconY);
+        DrawUniformStatusIcon(gfx, foreground, iconX, iconY,
                               g_popupKind, percent, g_nativeMuted);
     }
     if (hasChevron)
@@ -2301,6 +2373,7 @@ void ResetHideTimer(UINT milliseconds);
 void ResetHideTimerFor(DurationKind kind);
 void ClosePanel();
 void UpdateArrowHitWindow();
+void UpdateSpeakerHitWindow();
 void FlushNoticeBatch();
 void ShowPanel();
 void ShowNotice(std::wstring, std::wstring, DurationKind);
@@ -2505,6 +2578,9 @@ void FinishPopupHide() {
     g_arrowPressed = false;
     if (g_arrowWnd && GetCapture() == g_arrowWnd) ReleaseCapture();
     if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
+    if (g_speakerHitWnd) ShowWindow(g_speakerHitWnd, SW_HIDE);
+    g_speakerPressed = false;
+    if (g_speakerHitWnd && GetCapture() == g_speakerHitWnd) ReleaseCapture();
     g_mainBarDragging = false;
     g_mainBarDragKind = -1;
     if (g_barWheelWnd && GetCapture() == g_barWheelWnd) ReleaseCapture();
@@ -2637,6 +2713,7 @@ void ShowPopupAnimated() {
     // Repeated volume-key events must not perpetually restart fade-in.
     RenderPopup();
     UpdateBarWheelWindow();
+    UpdateSpeakerHitWindow();
 }
 
 void SetNoticeHitTesting(bool enabled) {
@@ -4972,7 +5049,9 @@ void DrawHorizontalVolume(Gdiplus::Graphics& gfx) {
         static_cast<BYTE>((g_backgroundOpacity.load() * 255 + 50) / 100)));
     gfx.FillPath(&base, &body);
     Gdiplus::Color fg = ToGdiColor(fgRgb);
-    DrawUniformStatusIcon(gfx, fg, 49.0f, centerY, PopupKind::NativeVolume,
+    float speakerX = 0.0f, speakerY = 0.0f;
+    MainVolumeIconCenter(speakerX, speakerY);
+    DrawUniformStatusIcon(gfx, fg, speakerX, speakerY, PopupKind::NativeVolume,
                           g_nativePercent, g_nativeMuted);
     const float trackW = logicalW - (g_showMixerArrow.load() ? 191.0f : 169.0f);
     Gdiplus::GraphicsPath track;
@@ -5099,6 +5178,33 @@ void UpdateArrowHitWindow() {
     const int x = main.left + static_cast<int>(std::lround(arrowX * g_scale)) - targetW / 2;
     const int y = main.top + static_cast<int>(std::lround(arrowY * g_scale)) - targetH / 2;
     SetWindowPos(g_arrowWnd, HWND_TOPMOST, x, y, targetW, targetH,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+// An almost invisible, non-activating mouse surface. The remaining main OSD
+// stays click-through, preserving track dragging and mixer-arrow hit targets.
+void UpdateSpeakerHitWindow() {
+    if (!g_speakerHitWnd) return;
+    if (g_popupKind != PopupKind::NativeVolume || !g_popupWnd ||
+        !IsWindowVisible(g_popupWnd) || g_closing.load()) {
+        g_speakerPressed = false;
+        if (GetCapture() == g_speakerHitWnd) ReleaseCapture();
+        ShowWindow(g_speakerHitWnd, SW_HIDE);
+        return;
+    }
+    RECT popup{};
+    if (!GetWindowRect(g_popupWnd, &popup) || g_scale <= 0.0f) {
+        ShowWindow(g_speakerHitWnd, SW_HIDE);
+        return;
+    }
+    float cx = 0.0f, cy = 0.0f;
+    MainVolumeIconCenter(cx, cy);
+    const float hitSize = std::max(26.0f,
+        static_cast<float>(g_iconSize.load()) + 8.0f);
+    const int size = std::max(16, static_cast<int>(std::lround(hitSize * g_scale)));
+    const int x = popup.left + static_cast<int>(std::lround(cx * g_scale)) - size / 2;
+    const int y = popup.top + static_cast<int>(std::lround(cy * g_scale)) - size / 2;
+    SetWindowPos(g_speakerHitWnd, HWND_TOPMOST, x, y, size, size,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
@@ -5373,7 +5479,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     // pointer. WM_MOUSELEAVE re-arms its category's selected duration.
     // This is event-driven; it adds no polling timer.
     const bool hoverSurface = hwnd == g_panelWnd || hwnd == g_arrowWnd ||
-        hwnd == g_barWheelWnd ||
+        hwnd == g_barWheelWnd || hwnd == g_speakerHitWnd ||
         (hwnd == g_popupWnd && g_popupKind == PopupKind::Notification &&
          g_noticeClickable);
     if (msg == WM_MOUSEMOVE && hoverSurface) {
@@ -5397,7 +5503,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_NCHITTEST) {
         if (hwnd == g_popupWnd) return g_popupKind == PopupKind::Notification && g_noticeClickable ? HTCLIENT : HTTRANSPARENT;
         if (hwnd == g_panelWnd || hwnd == g_arrowWnd ||
-            hwnd == g_barWheelWnd) return HTCLIENT;
+            hwnd == g_barWheelWnd || hwnd == g_speakerHitWnd) return HTCLIENT;
     }
     if (msg == WM_SETCURSOR && hwnd == g_popupWnd &&
         g_popupKind == PopupKind::Notification && g_noticeClickable) {
@@ -5406,9 +5512,9 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_SETCURSOR &&
         (hwnd == g_panelWnd || hwnd == g_arrowWnd ||
-         hwnd == g_barWheelWnd)) {
+         hwnd == g_barWheelWnd || hwnd == g_speakerHitWnd)) {
         bool overClickableIcon = hwnd == g_arrowWnd ||
-            hwnd == g_barWheelWnd;
+            hwnd == g_barWheelWnd || hwnd == g_speakerHitWnd;
         if (hwnd == g_panelWnd && g_scale > 0) {
             POINT point{};
             if (GetCursorPos(&point) && ScreenToClient(hwnd, &point)) {
@@ -5426,7 +5532,8 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_MOUSEACTIVATE &&
         (hwnd == g_popupWnd || hwnd == g_panelWnd ||
-         hwnd == g_arrowWnd || hwnd == g_barWheelWnd))
+         hwnd == g_arrowWnd || hwnd == g_barWheelWnd ||
+         hwnd == g_speakerHitWnd))
         return MA_NOACTIVATE;
     if (msg == WM_LBUTTONUP && hwnd == g_popupWnd &&
         g_popupKind == PopupKind::Notification && g_noticeClickable) {
@@ -5434,6 +5541,37 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else { g_panelMode = PanelMode::Details; g_noticeScroll = 0; ShowPanel(); }
         ResetHideTimerFor(DurationKind::Interactive);
         return 0;
+    }
+    if (hwnd == g_speakerHitWnd) {
+        if (msg == WM_LBUTTONDOWN) {
+            if (g_popupKind == PopupKind::NativeVolume && g_popupWnd &&
+                IsWindowVisible(g_popupWnd) && !g_closing.load()) {
+                g_speakerPressed = true;
+                SetCapture(hwnd);
+                KillTimer(g_popupWnd, kHideTimer);
+            }
+            return 0;
+        }
+        if (msg == WM_LBUTTONUP) {
+            RECT area{};
+            GetClientRect(hwnd, &area);
+            const POINT pointer{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            const bool activate = g_speakerPressed &&
+                g_popupKind == PopupKind::NativeVolume &&
+                !g_closing.load() && PtInRect(&area, pointer);
+            g_speakerPressed = false;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            if (activate) ToggleDefaultAudioMute();
+            else if (g_popupWnd && IsWindowVisible(g_popupWnd))
+                ResetHideTimerFor(g_activeDurationKind);
+            return 0;
+        }
+        if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE) {
+            g_speakerPressed = false;
+            if (g_popupWnd && IsWindowVisible(g_popupWnd))
+                ResetHideTimerFor(g_activeDurationKind);
+            return 0;
+        }
     }
     if (msg == WM_MOUSEWHEEL && hwnd == g_barWheelWnd) {
         HandleMainBarWheel(GET_WHEEL_DELTA_WPARAM(wp));
@@ -5756,6 +5894,12 @@ DWORD WINAPI UiThreadProc(void*) {
         nullptr, nullptr, wc.hInstance, nullptr);
     if (g_arrowWnd)
         SetLayeredWindowAttributes(g_arrowWnd, 0, 1, LWA_ALPHA);
+    g_speakerHitWnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        kWindowClass, L"", WS_POPUP, 0, 0, 32, 32,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    if (g_speakerHitWnd)
+        SetLayeredWindowAttributes(g_speakerHitWnd, 0, 1, LWA_ALPHA);
     g_barWheelWnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         kWindowClass, L"", WS_POPUP, 0, 0, 32, 32,
@@ -5797,11 +5941,14 @@ DWORD WINAPI UiThreadProc(void*) {
     if (g_lockHook) { UnhookWindowsHookEx(g_lockHook); g_lockHook = nullptr; }
     ClosePanel();
     ClearMediaArtworkCache();  // Must precede GDI+ shutdown.
+    if (g_speakerHitWnd) DestroyWindow(g_speakerHitWnd);
     if (g_barWheelWnd) DestroyWindow(g_barWheelWnd);
     if (g_arrowWnd) DestroyWindow(g_arrowWnd);
     if (g_panelWnd) DestroyWindow(g_panelWnd);
     if (g_popupWnd) DestroyWindow(g_popupWnd);
     if (g_receiveWnd) DestroyWindow(g_receiveWnd);
+    g_speakerHitWnd = nullptr;
+    g_speakerPressed = false;
     g_barWheelWnd = nullptr;
     g_arrowWnd = nullptr;
     g_panelWnd = nullptr;
@@ -5830,7 +5977,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD & Media v1.7.2 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD & Media v1.7.3 initialized (%s)", name);
     return TRUE;
 }
 
