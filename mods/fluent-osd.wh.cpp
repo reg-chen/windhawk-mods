@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.8
+// @version         1.0.9
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.8)
+## XAML migration experiment (v1.0.9)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -766,6 +766,7 @@ struct State {
     controls::TextBlock value{nullptr};
     shapes::Rectangle track{nullptr};
     shapes::Rectangle fill{nullptr};
+    media::RectangleGeometry fillClip{nullptr};
     shapes::Ellipse thumb{nullptr};
 };
 media::SolidColorBrush Brush(DWORD rgb) {
@@ -776,7 +777,7 @@ media::SolidColorBrush Brush(DWORD rgb) {
 void DrawSnapshot(State& state) {
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
-        !state.thumb) return;
+        !state.fillClip || !state.thumb) return;
     Snapshot value;
     AcquireSRWLockShared(&g_snapshotLock);
     value = g_pending;
@@ -814,9 +815,7 @@ void DrawSnapshot(State& state) {
     state.icon.FontSize(std::clamp(value.iconSize, 10, 24));
     state.value.Text(winrt::hstring(std::to_wstring(percent) + L"%"));
     state.value.FontSize(std::clamp(value.fontSize, 10, 24));
-    // Center *within an explicit text box*, never from a guessed glyph width.
-    // This also keeps 0% / 100% aligned without measuring rendered text.
-    state.value.TextAlignment(wx::TextAlignment::Center);
+    // Alignment differs by layout: centered vertically, right-flush horizontally.
     state.value.Visibility(value.showValue
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
 
@@ -842,22 +841,31 @@ void DrawSnapshot(State& state) {
         controls::Canvas::SetLeft(state.track,
             centerX - trackThickness / 2.0);
         controls::Canvas::SetTop(state.track, trackTop);
+        // Exactly overlay the background shape; reveal only the portion
+        // below the current level. Never let the accent escape its track.
         state.fill.Width(trackThickness);
-        state.fill.Height(filled);
+        state.fill.Height(length);
         state.fill.RadiusX(trackThickness / 2.0);
         state.fill.RadiusY(trackThickness / 2.0);
         controls::Canvas::SetLeft(state.fill,
             centerX - trackThickness / 2.0);
-        controls::Canvas::SetTop(state.fill, trackBottom - filled);
+        controls::Canvas::SetTop(state.fill, trackTop);
+        state.fillClip.Rect(winrt::Windows::Foundation::Rect{
+            0.0f, static_cast<float>(length - filled),
+            static_cast<float>(trackThickness), static_cast<float>(filled)});
         controls::Canvas::SetLeft(state.thumb, centerX - thumbSize / 2.0);
-        controls::Canvas::SetTop(state.thumb,
-            trackBottom - filled - thumbSize / 2.0);
+        const double thumbHalf = thumbSize / 2.0;
+        const double thumbCenterY = std::clamp(trackBottom - filled,
+            trackTop + thumbHalf,
+            std::max(trackTop + thumbHalf, trackBottom - thumbHalf));
+        controls::Canvas::SetTop(state.thumb, thumbCenterY - thumbHalf);
         controls::Canvas::SetLeft(state.icon,
             centerX - value.iconSize / 2.0);
         controls::Canvas::SetTop(state.icon, bodyH - 31.0);
         // The old fixed 44px guess placed 0%/100% left of the card center.
         // Use the full card width so all percentage strings share its axis.
         state.value.Width(bodyW);
+        state.value.TextAlignment(wx::TextAlignment::Center);
         controls::Canvas::SetLeft(state.value, 0.0);
         controls::Canvas::SetTop(state.value, 7.0);
     } else {
@@ -865,8 +873,14 @@ void DrawSnapshot(State& state) {
         // icon center at x=49, track at x=76 and number near right.
         const double midY = bodyH / 2.0;
         const double trackX = 63.0; // 76 - 13
-        const double trackW = std::max(12.0, logicalW -
-            (value.showMixerArrow ? 191.0 : 169.0));
+        // Derive the progress width from the SAME right-aligned number box.
+        // The previous independent "logicalW - 169" left extra unused space.
+        constexpr double kValueFieldWidth = 54.0;
+        constexpr double kTrackValueGap = 9.0;
+        const double rightGap = value.showMixerArrow ? 32.0 : 7.0;
+        const double fieldLeft = bodyW - kValueFieldWidth - rightGap;
+        const double trackW = std::max(12.0,
+            fieldLeft - trackX - kTrackValueGap);
         const double filled = trackW * percent / 100.0;
         state.track.Width(trackW);
         state.track.Height(trackThickness);
@@ -875,36 +889,39 @@ void DrawSnapshot(State& state) {
         controls::Canvas::SetLeft(state.track, trackX);
         controls::Canvas::SetTop(state.track,
             midY - trackThickness / 2.0);
-        state.fill.Width(filled);
+        // Overlay a full-size, identically rounded fill, then clip it at
+        // the exact progress position. The background owns the full bounds.
+        state.fill.Width(trackW);
         state.fill.Height(trackThickness);
         state.fill.RadiusX(trackThickness / 2.0);
         state.fill.RadiusY(trackThickness / 2.0);
         controls::Canvas::SetLeft(state.fill, trackX);
         controls::Canvas::SetTop(state.fill,
             midY - trackThickness / 2.0);
-        controls::Canvas::SetLeft(state.thumb,
-            trackX + filled - thumbSize / 2.0);
-        controls::Canvas::SetTop(state.thumb, midY - thumbSize / 2.0);
+        state.fillClip.Rect(winrt::Windows::Foundation::Rect{
+            0.0f, 0.0f,
+            static_cast<float>(filled), static_cast<float>(trackThickness)});
+        const double thumbHalf = thumbSize / 2.0;
+        const double thumbCenterX = std::clamp(filled, thumbHalf,
+            std::max(thumbHalf, trackW - thumbHalf));
+        controls::Canvas::SetLeft(state.thumb, trackX + thumbCenterX - thumbHalf);
+        controls::Canvas::SetTop(state.thumb, midY - thumbHalf);
         controls::Canvas::SetLeft(state.icon,
             36.0 - value.iconSize / 2.0); // 49 - 13
         controls::Canvas::SetTop(state.icon,
             midY - value.iconSize / 2.0 - 1.0);
-        // Previously the XAML TextBlock was auto-sized and left-aligned,
-        // leaving its unoccupied 54px GDI+ text box as apparent right padding.
-        // Keep a fixed centered 54px field, nearer the card edge. Preserve
-        // room for the future mixer-arrow hit target when that option is on.
-        constexpr double kValueFieldWidth = 54.0;
+        // The numerals themselves, not just their 54-DIP layout slot,
+        // should end near the card edge. Leave a consistent 7-DIP margin.
         state.value.Width(kValueFieldWidth);
-        const double valueRightGap = value.showMixerArrow ? 32.0 : 7.0;
-        controls::Canvas::SetLeft(state.value, std::max(0.0,
-            bodyW - kValueFieldWidth - valueRightGap));
+        state.value.TextAlignment(wx::TextAlignment::Right);
+        controls::Canvas::SetLeft(state.value, std::max(0.0, fieldLeft));
         controls::Canvas::SetTop(state.value,
             midY - value.fontSize / 2.0 - 5.0);
     }
 
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.8: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.9: show failed (%lu)", GetLastError());
         return;
     }
     KillTimer(state.host, kHideTimer);
@@ -925,13 +942,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DrawSnapshot(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.8: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.9: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.8: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.9: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
@@ -992,6 +1009,9 @@ void CreateContent(State& state) {
     fill.RadiusX(4.0);
     fill.RadiusY(4.0);
     fill.Fill(Brush(0x67acff));
+    // Reuse a single rectangle geometry per STA for both orientations.
+    media::RectangleGeometry fillClip;
+    fill.Clip(fillClip);
     canvas.Children().Append(fill);
     shapes::Ellipse thumb;
     thumb.Width(11.0);
@@ -1016,6 +1036,7 @@ void CreateContent(State& state) {
     state.icon = icon;
     state.track = track;
     state.fill = fill;
+    state.fillClip = fillClip;
     state.thumb = thumb;
     state.value = value;
 }
@@ -1055,7 +1076,7 @@ DWORD WINAPI ThreadProc(void*) {
             const HRESULT borderHr = DwmSetWindowAttribute(
                 state.host, DWMWA_BORDER_COLOR,
                 &noBorder, sizeof(noBorder));
-            Wh_Log(L"XAML v1.0.8: DWM round=0x%08lX border-none=0x%08lX",
+            Wh_Log(L"XAML v1.0.9: DWM round=0x%08lX border-none=0x%08lX",
                    static_cast<unsigned long>(dwm),
                    static_cast<unsigned long>(borderHr));
             if (!g_stopping.load()) {
@@ -1074,7 +1095,7 @@ DWORD WINAPI ThreadProc(void*) {
                     winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
                 CreateContent(state);
                 g_ready.store(state.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.8: renderer ready");
+                Wh_Log(L"XAML v1.0.9: renderer ready");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -1083,16 +1104,17 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.8: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.9: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.8: startup exception");
+        Wh_Log(L"XAML v1.0.9: startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
     if (state.host) KillTimer(state.host, kHideTimer);
     state.thumb = nullptr;
+    state.fillClip = nullptr;
     state.fill = nullptr;
     state.track = nullptr;
     state.value = nullptr;
@@ -1102,12 +1124,12 @@ DWORD WINAPI ThreadProc(void*) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.8: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.9: island close failed"); }
         state.source = nullptr;
     }
     if (state.manager) {
         try { state.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.8: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.9: manager close failed"); }
         state.manager = nullptr;
     }
     if (state.host) DestroyWindow(state.host);
@@ -1122,7 +1144,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.8: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.9: STA creation failed (%lu)", GetLastError());
     }
 }
 bool Show(const Snapshot& snapshot) {
@@ -7082,7 +7104,7 @@ void ShowNativeVolumePopup() {
 
         RECT target{};
         if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-            Wh_Log(L"Fluent OSD v1.0.8: XAML volume not delivered (missing anchor HWND)");
+            Wh_Log(L"Fluent OSD v1.0.9: XAML volume not delivered (missing anchor HWND)");
             return;
         }
         const bool light = IsLightTheme();
@@ -7108,12 +7130,12 @@ void ShowNativeVolumePopup() {
         static bool loggedXamlUnavailable = false;
         if (xaml_volume::Show(data)) {
             if (!loggedXamlRouting) {
-                Wh_Log(L"Fluent OSD v1.0.8: native volume -> XAML only");
+                Wh_Log(L"Fluent OSD v1.0.9: native volume -> XAML only");
                 loggedXamlRouting = true;
             }
             loggedXamlUnavailable = false;
         } else if (!loggedXamlUnavailable) {
-            Wh_Log(L"Fluent OSD v1.0.8: XAML volume unavailable; NO GDI+ fallback");
+            Wh_Log(L"Fluent OSD v1.0.9: XAML volume unavailable; NO GDI+ fallback");
             loggedXamlUnavailable = true;
         }
         return;
@@ -8053,7 +8075,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.8 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.9 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
