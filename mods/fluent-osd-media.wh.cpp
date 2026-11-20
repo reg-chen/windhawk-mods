@@ -2,7 +2,7 @@
 // @id              fluent-osd-media
 // @name            Fluent OSD & Media
 // @description     Fluent-style Windows 11 OSDs for volume, DDC/CI brightness, media controls, per-app audio mixer, lock keys, clipboard and device events.
-// @version         1.7.4
+// @version         1.7.5
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -108,22 +108,17 @@ Windows owns process cleanup when Explorer exits. This limits one potential
 source of "GDI+ Window is preventing shutdown" without claiming to resolve
 shutdown blockers originating in other processes.
 
-## Spotify SMTC controls
+## Standard SMTC shuffle / repeat controls
 
-When the active Windows media session identifies as the Spotify desktop
-application, this mod reads its advertised GSMTC shuffle and repeat
-capabilities and nullable states. Supported controls appear as compact
-buttons in the SMTC card's existing canvas (without changing user-defined
-card width or height), and commands run only on the existing media worker.
-Repeat cycles off -> list -> track -> off. Unsupported or unreported
-capabilities remain hidden. Browser-hosted Spotify is not identified as the
-desktop application.
+Shuffle and Repeat are standard GSMTC capabilities, not Spotify-specific.
+Each appears only when the active media session reports support and a valid
+nullable state. Their buttons are half the diameter of the standard playback
+buttons and stacked vertically immediately left of Previous, without
+changing the user-configured SMTC panel dimensions. Repeat cycles off ->
+list -> track -> off. Commands run on the existing on-demand media worker.
 
-"Add to Liked Songs" cannot be implemented using GSMTC: Spotify's official
-Web API requires separate OAuth authorization and a Spotify track URI.
-This mod intentionally does not emulate focus-stealing keyboard shortcuts,
-access another application's internal tokens, or silently request Spotify
-account permissions. No favorite button is claimed or displayed.
+Spotify Liked Songs is not a GSMTC capability and is not implemented.
+No account authorization, token extraction or keyboard simulation is used.
 
 ## Main volume interaction
 
@@ -1069,9 +1064,7 @@ struct MediaSnapshot {
     bool canPrevious = false;
     bool canToggle = false;
     bool canNext = false;
-    // Spotify-specific controls only when a Windows SMTC session explicitly
-    // advertises support and reports a known state.
-    bool isSpotify = false;
+    // Standard GSMTC capabilities, independent of player brand.
     bool canShuffle = false, shuffleKnown = false, shuffleActive = false;
     bool canRepeat = false;
     int repeatMode = -1; // Windows MediaPlaybackAutoRepeatMode: 0=None, 1=Track, 2=List
@@ -1101,8 +1094,8 @@ INT64 g_mediaPreviewPosition = 0;
 ULONGLONG g_mediaSeekHoldUntil = 0;
 int g_mediaPressedIndex = -1;
 bool g_mediaPressedInside = false;
-int g_spotifyPressedAction = 0; // UI thread only, 5=shuffle, 6=repeat
-bool g_spotifyPressedInside = false;
+int g_extraPressedAction = 0; // UI thread only, 5=shuffle, 6=repeat
+bool g_extraPressedInside = false;
 int g_mediaFeedbackIndex = -1;
 ULONGLONG g_mediaFeedbackTick = 0;
 ULONGLONG g_mediaLastRefreshTick = 0;
@@ -3831,19 +3824,6 @@ HRESULT GetAsyncObject(CPtr& operation, CPtr& result,
     return hr;
 }
 
-// Check exact desktop app identity, not track/artist text. Browser-hosted
-// Spotify sessions intentionally do not masquerade as the Spotify app.
-bool IsSpotifySession(Runtime& api, CPtr& session) {
-    RawHString source = nullptr;
-    if (FAILED(Call(session.Get(), 6, &source)) || !source) return false;
-    const std::wstring app = api.Text(source);
-    api.remove(source);
-    constexpr PCWSTR storePrefix = L"SpotifyAB.SpotifyMusic_";
-    return _wcsicmp(app.c_str(), L"Spotify.exe") == 0 ||
-           _wcsicmp(app.c_str(), L"Spotify") == 0 ||
-           _wcsnicmp(app.c_str(), storePrefix, wcslen(storePrefix)) == 0;
-}
-
 // Nullable WinRT playback properties are IReference<T> objects. Missing
 // values are not interpreted as false/off: the control stays unavailable.
 bool ReadOptionalState(IUnknown* info, size_t slot, BOOLEAN& value) {
@@ -3880,7 +3860,7 @@ void RequestMediaAction(CPtr& session, const MediaCommand& command) {
         } else {
             INT32 mode = -1;
             if (!ReadOptionalMode(info.Get(), mode)) return;
-            // Spotify order: repeat off -> playlist -> track -> off.
+            // Repeat off -> list -> track -> off.
             const INT32 next = mode == 0 ? 2 : mode == 2 ? 1 : 0;
             // ABI slot 21: TryChangeAutoRepeatModeAsync(enum int32).
             if (FAILED(Call(session.Get(), 21, next,
@@ -4078,18 +4058,13 @@ DWORD WINAPI MediaThreadProc(void*) {
         AcquireSRWLockExclusive(&g_mediaCommandLock);
         commands.swap(g_mediaCommands);
         ReleaseSRWLockExclusive(&g_mediaCommandLock);
-        const bool spotify = session && IsSpotifySession(api, session);
         if (session) {
-            for (const auto& command : commands) {
-                // Do not let an old Spotify command target a different player.
-                if (command.action >= 5 && !spotify) continue;
+            for (const auto& command : commands)
                 RequestMediaAction(session, command);
-            }
         }
         MediaSnapshot snapshot;
         if (session) {
             snapshot.available = true;
-            snapshot.isSpotify = spotify;
             CPtr info;
             if (SUCCEEDED(Call(session.Get(), 9, info.GetAddressOf())) && info) {
                 int status = 0;
@@ -4102,21 +4077,21 @@ DWORD WINAPI MediaThreadProc(void*) {
                     if (SUCCEEDED(Call(controls.Get(), 12, &flag))) snapshot.canNext = flag != 0;
                     if (SUCCEEDED(Call(controls.Get(), 16, &flag))) snapshot.canToggle = flag != 0;
                     if (SUCCEEDED(Call(controls.Get(), 20, &flag))) snapshot.canSeek = flag != 0;
-                    if (spotify && SUCCEEDED(Call(controls.Get(), 17, &flag)))
+                    if (SUCCEEDED(Call(controls.Get(), 17, &flag)))
                         snapshot.canShuffle = flag != 0;
-                    if (spotify && SUCCEEDED(Call(controls.Get(), 18, &flag)))
+                    if (SUCCEEDED(Call(controls.Get(), 18, &flag)))
                         snapshot.canRepeat = flag != 0;
                     if (!snapshot.canToggle && SUCCEEDED(Call(controls.Get(), 6, &flag))) snapshot.canToggle = flag != 0;
                     if (!snapshot.canToggle && SUCCEEDED(Call(controls.Get(), 7, &flag))) snapshot.canToggle = flag != 0;
                 }
-                if (spotify && snapshot.canShuffle) {
+                if (snapshot.canShuffle) {
                     BOOLEAN active = FALSE;
                     if (ReadOptionalState(info.Get(), 11, active)) {
                         snapshot.shuffleKnown = true;
                         snapshot.shuffleActive = active != FALSE;
                     }
                 }
-                if (spotify && snapshot.canRepeat) {
+                if (snapshot.canRepeat) {
                     INT32 mode = -1;
                     if (ReadOptionalMode(info.Get(), mode))
                         snapshot.repeatMode = mode;
@@ -4465,12 +4440,11 @@ void DrawPanelCard(Gdiplus::Graphics& gfx, float width, float height,
 // 132px cap. Where the panel is too narrow for a square cover at full height
 // AND a readable transport column, center the entire cover/control group
 // vertically instead of clipping or distorting the artwork.
-bool SpotifyExtraControlsVisible() {
-    return g_mediaCurrent.isSpotify && g_showMediaControls.load() &&
+bool MediaExtraControlsVisible() {
+    return g_showMediaControls.load() &&
         ((g_mediaCurrent.canShuffle && g_mediaCurrent.shuffleKnown) ||
          (g_mediaCurrent.canRepeat && g_mediaCurrent.repeatMode >= 0));
 }
-constexpr float kSpotifyExtraInset = 26.0f; // Reserve a thin bottom control row.
 struct MediaLayout {
     float artX, artY, artSize;
     float textX, textWidth, titleY, artistY;
@@ -4495,22 +4469,20 @@ MediaLayout ComputeMediaLayout(float h, float w) {
     const float baseRadius = 16.0f *
         (g_mediaControlSizePercent.load() / 100.0f);
 
-    // Reserve space for THREE full-size controls and a minimum metadata
-    // column. Its required width changes with artwork-relative control size.
-    // Binary search is monotonic: larger artwork also means larger buttons.
+    // Reserve an additional half-size column immediately before Previous.
+    // The three main controls remain on one baseline without a bottom row.
+    const bool hasExtra = MediaExtraControlsVisible();
     auto controlScale = [](float art) {
         return std::clamp(art / 125.0f, 0.78f, 1.45f);
     };
     auto fits = [&](float art) {
         const float radius = baseRadius * controlScale(art);
-        const float infoWidth = std::max(86.0f, 6.0f * radius + 8.0f);
-        return art + infoWidth <= usableWidth;
+        const float required = hasExtra ? 7.0f * radius + 14.0f
+                                        : 6.0f * radius + 8.0f;
+        return art + std::max(86.0f, required) <= usableWidth;
     };
     float lo = 1.0f;
-    // Only the Spotify variant reserves room for extra compact controls.
-    // The configured SMTC canvas dimensions remain completely unchanged.
-    float hi = std::max(1.0f, contentHeight -
-        (SpotifyExtraControlsVisible() ? kSpotifyExtraInset : 0.0f));
+    float hi = contentHeight;
     for (int i = 0; i < 18; ++i) {
         const float candidate = (lo + hi) * 0.5f;
         if (fits(candidate)) lo = candidate;
@@ -4526,8 +4498,10 @@ MediaLayout ComputeMediaLayout(float h, float w) {
     const float textWidth = std::max(1.0f, contentRight - textX);
     const float scale = controlScale(artSize);
     const float radius = std::min(baseRadius * scale,
-                                  std::max(1.0f, (textWidth - 8.0f) / 6.0f));
-    const float leftButtonX = textX + radius;
+        std::max(1.0f, hasExtra ? (textWidth - 14.0f) / 7.0f
+                                : (textWidth - 8.0f) / 6.0f));
+    const float extraColumnWidth = hasExtra ? radius + 6.0f : 0.0f;
+    const float leftButtonX = textX + extraColumnWidth + radius;
     const float rightButtonX = contentRight - radius;
     // All vertical geometry is tied to the same artwork box, not to an
     // unrelated 176px reference panel height or a second center offset.
@@ -4620,36 +4594,38 @@ std::wstring FormatMediaTime(INT64 span100ns) {
     return std::to_wstring(seconds / 60) + L":" + sec;
 }
 
-// Two optional Spotify transport actions are positioned in the existing
-// bottom insets. Keeping the panel dimensions unchanged avoids SMTC/main OSD
-// misalignment in both horizontal and vertical layouts.
-struct SpotifyExtraLayout { float x[2], y, radius; };
-bool GetSpotifyExtraLayout(SpotifyExtraLayout& extra) {
-    if (!SpotifyExtraControlsVisible() || g_panelMode != PanelMode::Media ||
+// Two half-size buttons in a vertical column directly left of Previous.
+// Both paint and hit test use these same coordinates.
+struct MediaExtraLayout { float x, y[2], radius; };
+bool GetMediaExtraLayout(MediaExtraLayout& extra) {
+    if (!MediaExtraControlsVisible() || g_panelMode != PanelMode::Media ||
         g_scale <= 0.0f) return false;
-    const float h = g_panelHeight / g_scale;
-    const float w = g_panelWidth / g_scale;
-    const MediaLayout layout = ComputeMediaLayout(h, w);
-    const bool vertical = g_verticalVolumeBrightness.load();
-    const float bottom = vertical ? 6.0f : 13.0f;
-    extra.x[0] = layout.textX + layout.textWidth / 3.0f;
-    extra.x[1] = layout.textX + layout.textWidth * 2.0f / 3.0f;
-    extra.y = h - bottom - 14.0f;
-    extra.radius = 11.0f;
+    const MediaLayout layout = ComputeMediaLayout(
+        g_panelHeight / g_scale, g_panelWidth / g_scale);
+    extra.radius = layout.buttonRadius * 0.5f;
+    extra.x = layout.controlsX[0] - layout.buttonRadius -
+              extra.radius - 3.0f;
+    const bool both = g_mediaCurrent.canShuffle &&
+                      g_mediaCurrent.shuffleKnown &&
+                      g_mediaCurrent.canRepeat &&
+                      g_mediaCurrent.repeatMode >= 0;
+    const float offset = both ? extra.radius + 2.0f : 0.0f;
+    extra.y[0] = layout.controlsY - offset; // Shuffle above
+    extra.y[1] = layout.controlsY + offset; // Repeat below
     return true;
 }
-int SpotifyExtraHitTest(float x, float y) {
-    SpotifyExtraLayout extra{};
-    if (!GetSpotifyExtraLayout(extra)) return 0;
+int MediaExtraHitTest(float x, float y) {
+    MediaExtraLayout extra{};
+    if (!GetMediaExtraLayout(extra)) return 0;
     const bool allowed[2] = {
         g_mediaCurrent.canShuffle && g_mediaCurrent.shuffleKnown,
         g_mediaCurrent.canRepeat && g_mediaCurrent.repeatMode >= 0
     };
     for (int i = 0; i < 2; ++i) {
-        const float dx = x - extra.x[i];
-        const float dy = y - extra.y;
-        if (allowed[i] && dx * dx + dy * dy <= extra.radius * extra.radius)
-            return i == 0 ? 5 : 6;
+        const float dx = x - extra.x;
+        const float dy = y - extra.y[i];
+        if (allowed[i] && dx * dx + dy * dy <=
+            extra.radius * extra.radius) return i == 0 ? 5 : 6;
     }
     return 0;
 }
@@ -4834,8 +4810,8 @@ void DrawMediaPanel(Gdiplus::Graphics& gfx) {
                          allowed[i] ? fg : quiet,
                          layout.contentScale * (pressed ? 0.90f : 1.0f));
     }
-    SpotifyExtraLayout extra{};
-    if (GetSpotifyExtraLayout(extra)) {
+    MediaExtraLayout extra{};
+    if (GetMediaExtraLayout(extra)) {
         const bool enabled[2] = {
             g_mediaCurrent.canShuffle && g_mediaCurrent.shuffleKnown,
             g_mediaCurrent.canRepeat && g_mediaCurrent.repeatMode >= 0
@@ -4847,19 +4823,25 @@ void DrawMediaPanel(Gdiplus::Graphics& gfx) {
         for (int i = 0; i < 2; ++i) {
             if (!enabled[i]) continue;
             const int action = 5 + i;
-            const bool pressed = g_spotifyPressedAction == action &&
-                                 g_spotifyPressedInside;
+            const bool pressed = g_extraPressedAction == action &&
+                                 g_extraPressedInside;
+            const bool tapped = feedback && g_mediaFeedbackIndex == action - 2;
             const float radius = extra.radius * (pressed ? 0.95f : 1.0f);
-            Gdiplus::SolidBrush background(active[i] ?
+            Gdiplus::SolidBrush background(pressed || tapped ?
+                ToGdiColor(accentRgb, 96) : active[i] ?
                 ToGdiColor(accentRgb, 65) :
                 (light ? Gdiplus::Color(255, 233, 234, 238)
                        : Gdiplus::Color(255, 67, 68, 74)));
-            gfx.FillEllipse(&background, extra.x[i] - radius,
-                extra.y - radius, radius * 2.0f, radius * 2.0f);
+            gfx.FillEllipse(&background, extra.x - radius,
+                extra.y[i] - radius, radius * 2.0f, radius * 2.0f);
             Gdiplus::Pen pen(active[i] ? ToGdiColor(accentRgb) : fg, 1.6f);
             pen.SetStartCap(Gdiplus::LineCapRound);
             pen.SetEndCap(Gdiplus::LineCapRound);
-            const float x = extra.x[i], y = extra.y;
+            // Both the circle and its symbol scale with Previous.
+            const Gdiplus::GraphicsState saved = gfx.Save();
+            gfx.TranslateTransform(extra.x, extra.y[i]);
+            gfx.ScaleTransform(extra.radius / 16.0f, extra.radius / 16.0f);
+            const float x = 0.0f, y = 0.0f;
             if (i == 0) { // Shuffle: crossing paths with directional heads.
                 gfx.DrawLine(&pen, x - 6.0f, y - 4.5f, x - 2.0f, y - 4.5f);
                 gfx.DrawLine(&pen, x - 2.0f, y - 4.5f, x + 3.0f, y + 4.5f);
@@ -4882,6 +4864,7 @@ void DrawMediaPanel(Gdiplus::Graphics& gfx) {
                     DrawText(gfx, L"1", x - 4.0f, y - 4.0f,
                              8.0f, 8.0f, 7.0f, fg, true);
             }
+            gfx.Restore(saved);
         }
     }
 }
@@ -5053,12 +5036,12 @@ void RenderPanel() {
 void ClosePanel() {
     if (g_popupWnd) KillTimer(g_popupWnd, kMediaAnimationTimer);
     const bool heldCapture = g_mediaPressedIndex >= 0 ||
-        g_spotifyPressedAction != 0 ||
+        g_extraPressedAction != 0 ||
         g_mixerDrag || g_mixerMutePressedIndex >= 0;
     g_mediaPressedIndex = -1;
     g_mediaPressedInside = false;
-    g_spotifyPressedAction = 0;
-    g_spotifyPressedInside = false;
+    g_extraPressedAction = 0;
+    g_extraPressedInside = false;
     g_mediaSeeking = false;
     g_mediaSeekHoldUntil = 0;
     g_mediaFeedbackIndex = -1;
@@ -5726,7 +5709,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else if (g_panelMode == PanelMode::Media)
                     overClickableIcon = MediaButtonHitTest(x, y) >= 0 ||
                         MediaTimelineHitTest(x, y) ||
-                        SpotifyExtraHitTest(x, y) != 0;
+                        MediaExtraHitTest(x, y) != 0;
             }
         }
         SetCursor(LoadCursorW(nullptr,
@@ -5861,9 +5844,9 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 PreviewMediaSeek(x);
                 return 0;
             }
-            g_spotifyPressedAction = SpotifyExtraHitTest(x, y);
-            g_spotifyPressedInside = g_spotifyPressedAction != 0;
-            if (g_spotifyPressedAction) {
+            g_extraPressedAction = MediaExtraHitTest(x, y);
+            g_extraPressedInside = g_extraPressedAction != 0;
+            if (g_extraPressedAction) {
                 SetCapture(hwnd);
                 RenderPanel();
                 return 0;
@@ -5881,12 +5864,12 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             PreviewMediaSeek(x);
             return 0;
         }
-        if (msg == WM_MOUSEMOVE && g_spotifyPressedAction) {
+        if (msg == WM_MOUSEMOVE && g_extraPressedAction) {
             const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
             const float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
-            const bool inside = SpotifyExtraHitTest(x, y) == g_spotifyPressedAction;
-            if (inside != g_spotifyPressedInside) {
-                g_spotifyPressedInside = inside;
+            const bool inside = MediaExtraHitTest(x, y) == g_extraPressedAction;
+            if (inside != g_extraPressedInside) {
+                g_extraPressedInside = inside;
                 RenderPanel();
             }
             return 0;
@@ -5914,11 +5897,11 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ResetHideTimerFor(DurationKind::Interactive);
                 return 0;
             }
-            if (g_spotifyPressedAction) {
-                const int action = g_spotifyPressedAction;
-                const bool activated = SpotifyExtraHitTest(x, y) == action;
-                g_spotifyPressedAction = 0;
-                g_spotifyPressedInside = false;
+            if (g_extraPressedAction) {
+                const int action = g_extraPressedAction;
+                const bool activated = MediaExtraHitTest(x, y) == action;
+                g_extraPressedAction = 0;
+                g_extraPressedInside = false;
                 if (GetCapture() == hwnd) ReleaseCapture();
                 if (activated) {
                     g_mediaFeedbackIndex = action - 2; // 3=shuffle, 4=repeat
@@ -5975,11 +5958,11 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_mediaSeekHoldUntil = 0;
             if (g_panelMode == PanelMode::Media) RenderPanel();
         }
-        if (g_mediaPressedIndex >= 0 || g_spotifyPressedAction) {
+        if (g_mediaPressedIndex >= 0 || g_extraPressedAction) {
             g_mediaPressedIndex = -1;
             g_mediaPressedInside = false;
-            g_spotifyPressedAction = 0;
-            g_spotifyPressedInside = false;
+            g_extraPressedAction = 0;
+            g_extraPressedInside = false;
             if (g_panelMode == PanelMode::Media) RenderPanel();
         }
         g_mixerMutePressedIndex = -1;
@@ -6214,7 +6197,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD & Media v1.7.4 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD & Media v1.7.5 initialized (%s)", name);
     return TRUE;
 }
 
