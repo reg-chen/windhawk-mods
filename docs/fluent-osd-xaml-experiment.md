@@ -54,6 +54,28 @@ This pilot uses **system `Windows.UI.Xaml`** and the documented legacy Island ho
 
 See Microsoft's [UWP XAML hosting documentation](https://learn.microsoft.com/en-us/windows/uwp/xaml-islands/using-the-xaml-hosting-api) and [Win32 C++ XAML Island example](https://learn.microsoft.com/en-us/windows/uwp/xaml-islands/host-standard-control-with-xaml-islands-cpp).
 
+## v0.1.2 — Rounded-corner host clipping (experimental)
+
+Observed on the Windows host: the XAML preview renders, but the four
+corners show black opaque pixels outside the card radius.
+
+The XAML `Border.CornerRadius` only rounds the XAML card; the enclosing
+Win32 `WS_POPUP` HWND and its XAML Island child still occupy a rectangle.
+The prototype therefore applies a Win32 rounded `HRGN` via
+`CreateRoundRectRgn` / `SetWindowRgn` to the **top-level host**. The same
+14-DIP radius is used by the XAML card and converted to physical pixels
+using the host DPI. It is reapplied when the window is shown, resized,
+or notified of a DPI change. `gdi32` was added to the link options.
+
+This clips pixels outside the window region; it is **not** per-pixel-alpha
+transparency and may produce slightly stepped edges. Verify the four corners
+on a light and a dark desktop background, including displays with different
+DPI scaling. Do not confuse a region-clipped preview with a production-ready
+alpha-composited overlay.
+
+References: [SetWindowRgn](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowrgn),
+[CreateRoundRectRgn](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createroundrectrgn).
+
 ## Migration gates
 
 1. **Host viability:** Windows compilation, Island activation, show/hide, transparency behavior, DPI, multimonitor placement, nonactivation and clean unloading.
