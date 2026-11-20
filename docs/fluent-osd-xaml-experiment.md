@@ -99,12 +99,12 @@ would restore the jagged edges.
 
 Microsoft reference: [Apply rounded corners in desktop apps](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/ui/apply-rounded-corners).
 
-## First integrated backend — Fluent OSD v1.0.9 (branch only)
+## First integrated backend — Fluent OSD v1.0.10 (branch only)
 
 The existing `mods/fluent-osd.wh.cpp` now contains an **opt-in** XAML
 volume renderer within the **same** mod.
 
-v1.0.9 fixes the Windhawk Clang `std::clamp` overload mismatch between
+v1.0.5 fixed the Windhawk Clang `std::clamp` overload mismatch between
 Win32 `LONG` (`RECT`) coordinates and local `int` variables. The source
 already includes `winsock2.h` before `windows.h`; a remaining Winsock
 include warning may originate from Windhawk's generated compilation prelude.
@@ -121,8 +121,8 @@ XAML Island probe remains separate and unchanged.
   and other *non-volume* OSD categories retain their original GDI+ paths.
 - Failed XAML initialization, an unavailable host, failed event posting or
   render exceptions **do not trigger GDI+ volume fallback**. The event
-  may show nothing; Windhawk logs contain `XAML v1.0.9:` or
-  `Fluent OSD v1.0.9:` diagnostics.
+  may show nothing; Windhawk logs contain `XAML v1.0.10:` or
+  `Fluent OSD v1.0.10:` diagnostics.
 - Native volume events and Core Audio state remain in the existing code.
   A plain value snapshot (percent, mute, duration, language, colors, anchor)
   is copied across the thread boundary. All XAML/WinRT objects stay on a
@@ -134,7 +134,7 @@ XAML Island probe remains separate and unchanged.
 
 1. Disable the standalone `fluent-osd-xaml-island-probe` mod.
 2. Load **`mods/fluent-osd.wh.cpp`** from the `fluent-osd-xaml`
-   branch into Windhawk, and verify **`@version 1.0.9`**.
+   branch into Windhawk, and verify **`@version 1.0.10`**.
    The test mod has a **separate ID** (`fluent-osd-xaml`), so it can
    be installed alongside the production `fluent-osd`; however, only
    **one should be enabled at a time**, because both install Windows OSD
@@ -145,8 +145,8 @@ XAML Island probe remains separate and unchanged.
    **Experimental XAML volume renderer (no fallback)**. Change volume with
    the Windows volume buttons. A native XAML popup should show the actual
    volume and mute state.
-4. Inspect logs: `XAML v1.0.9: renderer ready`, then
-   `Fluent OSD v1.0.9: native volume -> XAML only`.
+4. Inspect logs: `XAML v1.0.10: renderer ready`, then
+   `Fluent OSD v1.0.10: native volume -> XAML only`.
    If the view is missing, check for
    `XAML volume unavailable; NO GDI+ fallback`, startup or draw errors.
 5. Disable the XAML switch and trigger volume again: **only then**
@@ -189,13 +189,13 @@ v1.0.1 branch is unchanged.
 
 ### Targeted visual test for the new build
 
-1. Load the experimental `@id fluent-osd-xaml` **v1.0.9** source,
+1. Load the experimental `@id fluent-osd-xaml` **v1.0.10** source,
    keeping the production mod disabled during test.
 2. Enable custom volume + experimental XAML volume rendering; adjust
    volume and mute. The old demo heading should be gone.
 3. Check all four corners against a bright background. If any dark
    pixels remain, capture a close-up and check
-   `XAML v1.0.9: DWM round=... border-none=...` in the Windhawk log.
+   `XAML v1.0.10: DWM round=... border-none=...` in the Windhawk log.
 4. Compare horizontal and vertical layouts, theme colors, user-defined
    width/height, 100%/125%/150% DPI and disabled value/icon options.
 5. If compiling fails, send the **first** compiler error and version
@@ -232,6 +232,23 @@ v1.0.1 branch is unchanged.
 - No change to event routing, DWM corner treatment or the production
   `fluent-osd` branch. Real-machine compile and visual validation
   are still required.
+
+## v1.0.10 — Remove nonexistent mixer-arrow gutter
+
+- In the XAML volume-only renderer, the mixer-arrow control is **not
+  implemented**. The horizontal layout nevertheless reserved **32 DIP**
+  instead of **7 DIP** after the percentage text whenever the existing
+  mixer-arrow setting was enabled.
+- The vertical renderer has **no corresponding bottom-gap branch**.
+  That asymmetry explains why the report only affected horizontal mode.
+- Remove the unimplemented XAML arrow reservation and its unused
+  snapshot member. Align the percentage field 7 DIP from the right
+  edge regardless of the mixer setting. The track derives its endpoint
+  from that same value-field boundary.
+- When XAML mixer controls are implemented, add their spacing together
+  with the actual clickable UI rather than allocating invisible space.
+- No change to native event routing, DWM rounding, or GDI+ production
+  renderer. Runtime verification is still required.
 
 ## Migration gates
 
