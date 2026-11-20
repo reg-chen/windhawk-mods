@@ -354,6 +354,64 @@ must stay fixed throughout. Also toggle Show Value off/on and change
 font size to exercise cache invalidation. This requires the user's
 Windhawk runtime test; no Windows compiler/runtime validation was run.
 
+## v1.0.16 — XAML switch directly controls migrated OSD categories
+
+### Scope and compatibility
+
+- The existing Windhawk setting key
+  `CustomOSD.Switches.experimentalXamlVolume` is retained so earlier
+  test configurations are not reset. Its visible name now states
+  **XAML renderer for migrated OSDs (no fallback)**.
+- The switch now routes **system volume AND Windows native brightness**
+  to a shared native XAML rendering path. Their individual
+  `showCustomVolume` and `showCustomBrightness` toggles still determine
+  whether events are shown at all.
+- The XAML off state restores the prior GDI+ path for those categories.
+  The XAML on state **never** falls back to GDI+ when unavailable, so
+  failures remain observable.
+- Brightness uses the OS-provided Segoe Fluent Icons **Brightness E706**
+  symbol; `ddcShowSun` controls icon visibility in brightness mode.
+  Unknown native brightness levels display their raw reading, with
+  no percentage fill or slider thumb.
+- Shared popup placement, UI language, dimensions, DPI, color theme,
+  show percentage and duration all remain sourced from existing state.
+- Volume/brightness text and icons use maximum intrinsic size slots,
+  rather than changing bar width with a runtime value. Raw brightness
+  reserves a separately cached 5-digit numeric slot and does not
+  contaminate the volume percentage's slot.
+
+### Explicitly NOT migrated yet
+
+- **DDC/CI brightness:** current code retains per-monitor latest values,
+  physical target identity and simultaneous per-target GDI+ surfaces in
+  source/all-display modes. The XAML implementation currently has only
+  one window. Blindly redirecting DDC into it would lose this behavior.
+  Therefore DDC remains on its existing renderer regardless of the
+  XAML switch until an independent XAML host-per-display is implemented.
+- **SMTC, Mixer, USB, Bluetooth, network, clipboard and lock-key
+  status:** still GDI+. Their dedicated renderers and interactions
+  have not been converted.
+- No claim is made that GDI+ initialization or rendering has been
+  removed from the full test build.
+
+### Manual test
+
+1. Load `fluent-osd-xaml` **v1.0.16** and keep the production
+   `fluent-osd` mod disabled.
+2. Enable `showCustomVolume` and `showCustomBrightness` plus the
+   XAML switch. Change volume then use Windows native brightness keys.
+   Both must show the **same XAML styling**, not a GDI+ brightness card.
+3. Check log messages:
+   `Fluent OSD v1.0.16: native volume -> XAML only` and
+   `Fluent OSD v1.0.16: native brightness -> XAML only`.
+4. Test 98→100%, brightness 0→100%, theme changes, vertical layout,
+   `ddcShowSun` off/on, and XAML renderer off/on.
+5. Trigger external-monitor DDC/CI separately. It should remain on
+   the existing renderer until per-monitor XAML support is built.
+6. Disable/re-enable Windhawk mod, review Explorer shutdown and
+   `XAML v1.0.16` startup logs. This source is not yet
+   Windows-compiled or runtime-tested by the assistant.
+
 ## Migration gates
 
 1. **Host viability:** Windows compilation, Island activation, show/hide, transparency behavior, DPI, multimonitor placement, nonactivation and clean unloading.
