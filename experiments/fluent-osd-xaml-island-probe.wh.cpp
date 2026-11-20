@@ -3,7 +3,7 @@
 // @name            Fluent OSD XAML Island Probe (Experimental)
 // @description     Isolated native XAML Island volume-preview host for testing a future Fluent OSD renderer.
 // @description:zh-TW 獨立測試原生 XAML Island 的音量預覽，供 Fluent OSD 未來渲染架構研究。
-// @version         0.1.0
+// @version         0.1.1
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -316,7 +316,7 @@ DWORD WINAPI ProbeThreadProc(void*) {
                     Wh_Log(L"XAML probe: hotkey registration failed (%lu)",
                            GetLastError());
                 else
-                    Wh_Log(L"XAML probe ready: Ctrl+Alt+Shift+O");
+                    Wh_Log(L"XAML probe v0.1.1 ready: Ctrl+Alt+Shift+O");
                 if (!SetTimer(state.host, kStartupPreviewTimer,
                               kStartupPreviewDelayMs, nullptr))
                     TryShowPreview(state, L"startup timer unavailable");
@@ -382,7 +382,7 @@ DWORD WINAPI ProbeThreadProc(void*) {
 
 BOOL Wh_ModInit() {
     g_stopping.store(false);
-    Wh_Log(L"XAML probe: mod init in pid=%lu", GetCurrentProcessId());
+    Wh_Log(L"XAML probe v0.1.1: mod init in pid=%lu", GetCurrentProcessId());
     // Standalone opt-in diagnostic mod: no hooks or native OSD suppression.
     g_thread = CreateThread(nullptr, 0, ProbeThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
