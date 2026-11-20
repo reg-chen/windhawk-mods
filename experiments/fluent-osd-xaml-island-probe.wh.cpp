@@ -75,7 +75,9 @@ namespace {
 constexpr wchar_t kHostClass[] = L"Windhawk.FluentOSD.XamlProbe.Host";
 constexpr UINT kHotkeyId = 320;
 constexpr UINT_PTR kHideTimer = 321;
-constexpr UINT kVisibleMs = 2800;
+constexpr UINT_PTR kStartupPreviewTimer = 322;
+constexpr UINT kStartupPreviewDelayMs = 750;
+constexpr UINT kVisibleMs = 12000; // Diagnostic preview, intentionally conspicuous.
 constexpr int kProbeWidth = 344;  // Physical px, first-stage hosting check.
 constexpr int kProbeHeight = 124;
 
@@ -128,16 +130,42 @@ void ShowPreview(ProbeState& state) {
     state.volumeBar.IsEnabled(available);
 
     POINT cursor{};
-    GetCursorPos(&cursor);
-    HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+    HMONITOR monitor = GetCursorPos(&cursor)
+        ? MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY)
+        : MonitorFromWindow(state.host, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{sizeof(mi)};
-    if (!GetMonitorInfoW(monitor, &mi)) return;
-    const int x = mi.rcWork.right - kProbeWidth - 24;
-    const int y = mi.rcWork.bottom - kProbeHeight - 24;
-    SetWindowPos(state.host, HWND_TOPMOST, x, y,
-                 kProbeWidth, kProbeHeight,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    SetTimer(state.host, kHideTimer, kVisibleMs, nullptr);
+    if (!GetMonitorInfoW(monitor, &mi)) {
+        Wh_Log(L"XAML probe: GetMonitorInfo failed: %lu", GetLastError());
+        return;
+    }
+    // Center the first-stage diagnostic instead of hiding it near a screen edge.
+    const int x = mi.rcWork.left +
+        (mi.rcWork.right - mi.rcWork.left - kProbeWidth) / 2;
+    const int y = mi.rcWork.top +
+        (mi.rcWork.bottom - mi.rcWork.top - kProbeHeight) / 2;
+    if (!SetWindowPos(state.host, HWND_TOPMOST, x, y,
+        kProbeWidth, kProbeHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+        Wh_Log(L"XAML probe: SetWindowPos(show) failed: %lu", GetLastError());
+        return;
+    }
+    UpdateWindow(state.host);
+    Wh_Log(L"XAML probe: preview at (%d,%d), hostVisible=%d islandVisible=%d",
+        x, y, static_cast<int>(IsWindowVisible(state.host)),
+        static_cast<int>(state.island && IsWindowVisible(state.island)));
+    if (!SetTimer(state.host, kHideTimer, kVisibleMs, nullptr))
+        Wh_Log(L"XAML probe: hide timer failed: %lu", GetLastError());
+}
+
+void TryShowPreview(ProbeState& state, PCWSTR reason) {
+    Wh_Log(L"XAML probe: preview requested (%s)", reason);
+    try {
+        ShowPreview(state);
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"XAML probe: preview failed: HRESULT 0x%08lX (%s)",
+            static_cast<unsigned long>(ex.code()), ex.message().c_str());
+    } catch (...) {
+        Wh_Log(L"XAML probe: preview failed with unexpected exception");
+    }
 }
 
 LRESULT CALLBACK ProbeWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -151,7 +179,7 @@ LRESULT CALLBACK ProbeWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (msg) {
         case WM_HOTKEY:
-            if (wp == kHotkeyId && state) ShowPreview(*state);
+            if (wp == kHotkeyId && state) TryShowPreview(*state, L"hotkey");
             return 0;
         case WM_SIZE:
             if (state && state->island)
@@ -160,9 +188,13 @@ LRESULT CALLBACK ProbeWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         case WM_TIMER:
-            if (wp == kHideTimer) {
+            if (wp == kStartupPreviewTimer) {
+                KillTimer(hwnd, kStartupPreviewTimer);
+                if (state) TryShowPreview(*state, L"startup");
+            } else if (wp == kHideTimer) {
                 KillTimer(hwnd, kHideTimer);
                 ShowWindow(hwnd, SW_HIDE);
+                Wh_Log(L"XAML probe: preview hidden");
             }
             return 0;
         case WM_MOUSEACTIVATE:
@@ -225,30 +257,39 @@ DWORD WINAPI ProbeThreadProc(void*) {
     // Create a message queue before exposing the thread ID to the unloader.
     PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
     g_threadId.store(GetCurrentThreadId());
+    Wh_Log(L"XAML probe: STA worker starting tid=%lu", GetCurrentThreadId());
     try {
         winrt::init_apartment(winrt::apartment_type::single_threaded);
         apartmentReady = true;
+        Wh_Log(L"XAML probe: STA initialized");
         if (!g_stopping.load()) {
             WNDCLASSEXW wc{sizeof(wc)};
             wc.lpfnWndProc = ProbeWindowProc;
             wc.hInstance = instance;
             wc.lpszClassName = kHostClass;
+            // An ordinary redirected host gives a visible fallback surface
+            // if its child XAML composition fails to present.
+            wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
             classRegistered = RegisterClassExW(&wc) != 0;
             if (!classRegistered)
                 winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
 
-            // A composition host, not a GDI layered popup. No WebView2/HTML.
+            // Test a conventional redirected host first. The previous
+            // WS_EX_NOREDIRECTIONBITMAP path may hide fallback rendering.
+            // Neither path uses WebView2 or HTML.
             state.host = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
-                    WS_EX_NOREDIRECTIONBITMAP,
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
                 kHostClass, L"", WS_POPUP,
                 0, 0, kProbeWidth, kProbeHeight,
                 nullptr, nullptr, instance, &state);
             if (!state.host)
                 winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
             g_host.store(state.host);
+            Wh_Log(L"XAML probe: Win32 host created hwnd=%p", state.host);
             if (!g_stopping.load()) {
+                Wh_Log(L"XAML probe: initializing WindowsXamlManager");
                 state.manager = hosting::WindowsXamlManager::InitializeForCurrentThread();
+                Wh_Log(L"XAML probe: manager initialized; creating island");
                 state.source = hosting::DesktopWindowXamlSource{};
                 ComPtr<IDesktopWindowXamlSourceNative> interop;
                 // Use the documented COM IID explicitly. No dependency on
@@ -259,10 +300,15 @@ DWORD WINAPI ProbeThreadProc(void*) {
                     reinterpret_cast<void**>(interop.GetAddressOf())));
                 winrt::check_hresult(interop->AttachToWindow(state.host));
                 winrt::check_hresult(interop->get_WindowHandle(&state.island));
-                SetWindowPos(state.island, nullptr, 0, 0,
+                if (!state.island)
+                    winrt::throw_hresult(E_POINTER);
+                Wh_Log(L"XAML probe: island attached hwnd=%p", state.island);
+                if (!SetWindowPos(state.island, nullptr, 0, 0,
                     kProbeWidth, kProbeHeight,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW))
+                    winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
                 CreateXamlContent(state);
+                Wh_Log(L"XAML probe: XAML controls created");
                 state.registeredHotkey = RegisterHotKey(state.host, kHotkeyId,
                     MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
                     'O') != FALSE;
@@ -271,6 +317,11 @@ DWORD WINAPI ProbeThreadProc(void*) {
                            GetLastError());
                 else
                     Wh_Log(L"XAML probe ready: Ctrl+Alt+Shift+O");
+                if (!SetTimer(state.host, kStartupPreviewTimer,
+                              kStartupPreviewDelayMs, nullptr))
+                    TryShowPreview(state, L"startup timer unavailable");
+                else
+                    Wh_Log(L"XAML probe: startup auto-preview scheduled");
                 while (!g_stopping.load() && GetMessageW(&message, nullptr, 0, 0) > 0) {
                     TranslateMessage(&message);
                     DispatchMessageW(&message);
@@ -286,7 +337,10 @@ DWORD WINAPI ProbeThreadProc(void*) {
     // Close island, release the framework, then destroy the parent HWND.
     if (state.registeredHotkey && state.host)
         UnregisterHotKey(state.host, kHotkeyId);
-    if (state.host) KillTimer(state.host, kHideTimer);
+    if (state.host) {
+        KillTimer(state.host, kHideTimer);
+        KillTimer(state.host, kStartupPreviewTimer);
+    }
     state.volumeBar = nullptr;
     state.volumeText = nullptr;
     if (state.source) {
@@ -328,6 +382,7 @@ DWORD WINAPI ProbeThreadProc(void*) {
 
 BOOL Wh_ModInit() {
     g_stopping.store(false);
+    Wh_Log(L"XAML probe: mod init in pid=%lu", GetCurrentProcessId());
     // Standalone opt-in diagnostic mod: no hooks or native OSD suppression.
     g_thread = CreateThread(nullptr, 0, ProbeThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
