@@ -262,6 +262,23 @@ v1.0.1 branch is unchanged.
   routing are unchanged. Only the experimental `fluent-osd-xaml`
   mod was edited; runtime verification is pending.
 
+## v1.0.12 — Optical margin based on real screenshot
+
+- Screenshot at 520 × 185 px: dark card occupies approximately x=115–446;
+  speaker glyph begins at x=141 (26px visible left inset), and the final
+  glyph of `100%` ends at about x=431 (15px visible right inset).
+- The right-aligned number looked too close to the card boundary even
+  though its *layout* right inset was 16 DIP. The unequal **visible**
+  margins are the relevant comparison, not the `TextBlock` slot alone.
+- Increase only the horizontal value's right inset from **16 to 28 DIP**,
+  keeping the same number-field width, right alignment, and 9-DIP gap
+  between progress track and number.
+- With the same screenshot scale, the expected visible right inset
+  grows by roughly 11px, making it comparable to the icon's left inset.
+  This is a measured correction, not yet a validated visual result.
+- Vertical layout, full-size progress fill clipping, DWM and production
+  mod are untouched.
+
 ## Migration gates
 
 1. **Host viability:** Windows compilation, Island activation, show/hide, transparency behavior, DPI, multimonitor placement, nonactivation and clean unloading.
