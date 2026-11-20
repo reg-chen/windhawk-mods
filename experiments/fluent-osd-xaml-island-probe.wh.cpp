@@ -243,7 +243,13 @@ DWORD WINAPI ProbeThreadProc(void*) {
             if (!g_stopping.load()) {
                 state.manager = hosting::WindowsXamlManager::InitializeForCurrentThread();
                 state.source = hosting::DesktopWindowXamlSource{};
-                auto interop = state.source.as<IDesktopWindowXamlSourceNative>();
+                ComPtr<IDesktopWindowXamlSourceNative> interop;
+                // Use the documented COM IID explicitly. No dependency on
+                // C++/WinRT projection metadata for this native interface.
+                auto* unknown = winrt::get_unknown(state.source);
+                winrt::check_hresult(unknown->QueryInterface(
+                    __uuidof(IDesktopWindowXamlSourceNative),
+                    reinterpret_cast<void**>(interop.GetAddressOf())));
                 winrt::check_hresult(interop->AttachToWindow(state.host));
                 winrt::check_hresult(interop->get_WindowHandle(&state.island));
                 SetWindowPos(state.island, nullptr, 0, 0,
@@ -277,13 +283,23 @@ DWORD WINAPI ProbeThreadProc(void*) {
     state.volumeBar = nullptr;
     state.volumeText = nullptr;
     if (state.source) {
-        state.source.Content(nullptr);
-        state.source.Close();
+        try {
+            state.source.Content(nullptr);
+            state.source.Close();
+        } catch (const winrt::hresult_error& ex) {
+            Wh_Log(L"XAML probe: island close failed: 0x%08lX",
+                static_cast<unsigned long>(ex.code()));
+        }
         state.source = nullptr;
     }
     state.island = nullptr;
     if (state.manager) {
-        state.manager.Close();
+        try {
+            state.manager.Close();
+        } catch (const winrt::hresult_error& ex) {
+            Wh_Log(L"XAML probe: manager close failed: 0x%08lX",
+                static_cast<unsigned long>(ex.code()));
+        }
         state.manager = nullptr;
     }
     g_host.store(nullptr);
@@ -321,12 +337,16 @@ void Wh_ModBeforeUninit() {
     const DWORD threadId = g_threadId.load();
     if (threadId) PostThreadMessageW(threadId, WM_QUIT, 0, 0);
     if (g_thread) {
-        // Bounded shutdown to avoid indefinitely blocking the Shell.
-        // A timeout means unloading this pilot is NOT proven safe; do not
-        // deploy it as the production backend without a stronger exit path.
+        // Never let Windhawk unload this module while our thread may still
+        // execute its code. A stuck XAML shutdown can consequently block
+        // removal: this is a pilot, not an enabled-by-default renderer.
         const DWORD result = WaitForSingleObject(g_thread, 6000);
-        if (result != WAIT_OBJECT_0)
-            Wh_Log(L"XAML probe: STA did not exit cleanly (%lu); experimental safety limit", result);
+        if (result == WAIT_TIMEOUT) {
+            Wh_Log(L"XAML probe: STA exit exceeded 6s; waiting for safe unload");
+            WaitForSingleObject(g_thread, INFINITE);
+        } else if (result == WAIT_FAILED) {
+            Wh_Log(L"XAML probe: thread wait failed: %lu", GetLastError());
+        }
         CloseHandle(g_thread);
         g_thread = nullptr;
     }
