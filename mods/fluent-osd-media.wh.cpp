@@ -2,7 +2,7 @@
 // @id              fluent-osd-media
 // @name            Fluent OSD & Media
 // @description     Fluent-style Windows 11 OSDs for volume, DDC/CI brightness, media controls, per-app audio mixer, lock keys, clipboard and device events.
-// @version         1.7.5
+// @version         1.7.6
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -65,8 +65,8 @@ indicators may require different display positions.
 - **Clipboard (opt-in):** Shortened text or image-first preview. Text previews
   are separately configurable; bitmap support depends on the data format.
 - **USB:** Device-interface arrival/removal, with available friendly names.
-- **Bluetooth:** Classic Bluetooth ACL connection/disconnection events;
-  BLE/profile connections may not provide the same events.
+- **Bluetooth:** Classic Bluetooth ACL connection/disconnection events.
+  BLE HID mice/keyboards are not covered; BLE monitoring is deferred.
 - **Network:** Windows connectivity-hint and interface-state changes, which
   do not independently establish Internet access or VPN/SSID identity.
 
@@ -107,6 +107,21 @@ resources. It does not monitor or intercept system shutdown separately;
 Windows owns process cleanup when Explorer exits. This limits one potential
 source of "GDI+ Window is preventing shutdown" without claiming to resolve
 shutdown blockers originating in other processes.
+
+## Multi-monitor and DDC event behavior
+
+OSD display routing can follow the DDC brightness event target, stay
+on the primary display, use one numbered Windows DISPLAYn device, or mirror
+the OSD to all attached monitors. The master popup remains the only
+interactive control surface; mirror windows are view-only.
+When Twinkle Tray changes multiple monitor brightness values in one burst,
+DDC events are coalesced for 90 ms **per monitor**. Each resolved target
+retains its own brightness value/range, and in target-display mode concurrent
+DDC updates appear on their respective screens instead of overwriting each
+other. DDC is target-specific even in all-monitor mode: untouched screens
+do not display another monitor's brightness percentage. Non-DDC events
+still mirror the same content. The master flyout remains the
+only interactive surface; other screens' DDC flyouts are view-only.
 
 ## Standard SMTC shuffle / repeat controls
 
@@ -631,6 +646,29 @@ trademarks remain the property of their respective owners.
           $name:zh-TW: 自訂 OSD 大小（%）
           $description: Overall uniform scale applied after the configurable logical width/height and monitor DPI. Does not change the aspect ratio of either layout.
           $description:zh-TW: 在可設定的邏輯寬高及螢幕 DPI 之後套用整體等比縮放，不會改變任何版面的長寬比例。
+        - displayOutputMode: source
+          $name: OSD display output
+          $name:zh-TW: OSD 顯示螢幕
+          $description: DDC/CI target monitor (primary for other events), primary only, selected monitor, or all monitors. DDC brightness always follows its target even in all-monitor mode; other events mirror to all screens. Mirror controls are view-only.
+          $description:zh-TW: 可選 DDC/CI 事件目標螢幕（其他事件使用主螢幕）、僅主螢幕、指定螢幕或所有螢幕。即使選擇所有螢幕，DDC 亮度仍依各自目標顯示，不複製別台的數值；其他 OSD 則同步顯示。副本僅供觀看。
+          $options:
+          - source: Event target monitor (default)
+          - primary: Primary monitor
+          - selected: Selected monitor
+          - all: All monitors (synchronized)
+          $options:zh-TW:
+          - source: 事件目標螢幕（預設）
+          - primary: 主螢幕
+          - selected: 指定螢幕
+          - all: 所有螢幕同步顯示
+        - displayOutputNumber: 1
+          $name: Windows display number
+          $name:zh-TW: Windows 顯示器編號
+          $description: Uses the Windows device ID DISPLAY1, DISPLAY2, etc. Only used in Selected monitor mode. Falls back to the primary display if missing.
+          $description:zh-TW: 對應 Windows 的 DISPLAY1、DISPLAY2 等裝置名稱；只在指定螢幕模式使用，找不到則回退主螢幕。
+          #! $showIf: {displayOutputMode: selected}
+          #! $min: 1
+          #! $max: 16
         - ddcPosition: bottomCenter
           $name: OSD position
           $name:zh-TW: OSD 位置
@@ -721,6 +759,8 @@ constexpr ULONG_PTR kCopyDataTag = 0x1E7AFB2;
 constexpr UINT_PTR kHideTimer = 320;
 constexpr UINT_PTR kFadeTimer = 321;
 constexpr UINT_PTR kEventBatchTimer = 322;
+constexpr UINT_PTR kDdcBatchTimer = 324;
+constexpr UINT kDdcBatchDelayMs = 90;
 constexpr UINT_PTR kMediaAnimationTimer = 323;
 constexpr UINT kMediaAnimationIntervalMs = 100;
 constexpr ULONGLONG kMediaFeedbackMs = 240;
@@ -937,6 +977,9 @@ std::atomic<int> g_iconSize{16};
 std::atomic<int> g_iconStrokeWidth{2};
 std::atomic<bool> g_showSun{true};
 std::atomic<bool> g_showValue{true};
+// 0=source, 1=primary, 2=selected DISPLAYn, 3=all screens
+std::atomic<int> g_displayOutputMode{0};
+std::atomic<int> g_displayOutputNumber{1};
 std::atomic<int> g_position{0};
 std::atomic<int> g_offsetX{0};
 std::atomic<int> g_offsetY{0};
@@ -977,6 +1020,15 @@ HANDLE g_uiReady = nullptr;
 DWORD g_uiThreadId = 0;
 HWND g_receiveWnd = nullptr;
 HWND g_popupWnd = nullptr;
+struct MirrorOutput {
+    HWND popup = nullptr;
+    HWND panel = nullptr;
+    HMONITOR monitor = nullptr;
+    RECT work{}, popupBounds{};
+    float scale = 1.0f;
+};
+std::vector<MirrorOutput> g_mirrorOutputs; // UI thread only
+constexpr size_t kMaxMirrorOutputs = 7; // At most 8 displays including master. 
 HWND g_panelWnd = nullptr;
 HWND g_arrowWnd = nullptr;
 // Hover and press state belong to the Explorer UI thread, like the flyouts.
@@ -1303,6 +1355,14 @@ void LoadSettings() {
     g_iconStrokeWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcIconStrokeWidth"), 1, 3));
     g_showSun.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowSun") != 0);
     g_showValue.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowValue") != 0);
+    PCWSTR outputMode = Wh_GetStringSetting(L"CustomOSD.Layout.displayOutputMode");
+    const int displayMode = outputMode && _wcsicmp(outputMode, L"all") == 0 ? 3 :
+        outputMode && _wcsicmp(outputMode, L"selected") == 0 ? 2 :
+        outputMode && _wcsicmp(outputMode, L"primary") == 0 ? 1 : 0;
+    g_displayOutputMode.store(displayMode);
+    Wh_FreeStringSetting(outputMode);
+    g_displayOutputNumber.store(std::clamp(
+        Wh_GetIntSetting(L"CustomOSD.Layout.displayOutputNumber"), 1, 16));
     g_position.store(ReadPositionSetting());
     g_offsetX.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetX"), -500, 500));
     g_offsetY.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetY"), -500, 500));
@@ -1610,6 +1670,19 @@ struct BrightnessEvent {
     DWORD producerPid;
 };
 static_assert(sizeof(BrightnessEvent) < 512);
+// Twinkle Tray emits an independent write for each physical monitor.
+// Keep a per-target batch: a single "latest" slot silently discards other
+// monitors' values, and a mirrored image duplicates the wrong percentage.
+constexpr size_t kMaxDdcTargets = 16;
+struct DdcTargetState {
+    BrightnessEvent event{};
+    ULONGLONG expiresAt = 0;
+};
+std::vector<BrightnessEvent> g_ddcBatchEvents;  // UI thread only
+std::vector<DdcTargetState> g_ddcTargets;      // UI thread only
+bool g_ddcBatchPending = false;
+WCHAR g_ddcLastUnresolved[CCHDEVICENAME]{}; // UI thread, log only changed failures
+WCHAR g_ddcLastTarget[CCHDEVICENAME]{}; // UI thread, log target transitions
 
 struct BrightnessWheelTask {
     bool native = false;
@@ -1638,8 +1711,16 @@ void QueueBrightnessWheelTask(const BrightnessWheelTask& task) {
 void Publish(HANDLE handle, DWORD value) {
     if (!DdcAllowed()) return;
     PhysicalInfo info = GetPhysicalInfo(handle);
-    if (!info.device[0] && !g_loggedUnmapped.exchange(true))
-        Wh_Log(L"DDC monitor handle not mapped. Restart Twinkle Tray if it was already running when the mod was enabled.");
+    if (!info.device[0]) {
+        if (!g_loggedUnmapped.exchange(true))
+            Wh_Log(L"DDC target monitor unknown: handle was not observed in "
+                   L"GetPhysicalMonitorsFromHMONITOR. Fully quit/restart "
+                   L"Twinkle Tray to rebuild its physical-monitor handle map.");
+        // The Event target monitor mode must not silently move an unknown
+        // target to DISPLAY1. Other output modes are location-independent.
+        if (g_displayOutputMode.load(std::memory_order_relaxed) == 0)
+            return;
+    }
     BrightnessEvent ev{};
     ev.magic = kEventMagic;
     wcscpy_s(ev.device, info.device);
@@ -1820,6 +1901,17 @@ BOOL CALLBACK FindDisplayCallback(HMONITOR m, HDC, LPRECT, LPARAM context) {
     }
     return TRUE;
 }
+// One GDI-name lookup for DDC events, selected DISPLAYn and popup routing.
+// Unknown identities stay unresolved, rather than silently identifying
+// the primary monitor as the event target.
+HMONITOR FindMonitorByDeviceName(PCWSTR device) {
+    if (!device || !device[0]) return nullptr;
+    FindDisplay result{};
+    wcscpy_s(result.name, device);
+    EnumDisplayMonitors(nullptr, nullptr, FindDisplayCallback,
+                        reinterpret_cast<LPARAM>(&result));
+    return result.monitor;
+}
 
 // UISettings.GetColorValue(UIColorType.Accent): actual user-configured
 // Windows UI accent, not DWM's distinct glass composition color.
@@ -1984,15 +2076,18 @@ void DrawTrackThumb(Gdiplus::Graphics& gfx, float x, float centerY,
                     diameter, diameter);
 }
 
-int BrightnessPercent(bool* known) {
-    *known = g_visible.maximum > g_visible.minimum;
+int BrightnessPercent(const BrightnessEvent& brightness, bool* known) {
+    *known = brightness.maximum > brightness.minimum;
     if (!*known) return 0;
-    const DWORD current = std::clamp(g_visible.value,
-                                     g_visible.minimum, g_visible.maximum);
-    const unsigned long long range = g_visible.maximum - g_visible.minimum;
+    const DWORD current = std::clamp(brightness.value,
+                                     brightness.minimum, brightness.maximum);
+    const unsigned long long range = brightness.maximum - brightness.minimum;
     return static_cast<int>((
-        static_cast<unsigned long long>(current - g_visible.minimum) * 100ULL +
+        static_cast<unsigned long long>(current - brightness.minimum) * 100ULL +
         range / 2ULL) / range);
+}
+int BrightnessPercent(bool* known) {
+    return BrightnessPercent(g_visible, known);
 }
 
 // Called ONLY on the Explorer OSD UI thread when Windows requests its
@@ -2234,7 +2329,7 @@ void MainVolumeIconCenter(float& x, float& y) {
     }
 }
 
-void DrawVerticalPopup(Gdiplus::Graphics& gfx) {
+void DrawVerticalPopup(Gdiplus::Graphics& gfx, const BrightnessEvent& brightness) {
     const bool light = IsLightTheme();
     const DWORD defaultBg = light ? 0xFAFAFC : 0x26262A;
     const DWORD defaultText = light ? 0x1C1C20 : 0xFAFAFB;
@@ -2298,8 +2393,8 @@ void DrawVerticalPopup(Gdiplus::Graphics& gfx) {
     int percent = 0;
     DWORD raw = 0;
     if (g_popupKind == PopupKind::DdcBrightness) {
-        percent = BrightnessPercent(&known);
-        raw = g_visible.value;
+        percent = BrightnessPercent(brightness, &known);
+        raw = brightness.value;
     } else {
         known = g_nativePercentKnown;
         percent = g_nativePercent;
@@ -2387,9 +2482,12 @@ void ShowPopupAnimated();
 void RenderPopup();
 void RenderPanel();
 void MovePopupToDisplay(const BrightnessEvent&);
+void SetPopupInteractive(bool enabled);
 void ResetHideTimer(UINT milliseconds);
 void ResetHideTimerFor(DurationKind kind);
 void ClosePanel();
+void HideMirroredWindows(bool onlyPanel);
+void DestroyMirroredWindows();
 void UpdateArrowHitWindow();
 void UpdateSpeakerHitWindow();
 void FlushNoticeBatch();
@@ -2588,6 +2686,8 @@ void DrawNotification(Gdiplus::Graphics& gfx) {
 // alpha). NEVER mix SetLayeredWindowAttributes on the popup/panel: doing so
 // would break subsequent UpdateLayeredWindow calls.
 void FinishPopupHide() {
+    HideMirroredWindows(false);
+    g_ddcTargets.clear(); // Release per-monitor values after visibility ends.
     g_fadeActive = false;
     g_fadeAlpha = 255;
     if (g_popupWnd) ShowWindow(g_popupWnd, SW_HIDE);
@@ -3156,17 +3256,35 @@ void DrawNotification(Gdiplus::Graphics& gfx);
 void DrawExpandChevron(Gdiplus::Graphics& gfx, float x, float y,
                        Gdiplus::Color color);
 
-void RenderPopup() {
-    if (!g_popupWnd || !g_gdiplusToken) return;
+void RenderMirroredFrame(HDC screen, void* pixels, int sourceWidth,
+                         int sourceHeight, bool panel);
+void RenderDdcTargetPeers();
+void HideMirroredWindows(bool onlyPanel);
+void DestroyMirroredWindows();
+
+struct PopupFrame {
+    HWND window = nullptr;
+    int width = 0, height = 0;
+    float scale = 1.0f;
+    BrightnessEvent brightness{};
+};
+// One GDI+ painter is shared by the master popup and all DDC-target peers.
+// A peer never mutates the global HWND, brightness snapshot or DPI state.
+bool RenderPopupFrame(const PopupFrame& frame, bool publishMirrors) {
+    if (!frame.window || !g_gdiplusToken || frame.width <= 0 ||
+        frame.height <= 0 || frame.width > 4096 || frame.height > 4096 ||
+        static_cast<uint64_t>(frame.width) * frame.height > 8388608ULL)
+        return false;
     HDC screen = GetDC(nullptr);
-    if (!screen) return;
+    if (!screen) return false;
     HDC memory = CreateCompatibleDC(screen);
-    if (!memory) { ReleaseDC(nullptr, screen); return; }
+    if (!memory) { ReleaseDC(nullptr, screen); return false; }
+    bool published = false;
 
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = g_width;
-    bi.bmiHeader.biHeight = -g_height;  // top-down
+    bi.bmiHeader.biWidth = frame.width;
+    bi.bmiHeader.biHeight = -frame.height;  // top-down
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
@@ -3176,14 +3294,14 @@ void RenderPopup() {
     if (bitmap && pixels) {
         HGDIOBJ previous = SelectObject(memory, bitmap);
         {
-            Gdiplus::Bitmap surface(g_width, g_height, g_width * 4,
+            Gdiplus::Bitmap surface(frame.width, frame.height, frame.width * 4,
                                     PixelFormat32bppPARGB,
                                     static_cast<BYTE*>(pixels));
             Gdiplus::Graphics gfx(&surface);
             gfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
             gfx.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
             gfx.Clear(Gdiplus::Color(0, 0, 0, 0));
-            gfx.ScaleTransform(g_scale, g_scale);
+            gfx.ScaleTransform(frame.scale, frame.scale);
             if (g_popupKind == PopupKind::LockStatus) {
                 DrawLockStatus(gfx);
             } else if (g_popupKind == PopupKind::Notification) {
@@ -3191,7 +3309,7 @@ void RenderPopup() {
             } else if (g_popupKind == PopupKind::NativeEvent) {
                 DrawNativeEvent(gfx);
             } else if (g_verticalVolumeBrightness.load(std::memory_order_relaxed)) {
-                DrawVerticalPopup(gfx);
+                DrawVerticalPopup(gfx, frame.brightness);
             } else if (g_popupKind == PopupKind::NativeVolume) {
                 DrawHorizontalVolume(gfx);
             } else {
@@ -3276,13 +3394,13 @@ void RenderPopup() {
             }
             bool known = false;
             int percent = 0;
-            DWORD rawBrightness = g_visible.value;
+            DWORD rawBrightness = frame.brightness.value;
             if (g_popupKind == PopupKind::NativeBrightness) {
                 known = g_nativePercentKnown;
                 percent = std::clamp(g_nativePercent, 0, 100);
                 rawBrightness = static_cast<DWORD>(std::max(g_nativePercent, 0));
             } else {
-                percent = BrightnessPercent(&known);
+                percent = BrightnessPercent(frame.brightness, &known);
             }
             const bool showValue = g_showValue.load();
             const float barX = g_showSun.load() ? 80.0f : 38.0f;
@@ -3341,60 +3459,74 @@ void RenderPopup() {
             } // g_showValue
             } // horizontal renderer
         }
-        SIZE size{g_width, g_height};
+        SIZE size{frame.width, frame.height};
         POINT origin{0, 0};
         BLENDFUNCTION blend{AC_SRC_OVER, 0, static_cast<BYTE>(g_fadeAlpha), AC_SRC_ALPHA};
-        if (!UpdateLayeredWindow(g_popupWnd, screen, nullptr, &size,
+        if (!UpdateLayeredWindow(frame.window, screen, nullptr, &size,
                                  memory, &origin, 0, &blend, ULW_ALPHA)) {
             Wh_Log(L"UpdateLayeredWindow failed: %lu", GetLastError());
+        } else {
+            published = true;
         }
+        if (publishMirrors && published &&
+            g_displayOutputMode.load(std::memory_order_relaxed) == 3 &&
+            g_popupKind != PopupKind::DdcBrightness)
+            RenderMirroredFrame(screen, pixels, frame.width, frame.height, false);
         SelectObject(memory, previous);
         DeleteObject(bitmap);
     }
     DeleteDC(memory);
     ReleaseDC(nullptr, screen);
+    return published;
+}
+void RenderPopup() {
+    PopupFrame master{g_popupWnd, g_width, g_height, g_scale, g_visible};
+    if (!RenderPopupFrame(master, true)) return;
+    if (g_popupKind == PopupKind::DdcBrightness) {
+        const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
+        if (mode == 0 || mode == 3) RenderDdcTargetPeers();
+    }
 }
 
-void MovePopupToDisplay(const BrightnessEvent& ev) {
-    FindDisplay f{};
-    wcscpy_s(f.name, ev.device);
-    if (f.name[0]) EnumDisplayMonitors(nullptr, nullptr, FindDisplayCallback,
-                                       reinterpret_cast<LPARAM>(&f));
-    if (!f.monitor)
-        f.monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+struct PopupPlacement {
+    float scale = 1.0f;
+    int width = 0, height = 0;
+    RECT work{}, bounds{};
+};
+bool CalculatePopupPlacement(HMONITOR monitor, PopupPlacement& p) {
     MONITORINFO mi{sizeof(mi)};
-    if (!GetMonitorInfoW(f.monitor, &mi)) return;
+    if (!GetMonitorInfoW(monitor, &mi)) return false;
     UINT dpiX = 96, dpiY = 96;
-    if (GetDpiForMonitor(f.monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY) != S_OK)
+    if (GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY) != S_OK)
         dpiX = 96;
     // Apply an independent user-selected size factor after monitor DPI.
     // The renderer keeps the same Win11-inspired vector geometry.
     const float dpiScale = std::clamp(dpiX / 96.0f, 0.75f, 3.0f);
     const float sizeScale =
         g_ddcSizePercent.load(std::memory_order_relaxed) / 100.0f;
-    g_scale = dpiScale * sizeScale;
+    p.scale = dpiScale * sizeScale;
     const bool vertical = g_verticalVolumeBrightness.load(
         std::memory_order_relaxed);
-    g_width = static_cast<int>(std::lround(
+    p.width = static_cast<int>(std::lround(
         (g_popupKind == PopupKind::LockStatus ? 178 :
          g_popupKind == PopupKind::NativeEvent ? 296 :
          g_popupKind == PopupKind::Notification ?
              (g_clipboardThumbnail ? kClipboardImageCanvasW : 296.0f) :
-         MainLogicalWidth()) * g_scale));
-    g_height = static_cast<int>(std::lround(
+         MainLogicalWidth()) * p.scale));
+    p.height = static_cast<int>(std::lround(
         (g_popupKind == PopupKind::LockStatus ? 66 :
          g_popupKind == PopupKind::NativeEvent ? 92 :
          g_popupKind == PopupKind::Notification ?
              (g_clipboardThumbnail ? kClipboardImageCanvasH : 92.0f) :
-         MainLogicalHeight()) * g_scale));
+         MainLogicalHeight()) * p.scale));
     const RECT& r = mi.rcWork;
     const int margin = static_cast<int>(std::lround(24.0f * dpiScale));
-    const int centerX = r.left + ((r.right - r.left) - g_width) / 2;
-    const int centerY = r.top + ((r.bottom - r.top) - g_height) / 2;
+    const int centerX = r.left + ((r.right - r.left) - p.width) / 2;
+    const int centerY = r.top + ((r.bottom - r.top) - p.height) / 2;
     const int leftX = r.left + margin;
-    const int rightX = r.right - g_width - margin;
+    const int rightX = r.right - p.width - margin;
     const int topY = r.top + margin;
-    const int bottomY = r.bottom - g_height - margin;
+    const int bottomY = r.bottom - p.height - margin;
     int x = centerX;
     int y = bottomY;
     // Stable mapping retains positions chosen in v1.4.1.
@@ -3414,12 +3546,348 @@ void MovePopupToDisplay(const BrightnessEvent& ev) {
     x += static_cast<int>(std::lround(g_offsetX.load() * dpiScale));
     y += static_cast<int>(std::lround(g_offsetY.load() * dpiScale));
     // Avoid accidentally placing the entire popup outside its display.
-    x = std::clamp<int>(x, r.left, std::max(r.left, r.right - g_width));
-    y = std::clamp<int>(y, r.top, std::max(r.top, r.bottom - g_height));
-    SetWindowPos(g_popupWnd, HWND_TOPMOST, x, y, g_width, g_height,
-                 SWP_NOACTIVATE);
+    x = std::clamp<int>(x, r.left, std::max(r.left, r.right - p.width));
+    y = std::clamp<int>(y, r.top, std::max(r.top, r.bottom - p.height));
+    p.work = mi.rcWork;
+    p.bounds = RECT{x, y, x + p.width, y + p.height};
+    return true;
+}
+struct MirrorScan { HMONITOR master = nullptr; std::vector<HMONITOR> peers; };
+BOOL CALLBACK FindMirrorCallback(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
+    auto* scan = reinterpret_cast<MirrorScan*>(data);
+    if (monitor != scan->master && scan->peers.size() < kMaxMirrorOutputs)
+        scan->peers.push_back(monitor);
+    return TRUE;
+}
+void HideMirroredWindows(bool onlyPanel) {
+    for (auto& display : g_mirrorOutputs) {
+        if (display.panel) ShowWindow(display.panel, SW_HIDE);
+        if (!onlyPanel && display.popup) ShowWindow(display.popup, SW_HIDE);
+    }
+}
+void DestroyMirroredWindows() {
+    for (auto& display : g_mirrorOutputs) {
+        if (display.panel) DestroyWindow(display.panel);
+        if (display.popup) DestroyWindow(display.popup);
+    }
+    g_mirrorOutputs.clear();
+}
+HWND CreateMirrorSurface() {
+    return CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+        WS_EX_LAYERED | WS_EX_TRANSPARENT,
+        kWindowClass, L"", WS_POPUP, 0, 0, 1, 1,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+void RefreshMirrorOutputs(HMONITOR master) {
+    const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
+    const bool targetDisplayMode = mode == 0 &&
+        g_popupKind == PopupKind::DdcBrightness && !g_ddcTargets.empty();
+    if (mode != 3 && !targetDisplayMode) {
+        DestroyMirroredWindows();
+        return;
+    }
+    MirrorScan scan{master, {}};
+    EnumDisplayMonitors(nullptr, nullptr, FindMirrorCallback,
+                        reinterpret_cast<LPARAM>(&scan));
+    while (g_mirrorOutputs.size() < scan.peers.size()) {
+        MirrorOutput display{};
+        display.popup = CreateMirrorSurface();
+        display.panel = CreateMirrorSurface();
+        if (!display.popup || !display.panel) {
+            if (display.popup) DestroyWindow(display.popup);
+            if (display.panel) DestroyWindow(display.panel);
+            Wh_Log(L"OSD mirror creation failed: %lu", GetLastError());
+            break;
+        }
+        g_mirrorOutputs.push_back(display);
+    }
+    for (size_t i = 0; i < g_mirrorOutputs.size(); ++i) {
+        MirrorOutput& display = g_mirrorOutputs[i];
+        if (i >= scan.peers.size()) {
+            if (display.popup) ShowWindow(display.popup, SW_HIDE);
+            if (display.panel) ShowWindow(display.panel, SW_HIDE);
+            display.monitor = nullptr;
+            continue;
+        }
+        PopupPlacement place{};
+        if (!CalculatePopupPlacement(scan.peers[i], place)) {
+            display.monitor = nullptr;
+            if (display.popup) ShowWindow(display.popup, SW_HIDE);
+            if (display.panel) ShowWindow(display.panel, SW_HIDE);
+            continue;
+        }
+        // A visible replica may still contain the *previous* monitor's
+        // bitmap. Hide it before moving to another physical display.
+        if (display.monitor != scan.peers[i] &&
+            IsWindowVisible(display.popup))
+            ShowWindow(display.popup, SW_HIDE);
+        display.monitor = scan.peers[i];
+        display.work = place.work;
+        display.popupBounds = place.bounds;
+        display.scale = place.scale;
+        SetWindowPos(display.popup, HWND_TOPMOST,
+            place.bounds.left, place.bounds.top,
+            place.width, place.height, SWP_NOACTIVATE);
+    }
 }
 
+void MovePopupToDisplay(const BrightnessEvent& ev) {
+    WCHAR device[CCHDEVICENAME]{};
+    const int outputMode = g_displayOutputMode.load(std::memory_order_relaxed);
+    if ((outputMode == 0 ||
+         (outputMode == 3 && g_popupKind == PopupKind::DdcBrightness)) &&
+        ev.device[0]) {
+        wcscpy_s(device, ev.device);
+    } else if (outputMode == 2) {
+        swprintf_s(device, L"\\\\.\\DISPLAY%d",
+                   g_displayOutputNumber.load(std::memory_order_relaxed));
+    }
+    HMONITOR monitor = FindMonitorByDeviceName(device);
+    if (!monitor)
+        monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    PopupPlacement place{};
+    if (!CalculatePopupPlacement(monitor, place)) return;
+    g_scale = place.scale;
+    g_width = place.width;
+    g_height = place.height;
+    SetWindowPos(g_popupWnd, HWND_TOPMOST, place.bounds.left,
+        place.bounds.top, place.width, place.height, SWP_NOACTIVATE);
+    RefreshMirrorOutputs(monitor);
+}
+
+// Paint each target's actual DDC value on its own screen. This method uses
+// the existing renderer but temporarily swaps ONLY paint state on the same
+// Explorer UI thread; it never repositions the master or changes controls.
+// The guard prevents nested rendering from recursively rendering more peers.
+void RenderDdcTargetPeers() {
+    if (g_mirrorOutputs.empty()) return;
+    const ULONGLONG now = GetTickCount64();
+    for (auto& output : g_mirrorOutputs) {
+        if (!output.monitor || !output.popup) continue;
+        MONITORINFOEXW info{sizeof(info)};
+        if (!GetMonitorInfoW(output.monitor, &info)) {
+            ShowWindow(output.popup, SW_HIDE);
+            continue;
+        }
+        const auto item = std::find_if(g_ddcTargets.begin(),
+            g_ddcTargets.end(), [&](const DdcTargetState& target) {
+                return target.expiresAt > now &&
+                       _wcsicmp(target.event.device, info.szDevice) == 0;
+            });
+        if (item == g_ddcTargets.end()) {
+            // Never mirror another display's DDC percentage to this one.
+            ShowWindow(output.popup, SW_HIDE);
+            continue;
+        }
+        const int width = output.popupBounds.right -
+                          output.popupBounds.left;
+        const int height = output.popupBounds.bottom -
+                           output.popupBounds.top;
+        if (width <= 0 || height <= 0 || width > 4096 ||
+            height > 4096 || output.scale <= 0.0f) {
+            ShowWindow(output.popup, SW_HIDE);
+            continue;
+        }
+        PopupFrame frame{output.popup, width, height, output.scale,
+                         item->event};
+        if (RenderPopupFrame(frame, false))
+            ShowWindow(output.popup, SW_SHOWNOACTIVATE);
+        else
+            ShowWindow(output.popup, SW_HIDE);
+    }
+}
+
+// All replica HWNDs are view-only. The master premultiplied-alpha DIB is
+// scaled to each monitor's independent effective DPI on the same UI thread.
+// No new media/DDC worker, hooks, animation timers or network requests.
+void RenderMirroredFrame(HDC screen, void* pixels, int sourceWidth,
+                         int sourceHeight, bool panel) {
+    if (!screen || !pixels || sourceWidth <= 0 || sourceHeight <= 0 ||
+        g_scale <= 0.0f) return;
+    Gdiplus::Bitmap source(sourceWidth, sourceHeight, sourceWidth * 4,
+                          PixelFormat32bppPARGB, static_cast<BYTE*>(pixels));
+    if (source.GetLastStatus() != Gdiplus::Ok) return;
+    RECT mainPopup{}, mainPanel{};
+    if (!GetWindowRect(g_popupWnd, &mainPopup)) return;
+    if (panel && (!g_panelWnd || g_panelMode == PanelMode::None ||
+                  !GetWindowRect(g_panelWnd, &mainPanel))) return;
+    for (auto& output : g_mirrorOutputs) {
+        if (!output.monitor) continue;
+        HWND mirror = panel ? output.panel : output.popup;
+        if (!mirror) continue;
+        const float ratio = output.scale / g_scale;
+        if (ratio <= 0.0f || ratio > 4.0f) continue;
+        const int width = std::max(1, static_cast<int>(
+            std::lround(sourceWidth * ratio)));
+        const int height = std::max(1, static_cast<int>(
+            std::lround(sourceHeight * ratio)));
+        // Bound per-frame allocations inside explorer.exe.
+        if (width > 4096 || height > 4096 ||
+            static_cast<uint64_t>(width) * height > 8388608ULL) continue;
+        if (panel) {
+            int x = output.popupBounds.left + static_cast<int>(std::lround(
+                (mainPanel.left - mainPopup.left) * ratio));
+            int y = output.popupBounds.top + static_cast<int>(std::lround(
+                (mainPanel.top - mainPopup.top) * ratio));
+            x = std::clamp<int>(x, static_cast<int>(output.work.left),
+                std::max(static_cast<int>(output.work.left),
+                         static_cast<int>(output.work.right) - width));
+            y = std::clamp<int>(y, static_cast<int>(output.work.top),
+                std::max(static_cast<int>(output.work.top),
+                         static_cast<int>(output.work.bottom) - height));
+            SetWindowPos(mirror, HWND_TOPMOST, x, y, width, height,
+                         SWP_NOACTIVATE);
+        }
+        HDC targetDC = CreateCompatibleDC(screen);
+        if (!targetDC) continue;
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = width;
+        bi.bmiHeader.biHeight = -height;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* targetPixels = nullptr;
+        HBITMAP bitmap = CreateDIBSection(screen, &bi, DIB_RGB_COLORS,
+                                          &targetPixels, nullptr, 0);
+        if (bitmap && targetPixels) {
+            HGDIOBJ previous = SelectObject(targetDC, bitmap);
+            {
+                Gdiplus::Bitmap dst(width, height, width * 4,
+                    PixelFormat32bppPARGB, static_cast<BYTE*>(targetPixels));
+                Gdiplus::Graphics graphics(&dst);
+                graphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+                graphics.SetInterpolationMode(
+                    Gdiplus::InterpolationModeHighQualityBicubic);
+                graphics.DrawImage(&source, Gdiplus::Rect(0, 0, width, height));
+            }
+            SIZE size{width, height};
+            POINT origin{0, 0};
+            BLENDFUNCTION blend{AC_SRC_OVER, 0,
+                static_cast<BYTE>(g_fadeAlpha), AC_SRC_ALPHA};
+            if (UpdateLayeredWindow(mirror, screen, nullptr, &size,
+                                    targetDC, &origin, 0, &blend, ULW_ALPHA))
+                ShowWindow(mirror, SW_SHOWNOACTIVATE);
+            SelectObject(targetDC, previous);
+            DeleteObject(bitmap);
+        } else if (bitmap) {
+            DeleteObject(bitmap);
+        }
+        DeleteDC(targetDC);
+    }
+}
+
+// Coalesce writes per physical display, not across all displays. Each
+// target's raw value and range survive the burst for independent painting.
+void DisplayDdcBatch() {
+    if (!g_ddcBatchPending) return;
+    g_ddcBatchPending = false;
+    std::vector<BrightnessEvent> events = std::move(g_ddcBatchEvents);
+    g_ddcBatchEvents.clear();
+    if (g_closing.load() || !g_showDdcBrightness.load() || events.empty())
+        return;
+
+    const ULONGLONG now = GetTickCount64();
+    const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
+    const ULONGLONG expiry = now + static_cast<ULONGLONG>(
+        OsdDuration(DurationKind::DdcBrightness));
+    // The cache lasts only for the active OSD period, never indefinitely.
+    g_ddcTargets.erase(std::remove_if(g_ddcTargets.begin(),
+        g_ddcTargets.end(), [now](const DdcTargetState& item) {
+            return item.expiresAt <= now;
+        }), g_ddcTargets.end());
+
+    BrightnessEvent master{};
+    bool masterChosen = false;
+    // If both displays update in the same burst, keep the already-visible
+    // target as master. The other target still receives its own peer frame.
+    // This prevents the master window bouncing when write order varies.
+    bool pinnedMaster = false;
+    if ((mode == 0 || mode == 3) &&
+        g_popupKind == PopupKind::DdcBrightness && g_popupWnd &&
+        IsWindowVisible(g_popupWnd) && g_visible.device[0]) {
+        auto current = std::find_if(events.begin(), events.end(),
+            [&](const BrightnessEvent& event) {
+                return _wcsicmp(event.device, g_visible.device) == 0;
+            });
+        if (current != events.end()) {
+            master = *current;
+            masterChosen = true;
+            pinnedMaster = true;
+        }
+    }
+    WCHAR preferredDevice[CCHDEVICENAME]{};
+    if (mode == 1 || mode == 2) {
+        HMONITOR preferredMonitor = nullptr;
+        if (mode == 2) {
+            WCHAR device[CCHDEVICENAME]{};
+            swprintf_s(device, L"\\\\.\\DISPLAY%d",
+                g_displayOutputNumber.load(std::memory_order_relaxed));
+            preferredMonitor = FindMonitorByDeviceName(device);
+        }
+        if (!preferredMonitor)
+            preferredMonitor = MonitorFromPoint(
+                POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFOEXW monitorInfo{sizeof(monitorInfo)};
+        if (GetMonitorInfoW(preferredMonitor, &monitorInfo))
+            wcscpy_s(preferredDevice, monitorInfo.szDevice);
+    }
+
+    for (const BrightnessEvent& ev : events) {
+        const HMONITOR target = FindMonitorByDeviceName(ev.device);
+        if (!target && (mode == 0 || mode == 3)) {
+            if (_wcsicmp(g_ddcLastUnresolved, ev.device) != 0 ||
+                !g_ddcLastUnresolved[0]) {
+                wcscpy_s(g_ddcLastUnresolved, ev.device);
+                Wh_Log(L"DDC event target unresolved: device='%s', "
+                       L"physicalIndex=%lu, senderPID=%lu; skipping "
+                       L"unknown target.", ev.device, ev.physicalIndex,
+                       ev.producerPid);
+            }
+            continue;
+        }
+        if (target) {
+            if (_wcsicmp(g_ddcLastTarget, ev.device) != 0) {
+                wcscpy_s(g_ddcLastTarget, ev.device);
+                Wh_Log(L"DDC target resolved: '%s' (physicalIndex=%lu)",
+                       ev.device, ev.physicalIndex);
+            }
+            g_ddcLastUnresolved[0] = L'\0';
+            const auto sameDevice = [&](const DdcTargetState& state) {
+                return _wcsicmp(state.event.device, ev.device) == 0;
+            };
+            auto it = std::find_if(g_ddcTargets.begin(),
+                                   g_ddcTargets.end(), sameDevice);
+            if (it != g_ddcTargets.end()) {
+                it->event = ev;
+                it->expiresAt = expiry;
+            } else if (g_ddcTargets.size() < kMaxDdcTargets) {
+                g_ddcTargets.push_back({ev, expiry});
+            }
+        }
+        // Source mode puts the latest event on its own monitor. For fixed
+        // output/mirror modes prefer that screen's value if it was updated.
+        if (!masterChosen ||
+            ((mode == 0 || mode == 3) && !pinnedMaster) ||
+            (preferredDevice[0] &&
+             _wcsicmp(preferredDevice, ev.device) == 0)) {
+            master = ev;
+            masterChosen = true;
+        }
+    }
+    if (!masterChosen) return;
+
+    ClosePanel();
+    g_visible = master;
+    g_lastConfirmedDdcBrightness = master.value;
+    g_popupKind = PopupKind::DdcBrightness;
+    MovePopupToDisplay(master);
+    SetPopupInteractive(false);
+    ShowPopupAnimated();
+    UpdateArrowHitWindow();
+    ResetHideTimerFor(DurationKind::DdcBrightness);
+}
 
 // Brightness writes never execute on the OSD UI thread. Firmware DDC/CI
 // can be slow, so a single sleeping worker coalesces wheel updates. This
@@ -5026,6 +5494,8 @@ void RenderPanel() {
         BLENDFUNCTION blend{AC_SRC_OVER, 0, static_cast<BYTE>(g_fadeAlpha), AC_SRC_ALPHA};
         UpdateLayeredWindow(g_panelWnd, screen, nullptr, &sz,
                             memory, &origin, 0, &blend, ULW_ALPHA);
+        if (g_displayOutputMode.load(std::memory_order_relaxed) == 3)
+            RenderMirroredFrame(screen, pixels, w, h, true);
         SelectObject(memory, old);
         DeleteObject(bmp);
     }
@@ -5034,6 +5504,7 @@ void RenderPanel() {
 }
 
 void ClosePanel() {
+    HideMirroredWindows(true);
     if (g_popupWnd) KillTimer(g_popupWnd, kMediaAnimationTimer);
     const bool heldCapture = g_mediaPressedIndex >= 0 ||
         g_extraPressedAction != 0 ||
@@ -5448,6 +5919,11 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         FlushNoticeBatch();
         return 0;
     }
+    if (hwnd == g_receiveWnd && msg == WM_TIMER && wp == kDdcBatchTimer) {
+        KillTimer(hwnd, kDdcBatchTimer);
+        DisplayDdcBatch();
+        return 0;
+    }
     if (hwnd == g_receiveWnd && msg == WM_CLIPBOARDUPDATE) {
         ProcessClipboard();
         return 0;
@@ -5598,15 +6074,28 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return FALSE;
         // producerPid is descriptive metadata, not sender authentication.
         if (!g_showDdcBrightness.load()) return TRUE;
-        ClosePanel();
-        g_visible = ev;
-        g_lastConfirmedDdcBrightness = ev.value;
-        g_popupKind = PopupKind::DdcBrightness;
-        MovePopupToDisplay(ev);
-        SetPopupInteractive(false);
-        ShowPopupAnimated();
-        UpdateArrowHitWindow();
-        ResetHideTimerFor(DurationKind::DdcBrightness);
+        const bool firstInBatch = !g_ddcBatchPending;
+        // Keep one latest write per GDI target and physical index. Updates
+        // for display 1 must never overwrite display 2's brightness value.
+        auto sameTarget = [&](const BrightnessEvent& existing) {
+            return existing.physicalIndex == ev.physicalIndex &&
+                   _wcsicmp(existing.device, ev.device) == 0;
+        };
+        auto same = std::find_if(g_ddcBatchEvents.begin(),
+                                 g_ddcBatchEvents.end(), sameTarget);
+        if (same != g_ddcBatchEvents.end()) {
+            // Move a refreshed target to the end so the order reflects
+            // real writes: DISPLAY1 -> DISPLAY2 -> DISPLAY1 ends on DISPLAY1.
+            g_ddcBatchEvents.erase(same);
+            g_ddcBatchEvents.push_back(ev);
+        } else if (g_ddcBatchEvents.size() < kMaxDdcTargets) {
+            g_ddcBatchEvents.push_back(ev);
+        }
+        if (g_ddcBatchEvents.empty()) return TRUE;
+        g_ddcBatchPending = true;
+        if (firstInBatch &&
+            !SetTimer(g_receiveWnd, kDdcBatchTimer, kDdcBatchDelayMs, nullptr))
+            DisplayDdcBatch(); // Timer allocation failure must not lose updates.
         return TRUE;
     }
     if (msg == WM_TIMER && hwnd == g_popupWnd && wp == kHideTimer) {
@@ -6147,7 +6636,13 @@ DWORD WINAPI UiThreadProc(void*) {
     g_networkReceiver.store(nullptr);
     if (g_clipboardListener) RemoveClipboardFormatListener(g_receiveWnd);
     g_clipboardListener = false;
-    if (g_receiveWnd) KillTimer(g_receiveWnd, kEventBatchTimer);
+    if (g_receiveWnd) {
+        KillTimer(g_receiveWnd, kEventBatchTimer);
+        KillTimer(g_receiveWnd, kDdcBatchTimer);
+    }
+    g_ddcBatchPending = false;
+    g_ddcBatchEvents.clear();
+    g_ddcTargets.clear();
     g_noticeBatch = NoticeBatch{};
     g_usbNames.clear();
     g_networkInterfaces.clear();
@@ -6161,6 +6656,7 @@ DWORD WINAPI UiThreadProc(void*) {
     if (g_lockHook) { UnhookWindowsHookEx(g_lockHook); g_lockHook = nullptr; }
     ClosePanel();
     ClearMediaArtworkCache();  // Must precede GDI+ shutdown.
+    DestroyMirroredWindows();
     if (g_speakerHitWnd) DestroyWindow(g_speakerHitWnd);
     if (g_barWheelWnd) DestroyWindow(g_barWheelWnd);
     if (g_arrowWnd) DestroyWindow(g_arrowWnd);
@@ -6197,7 +6693,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD & Media v1.7.5 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD & Media v1.7.6 initialized (%s)", name);
     return TRUE;
 }
 
