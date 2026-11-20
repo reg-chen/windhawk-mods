@@ -292,6 +292,35 @@ v1.0.1 branch is unchanged.
   underlying event/DWM systems remain untouched. This is a
   screenshot-based optical correction pending Windhawk visual testing.
 
+## v1.0.14 — Content-measured responsive XAML layout
+
+**Replaces the fixed-coordinate experiments of v1.0.8–v1.0.13.**
+
+- The XAML volume snapshot now copies the existing
+  `CustomOSD.Appearance.ddcInnerPadding` setting alongside DPI scale,
+  custom width/height, font and icon size, track thickness and thumb size.
+- Both `TextBlock` controls are measured with `UIElement.Measure()`
+  and `DesiredSize()` after setting their actual glyph/text and font sizes.
+  Reset the number's prior explicit width before measuring it.
+- **Horizontal:** the measured icon and number sit at matching outer
+  insets (derived from inner padding and the original canvas cutout).
+  The two icon/bar/number gaps are calculated from measured content height
+  and are **identical**. The bar consumes the remaining width. No fixed
+  `trackX`, 54-DIP percentage field, or hard-coded right gap remains.
+- **Vertical:** top number and bottom icon are measured, then the progress
+  bar consumes the remaining height between two calculated gaps.
+  Number stays centered within the card; icon uses its actual measured
+  width rather than assuming the font-size equals glyph width.
+- Available padding and gaps shrink if a custom card is too narrow/short
+  to fit the requested dimensions. Fill clipping and the thumb bounds are
+  still calculated from the resulting track rectangle.
+- A static arithmetic check covered 26 horizontal/vertical combinations
+  of card dimensions and optional number visibility; it found no
+  overlapping geometry. **Actual XAML measurement/compilation and
+  rendering remain unverified** in Windhawk.
+- GDI+ rendering of *unported* OSD categories remains in this test build.
+  The volume XAML route does not fall back to GDI+.
+
 ## Migration gates
 
 1. **Host viability:** Windows compilation, Island activation, show/hide, transparency behavior, DPI, multimonitor placement, nonactivation and clean unloading.
