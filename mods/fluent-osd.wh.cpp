@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.7
+// @version         1.0.8
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.7)
+## XAML migration experiment (v1.0.8)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -814,6 +814,9 @@ void DrawSnapshot(State& state) {
     state.icon.FontSize(std::clamp(value.iconSize, 10, 24));
     state.value.Text(winrt::hstring(std::to_wstring(percent) + L"%"));
     state.value.FontSize(std::clamp(value.fontSize, 10, 24));
+    // Center *within an explicit text box*, never from a guessed glyph width.
+    // This also keeps 0% / 100% aligned without measuring rendered text.
+    state.value.TextAlignment(wx::TextAlignment::Center);
     state.value.Visibility(value.showValue
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
 
@@ -852,8 +855,10 @@ void DrawSnapshot(State& state) {
         controls::Canvas::SetLeft(state.icon,
             centerX - value.iconSize / 2.0);
         controls::Canvas::SetTop(state.icon, bodyH - 31.0);
-        controls::Canvas::SetLeft(state.value,
-            std::max(0.0, centerX - 22.0));
+        // The old fixed 44px guess placed 0%/100% left of the card center.
+        // Use the full card width so all percentage strings share its axis.
+        state.value.Width(bodyW);
+        controls::Canvas::SetLeft(state.value, 0.0);
         controls::Canvas::SetTop(state.value, 7.0);
     } else {
         // Original horizontal GDI+ body: 13px left/top canvas inset;
@@ -884,15 +889,22 @@ void DrawSnapshot(State& state) {
             36.0 - value.iconSize / 2.0); // 49 - 13
         controls::Canvas::SetTop(state.icon,
             midY - value.iconSize / 2.0 - 1.0);
+        // Previously the XAML TextBlock was auto-sized and left-aligned,
+        // leaving its unoccupied 54px GDI+ text box as apparent right padding.
+        // Keep a fixed centered 54px field, nearer the card edge. Preserve
+        // room for the future mixer-arrow hit target when that option is on.
+        constexpr double kValueFieldWidth = 54.0;
+        state.value.Width(kValueFieldWidth);
+        const double valueRightGap = value.showMixerArrow ? 32.0 : 7.0;
         controls::Canvas::SetLeft(state.value, std::max(0.0,
-            logicalW - (value.showMixerArrow ? 121.0 : 97.0)));
+            bodyW - kValueFieldWidth - valueRightGap));
         controls::Canvas::SetTop(state.value,
             midY - value.fontSize / 2.0 - 5.0);
     }
 
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.7: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.8: show failed (%lu)", GetLastError());
         return;
     }
     KillTimer(state.host, kHideTimer);
@@ -913,13 +925,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DrawSnapshot(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.7: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.8: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.7: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.8: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
@@ -1043,7 +1055,7 @@ DWORD WINAPI ThreadProc(void*) {
             const HRESULT borderHr = DwmSetWindowAttribute(
                 state.host, DWMWA_BORDER_COLOR,
                 &noBorder, sizeof(noBorder));
-            Wh_Log(L"XAML v1.0.7: DWM round=0x%08lX border-none=0x%08lX",
+            Wh_Log(L"XAML v1.0.8: DWM round=0x%08lX border-none=0x%08lX",
                    static_cast<unsigned long>(dwm),
                    static_cast<unsigned long>(borderHr));
             if (!g_stopping.load()) {
@@ -1062,7 +1074,7 @@ DWORD WINAPI ThreadProc(void*) {
                     winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
                 CreateContent(state);
                 g_ready.store(state.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.7: renderer ready");
+                Wh_Log(L"XAML v1.0.8: renderer ready");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -1071,11 +1083,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.7: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.8: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.7: startup exception");
+        Wh_Log(L"XAML v1.0.8: startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -1090,12 +1102,12 @@ DWORD WINAPI ThreadProc(void*) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.7: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.8: island close failed"); }
         state.source = nullptr;
     }
     if (state.manager) {
         try { state.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.7: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.8: manager close failed"); }
         state.manager = nullptr;
     }
     if (state.host) DestroyWindow(state.host);
@@ -1110,7 +1122,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.7: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.8: STA creation failed (%lu)", GetLastError());
     }
 }
 bool Show(const Snapshot& snapshot) {
@@ -7070,7 +7082,7 @@ void ShowNativeVolumePopup() {
 
         RECT target{};
         if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-            Wh_Log(L"Fluent OSD v1.0.7: XAML volume not delivered (missing anchor HWND)");
+            Wh_Log(L"Fluent OSD v1.0.8: XAML volume not delivered (missing anchor HWND)");
             return;
         }
         const bool light = IsLightTheme();
@@ -7096,12 +7108,12 @@ void ShowNativeVolumePopup() {
         static bool loggedXamlUnavailable = false;
         if (xaml_volume::Show(data)) {
             if (!loggedXamlRouting) {
-                Wh_Log(L"Fluent OSD v1.0.7: native volume -> XAML only");
+                Wh_Log(L"Fluent OSD v1.0.8: native volume -> XAML only");
                 loggedXamlRouting = true;
             }
             loggedXamlUnavailable = false;
         } else if (!loggedXamlUnavailable) {
-            Wh_Log(L"Fluent OSD v1.0.7: XAML volume unavailable; NO GDI+ fallback");
+            Wh_Log(L"Fluent OSD v1.0.8: XAML volume unavailable; NO GDI+ fallback");
             loggedXamlUnavailable = true;
         }
         return;
@@ -8041,7 +8053,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.7 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.8 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
