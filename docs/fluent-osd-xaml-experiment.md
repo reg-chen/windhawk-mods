@@ -250,6 +250,18 @@ v1.0.1 branch is unchanged.
 - No change to native event routing, DWM rounding, or GDI+ production
   renderer. Runtime verification is still required.
 
+## v1.0.11 — Horizontal percentage optical inset
+
+- Keep the horizontally right-aligned percentage value field but increase
+  its card-edge inset from **7 DIP to 16 DIP**. At 7 DIP, the % glyph
+  appeared visually flush with the right edge.
+- The progress track continues to derive its endpoint from the same
+  value-field origin (9 DIP separation), so the bar cannot overlap the
+  number when this inset changes.
+- Vertical percentage placement, fill clipping, DWM corners and event
+  routing are unchanged. Only the experimental `fluent-osd-xaml`
+  mod was edited; runtime verification is pending.
+
 ## Migration gates
 
 1. **Host viability:** Windows compilation, Island activation, show/hide, transparency behavior, DPI, multimonitor placement, nonactivation and clean unloading.
