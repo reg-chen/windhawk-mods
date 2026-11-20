@@ -3,12 +3,12 @@
 // @name            Fluent OSD XAML Island Probe (Experimental)
 // @description     Isolated native XAML Island volume-preview host for testing a future Fluent OSD renderer.
 // @description:zh-TW 獨立測試原生 XAML Island 的音量預覽，供 Fluent OSD 未來渲染架構研究。
-// @version         0.1.2
+// @version         0.1.3
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lgdi32 -luser32 -lole32 -luuid -lruntimeobject -lwindowsapp
+// @compilerOptions -luser32 -ldwmapi -lole32 -luuid -lruntimeobject -lwindowsapp
 // @license         GPL-3.0
 // ==/WindhawkMod==
 
@@ -33,6 +33,7 @@ Copyright (c) Reg Chen. GPL-3.0.
 // ==/WindhawkModReadme==
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <wrl/client.h>
@@ -80,7 +81,8 @@ constexpr UINT kStartupPreviewDelayMs = 750;
 constexpr UINT kVisibleMs = 12000; // Diagnostic preview, intentionally conspicuous.
 constexpr int kProbeWidth = 344;  // Physical px, first-stage hosting check.
 constexpr int kProbeHeight = 124;
-constexpr double kCardCornerRadiusDip = 14.0; // Shared with the XAML Border.
+// DWM controls the outer HWND radius. The XAML card radius remains visual.
+constexpr double kCardCornerRadiusDip = 14.0;
 
 std::atomic<HWND> g_host{nullptr};
 std::atomic<DWORD> g_threadId{0};
@@ -117,30 +119,16 @@ bool ReadDefaultVolume(int& percent, bool& muted) {
     return true;
 }
 
-// An XAML Border rounds its own pixels, not the rectangular top-level HWND.
-// Clip the host window itself so the island's opaque surface cannot show
-// black squares outside the card corners. The OS owns a successfully
-// installed HRGN; only delete it if SetWindowRgn fails.
-bool ApplyHostRoundClip(HWND hwnd, int width, int height, UINT dpi = 0) {
-    if (!hwnd || width <= 0 || height <= 0) return false;
-    if (!dpi) dpi = GetDpiForWindow(hwnd);
-    if (!dpi) dpi = 96;
-    const int diameter = std::clamp(
-        static_cast<int>(std::lround(kCardCornerRadiusDip * 2.0 *
-                                     static_cast<double>(dpi) / 96.0)),
-        2, std::min(width, height));
-    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1,
-                                    diameter, diameter);
-    if (!region) {
-        Wh_Log(L"XAML probe: CreateRoundRectRgn failed (%lu)", GetLastError());
-        return false;
-    }
-    if (!SetWindowRgn(hwnd, region, TRUE)) {
-        Wh_Log(L"XAML probe: SetWindowRgn failed (%lu)", GetLastError());
-        DeleteObject(region);
-        return false;
-    }
-    return true;
+// Unlike SetWindowRgn, DWM's rounded-window composition can anti-alias
+// the *top-level* HWND's edge. A popup needs an explicit corner opt-in.
+// This is a request to DWM, not proof that a borderless popup is eligible.
+void RequestDwmRoundedCorners(HWND hwnd) {
+    const DWM_WINDOW_CORNER_PREFERENCE preference = DWMWCP_ROUND;
+    const HRESULT hr = DwmSetWindowAttribute(
+        hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+        &preference, sizeof(preference));
+    Wh_Log(L"XAML probe v0.1.3: DWM rounded-corner request HRESULT=0x%08lX",
+           static_cast<unsigned long>(hr));
 }
 
 void ShowPreview(ProbeState& state) {
@@ -175,8 +163,6 @@ void ShowPreview(ProbeState& state) {
         Wh_Log(L"XAML probe: SetWindowPos(show) failed: %lu", GetLastError());
         return;
     }
-    // Moving between displays can change the host DPI without a resize.
-    ApplyHostRoundClip(state.host, kProbeWidth, kProbeHeight);
     UpdateWindow(state.host);
     Wh_Log(L"XAML probe: preview at (%d,%d), hostVisible=%d islandVisible=%d",
         x, y, static_cast<int>(IsWindowVisible(state.host)),
@@ -211,20 +197,11 @@ LRESULT CALLBACK ProbeWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == kHotkeyId && state) TryShowPreview(*state, L"hotkey");
             return 0;
         case WM_SIZE:
-            if (wp != SIZE_MINIMIZED && LOWORD(lp) && HIWORD(lp))
-                ApplyHostRoundClip(hwnd, LOWORD(lp), HIWORD(lp));
             if (state && state->island)
                 SetWindowPos(state->island, nullptr, 0, 0,
                     LOWORD(lp), HIWORD(lp),
                     SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
-        case WM_DPICHANGED: {
-            RECT rect{};
-            if (GetWindowRect(hwnd, &rect))
-                ApplyHostRoundClip(hwnd, rect.right - rect.left,
-                                   rect.bottom - rect.top, HIWORD(wp));
-            return 0;
-        }
         case WM_TIMER:
             if (wp == kStartupPreviewTimer) {
                 KillTimer(hwnd, kStartupPreviewTimer);
@@ -324,7 +301,7 @@ DWORD WINAPI ProbeThreadProc(void*) {
             if (!state.host)
                 winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
             g_host.store(state.host);
-            ApplyHostRoundClip(state.host, kProbeWidth, kProbeHeight);
+            RequestDwmRoundedCorners(state.host);
             Wh_Log(L"XAML probe: Win32 host created hwnd=%p", state.host);
             if (!g_stopping.load()) {
                 Wh_Log(L"XAML probe: initializing WindowsXamlManager");
@@ -356,7 +333,7 @@ DWORD WINAPI ProbeThreadProc(void*) {
                     Wh_Log(L"XAML probe: hotkey registration failed (%lu)",
                            GetLastError());
                 else
-                    Wh_Log(L"XAML probe v0.1.2 ready: Ctrl+Alt+Shift+O");
+                    Wh_Log(L"XAML probe v0.1.3 ready: Ctrl+Alt+Shift+O");
                 if (!SetTimer(state.host, kStartupPreviewTimer,
                               kStartupPreviewDelayMs, nullptr))
                     TryShowPreview(state, L"startup timer unavailable");
@@ -422,7 +399,7 @@ DWORD WINAPI ProbeThreadProc(void*) {
 
 BOOL Wh_ModInit() {
     g_stopping.store(false);
-    Wh_Log(L"XAML probe v0.1.2: mod init in pid=%lu", GetCurrentProcessId());
+    Wh_Log(L"XAML probe v0.1.3: mod init in pid=%lu", GetCurrentProcessId());
     // Standalone opt-in diagnostic mod: no hooks or native OSD suppression.
     g_thread = CreateThread(nullptr, 0, ProbeThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
