@@ -99,10 +99,16 @@ would restore the jagged edges.
 
 Microsoft reference: [Apply rounded corners in desktop apps](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/ui/apply-rounded-corners).
 
-## First integrated backend — Fluent OSD v1.0.4 (branch only)
+## First integrated backend — Fluent OSD v1.0.5 (branch only)
 
 The existing `mods/fluent-osd.wh.cpp` now contains an **opt-in** XAML
-volume renderer within the **same** mod. The proven v0.1.3 standalone
+volume renderer within the **same** mod.
+
+v1.0.5 fixes the Windhawk Clang `std::clamp` overload mismatch between
+Win32 `LONG` (`RECT`) coordinates and local `int` variables. The source
+already includes `winsock2.h` before `windows.h`; a remaining Winsock
+include warning may originate from Windhawk's generated compilation prelude.
+ The proven v0.1.3 standalone
 XAML Island probe remains separate and unchanged.
 
 - `CustomOSD.Switches.experimentalXamlVolume` defaults to **false**.
@@ -115,8 +121,8 @@ XAML Island probe remains separate and unchanged.
   and other *non-volume* OSD categories retain their original GDI+ paths.
 - Failed XAML initialization, an unavailable host, failed event posting or
   render exceptions **do not trigger GDI+ volume fallback**. The event
-  may show nothing; Windhawk logs contain `XAML v1.0.4:` or
-  `Fluent OSD v1.0.4:` diagnostics.
+  may show nothing; Windhawk logs contain `XAML v1.0.5:` or
+  `Fluent OSD v1.0.5:` diagnostics.
 - Native volume events and Core Audio state remain in the existing code.
   A plain value snapshot (percent, mute, duration, language, colors, anchor)
   is copied across the thread boundary. All XAML/WinRT objects stay on a
@@ -128,7 +134,7 @@ XAML Island probe remains separate and unchanged.
 
 1. Disable the standalone `fluent-osd-xaml-island-probe` mod.
 2. Load **`mods/fluent-osd.wh.cpp`** from the `fluent-osd-xaml`
-   branch into Windhawk, and verify **`@version 1.0.4`**.
+   branch into Windhawk, and verify **`@version 1.0.5`**.
    The test mod has a **separate ID** (`fluent-osd-xaml`), so it can
    be installed alongside the production `fluent-osd`; however, only
    **one should be enabled at a time**, because both install Windows OSD
@@ -139,8 +145,8 @@ XAML Island probe remains separate and unchanged.
    **Experimental XAML volume renderer (no fallback)**. Change volume with
    the Windows volume buttons. A native XAML popup should show the actual
    volume and mute state.
-4. Inspect logs: `XAML v1.0.4: renderer ready`, then
-   `Fluent OSD v1.0.4: native volume -> XAML only`.
+4. Inspect logs: `XAML v1.0.5: renderer ready`, then
+   `Fluent OSD v1.0.5: native volume -> XAML only`.
    If the view is missing, check for
    `XAML volume unavailable; NO GDI+ fallback`, startup or draw errors.
 5. Disable the XAML switch and trigger volume again: **only then**
