@@ -8,7 +8,7 @@
 // @include         explorer.exe
 // @include         Twinkle Tray.exe
 // @architecture    x86-64
-// @compilerOptions -lgdi32 -luser32 -lgdiplus -lshcore -ladvapi32 -lole32 -luuid -lshell32 -lsetupapi -liphlpapi -loleaut32
+// @compilerOptions -lgdi32 -luser32 -lgdiplus -lshcore -ladvapi32 -lole32 -luuid -lshell32 -lsetupapi -liphlpapi -loleaut32 -lruntimeobject -lwindowsapp
 // @license         GPL-3.0
 // ==/WindhawkMod==
 
@@ -746,6 +746,11 @@ trademarks remain the property of their respective owners.
 #include <wbemidl.h>
 #include <audiopolicy.h>
 #include <wrl/client.h>
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.h>
+#include <winrt/Windows.Media.Control.h>
+#include <winrt/Windows.Storage.Streams.h>
 #include <vector>
 #include <memory>
 #include <cstdlib>
@@ -2045,6 +2050,32 @@ bool IsLightTheme() {
     return status == ERROR_SUCCESS ? light != 0 : false;
 }
 
+// Shared color resolution across native, DDC, media, mixer and notices.
+// Query the system accent only when no valid custom accent is configured.
+DWORD ConfiguredOsdRgb(const std::atomic<int>& mode,
+                        const std::atomic<bool>& valid,
+                        const std::atomic<DWORD>& rgb, DWORD fallback) {
+    return mode.load() && valid.load() ? rgb.load() : fallback;
+}
+DWORD OsdBackgroundRgb(bool light) {
+    return ConfiguredOsdRgb(g_backgroundMode, g_validCustomBackground,
+                            g_customBackground, light ? 0xFAFAFC : 0x26262A);
+}
+DWORD OsdTextRgb(bool light) {
+    return ConfiguredOsdRgb(g_textMode, g_validCustomText,
+                            g_customText, light ? 0x1C1C20 : 0xFAFAFB);
+}
+DWORD OsdTrackRgb(bool light, bool mixer = false) {
+    return ConfiguredOsdRgb(g_trackMode, g_validCustomTrack,
+                            g_customTrack, mixer
+                                ? (light ? 0xE0E1E7 : 0x5E5E65)
+                                : (light ? 0xDEDFE3 : 0x595A60));
+}
+DWORD OsdAccentRgb() {
+    return g_accentMode.load() && g_validCustomAccent.load()
+        ? g_customAccent.load() : SystemAccentRgb();
+}
+
 void AddRoundedRect(Gdiplus::GraphicsPath& path, float x, float y,
                     float width, float height, float radius) {
     radius = std::clamp(radius, 0.0f,
@@ -2090,30 +2121,40 @@ int BrightnessPercent(bool* known) {
     return BrightnessPercent(g_visible, known);
 }
 
+// Shared endpoint acquisition for read, wheel, track drag and mute.
+// WRL::ComPtr already ships with Windhawk's compiler; it avoids repeating
+// manual COM Release paths and preserves multimedia -> console fallback.
+bool OpenDefaultAudioEndpointVolume(
+    Microsoft::WRL::ComPtr<IAudioEndpointVolume>& volume) {
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+        reinterpret_cast<void**>(enumerator.GetAddressOf()));
+    if (FAILED(hr) || !enumerator) return false;
+    Microsoft::WRL::ComPtr<IMMDevice> device;
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia,
+                                              device.GetAddressOf());
+    if (FAILED(hr) || !device) {
+        device.Reset();
+        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole,
+                                                  device.GetAddressOf());
+    }
+    if (FAILED(hr) || !device) return false;
+    volume.Reset();
+    hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
+        nullptr, reinterpret_cast<void**>(volume.GetAddressOf()));
+    return SUCCEEDED(hr) && volume.Get() != nullptr;
+}
+
 // Called ONLY on the Explorer OSD UI thread when Windows requests its
 // native volume indicator. We do not query continuously or alter the volume.
 bool ReadDefaultAudioVolume(int& percent, bool& muted) {
-    IMMDeviceEnumerator* enumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
-                                  CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
-                                  reinterpret_cast<void**>(&enumerator));
-    if (FAILED(hr) || !enumerator) return false;
-    IMMDevice* device = nullptr;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
-    if (FAILED(hr) || !device)
-        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    enumerator->Release();
-    if (FAILED(hr) || !device) return false;
-    IAudioEndpointVolume* volume = nullptr;
-    hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
-                          nullptr, reinterpret_cast<void**>(&volume));
-    device->Release();
-    if (FAILED(hr) || !volume) return false;
+    Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
+    if (!OpenDefaultAudioEndpointVolume(volume)) return false;
     float scalar = 0.0f;
     BOOL isMuted = FALSE;
     const bool ok = SUCCEEDED(volume->GetMasterVolumeLevelScalar(&scalar)) &&
                     SUCCEEDED(volume->GetMute(&isMuted));
-    volume->Release();
     if (ok) {
         percent = static_cast<int>(std::lround(
             std::clamp(scalar, 0.0f, 1.0f) * 100.0f));
@@ -2128,22 +2169,8 @@ void ResetHideTimerFor(DurationKind kind);
 
 bool AdjustDefaultAudioWheel(int steps) {
     if (!steps) return false;
-    IMMDeviceEnumerator* enumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
-        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
-        reinterpret_cast<void**>(&enumerator));
-    if (FAILED(hr) || !enumerator) return false;
-    IMMDevice* device = nullptr;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
-    if (FAILED(hr) || !device)
-        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    enumerator->Release();
-    if (FAILED(hr) || !device) return false;
-    IAudioEndpointVolume* volume = nullptr;
-    hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
-        nullptr, reinterpret_cast<void**>(&volume));
-    device->Release();
-    if (FAILED(hr) || !volume) return false;
+    Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
+    if (!OpenDefaultAudioEndpointVolume(volume)) return false;
     float level = 0;
     BOOL muted = FALSE;
     bool ok = SUCCEEDED(volume->GetMasterVolumeLevelScalar(&level));
@@ -2156,7 +2183,6 @@ bool AdjustDefaultAudioWheel(int steps) {
             volume->GetMute(&muted);
         }
     }
-    volume->Release();
     if (ok) {
         g_nativePercent = static_cast<int>(std::lround(level * 100.0f));
         g_nativeMuted = muted != FALSE;
@@ -2174,30 +2200,15 @@ bool SetDefaultAudioBarPercent(int percent) {
     if (g_popupKind != PopupKind::NativeVolume || !g_nativePercentKnown)
         return false;
     if (percent == g_nativePercent) return true;
-    IMMDeviceEnumerator* enumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
-        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
-        reinterpret_cast<void**>(&enumerator));
-    if (FAILED(hr) || !enumerator) return false;
-    IMMDevice* device = nullptr;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
-    if (FAILED(hr) || !device)
-        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    enumerator->Release();
-    if (FAILED(hr) || !device) return false;
-    IAudioEndpointVolume* volume = nullptr;
-    hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
-        nullptr, reinterpret_cast<void**>(&volume));
-    device->Release();
-    if (FAILED(hr) || !volume) return false;
-    hr = volume->SetMasterVolumeLevelScalar(percent / 100.0f, nullptr);
+    Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
+    if (!OpenDefaultAudioEndpointVolume(volume)) return false;
+    HRESULT hr = volume->SetMasterVolumeLevelScalar(percent / 100.0f, nullptr);
     float actual = percent / 100.0f;
     BOOL muted = FALSE;
     if (SUCCEEDED(hr)) {
         volume->GetMasterVolumeLevelScalar(&actual);
         volume->GetMute(&muted);
     }
-    volume->Release();
     if (FAILED(hr)) return false;
     g_nativePercent = static_cast<int>(std::lround(
         std::clamp(actual, 0.0f, 1.0f) * 100.0f));
@@ -2210,24 +2221,8 @@ bool SetDefaultAudioBarPercent(int percent) {
 bool ToggleDefaultAudioMute() {
     if (g_popupKind != PopupKind::NativeVolume || g_closing.load())
         return false;
-    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
-        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
-        reinterpret_cast<void**>(enumerator.GetAddressOf()));
-    if (FAILED(hr) || !enumerator) return false;
-    Microsoft::WRL::ComPtr<IMMDevice> device;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia,
-                                             device.GetAddressOf());
-    if (FAILED(hr) || !device) {
-        device.Reset();
-        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole,
-                                                 device.GetAddressOf());
-    }
-    if (FAILED(hr) || !device) return false;
     Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
-    hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
-        nullptr, reinterpret_cast<void**>(volume.GetAddressOf()));
-    if (FAILED(hr) || !volume) return false;
+    if (!OpenDefaultAudioEndpointVolume(volume)) return false;
     BOOL current = FALSE;
     if (FAILED(volume->GetMute(&current))) return false;
     const BOOL wanted = current ? FALSE : TRUE;
@@ -2331,21 +2326,10 @@ void MainVolumeIconCenter(float& x, float& y) {
 
 void DrawVerticalPopup(Gdiplus::Graphics& gfx, const BrightnessEvent& brightness) {
     const bool light = IsLightTheme();
-    const DWORD defaultBg = light ? 0xFAFAFC : 0x26262A;
-    const DWORD defaultText = light ? 0x1C1C20 : 0xFAFAFB;
-    const DWORD defaultTrack = light ? 0xDEDFE3 : 0x595A60;
-    const DWORD backgroundRgb =
-        g_backgroundMode.load() && g_validCustomBackground.load()
-        ? g_customBackground.load() : defaultBg;
-    const DWORD textRgb =
-        g_textMode.load() && g_validCustomText.load()
-        ? g_customText.load() : defaultText;
-    const DWORD trackRgb =
-        g_trackMode.load() && g_validCustomTrack.load()
-        ? g_customTrack.load() : defaultTrack;
-    const DWORD accentRgb =
-        g_accentMode.load() && g_validCustomAccent.load()
-        ? g_customAccent.load() : SystemAccentRgb();
+    const DWORD backgroundRgb = OsdBackgroundRgb(light);
+    const DWORD textRgb = OsdTextRgb(light);
+    const DWORD trackRgb = OsdTrackRgb(light);
+    const DWORD accentRgb = OsdAccentRgb();
     const BYTE opacity = static_cast<BYTE>(
         (g_backgroundOpacity.load() * 255 + 50) / 100);
     const Gdiplus::Color foreground = ToGdiColor(textRgb);
@@ -2506,12 +2490,9 @@ void ClearClipboardThumbnail() {
 // display request itself, not from polling device state.
 void DrawNativeEvent(Gdiplus::Graphics& gfx) {
     const bool light = IsLightTheme();
-    const DWORD bgRgb = g_backgroundMode.load() && g_validCustomBackground.load()
-        ? g_customBackground.load() : (light ? 0xFAFAFC : 0x26262A);
-    const DWORD fgRgb = g_textMode.load() && g_validCustomText.load()
-        ? g_customText.load() : (light ? 0x1C1C20 : 0xFAFAFB);
-    const DWORD accentRgb = g_accentMode.load() && g_validCustomAccent.load()
-        ? g_customAccent.load() : SystemAccentRgb();
+    const DWORD bgRgb = OsdBackgroundRgb(light);
+    const DWORD fgRgb = OsdTextRgb(light);
+    const DWORD accentRgb = OsdAccentRgb();
     const Gdiplus::Color fg = ToGdiColor(fgRgb);
     const Gdiplus::Color muted(195, fg.GetR(), fg.GetG(), fg.GetB());
     const Gdiplus::Color accent = ToGdiColor(accentRgb);
@@ -2612,12 +2593,9 @@ void DrawNativeEvent(Gdiplus::Graphics& gfx) {
 void DrawNotification(Gdiplus::Graphics& gfx) {
     // OSD text is ephemeral and never written to disk or Windhawk logs.
     const bool light = IsLightTheme();
-    const DWORD bg = g_backgroundMode.load() && g_validCustomBackground.load()
-        ? g_customBackground.load() : light ? 0xFAFAFC : 0x26262A;
-    const DWORD fgRgb = g_textMode.load() && g_validCustomText.load()
-        ? g_customText.load() : light ? 0x1C1C20 : 0xFAFAFB;
-    const DWORD accentRgb = g_accentMode.load() && g_validCustomAccent.load()
-        ? g_customAccent.load() : SystemAccentRgb();
+    const DWORD bg = OsdBackgroundRgb(light);
+    const DWORD fgRgb = OsdTextRgb(light);
+    const DWORD accentRgb = OsdAccentRgb();
     const Gdiplus::Color fg = ToGdiColor(fgRgb);
     const Gdiplus::Color quiet(195, fg.GetR(), fg.GetG(), fg.GetB());
     // Image-first clipboard notice: the image occupies nearly the whole
@@ -3315,21 +3293,14 @@ bool RenderPopupFrame(const PopupFrame& frame, bool publishMirrors) {
             } else {
 
             const bool light = IsLightTheme();
-            const DWORD baseBackground = light ? 0xFAFAFC : 0x26262A;
-            const DWORD baseText = light ? 0x1C1C20 : 0xFAFAFB;
-            const DWORD baseTrack = light ? 0xDEDFE3 : 0x595A60;
             const DWORD backgroundRgb =
-                g_backgroundMode.load() && g_validCustomBackground.load()
-                ? g_customBackground.load() : baseBackground;
+                OsdBackgroundRgb(light);
             const DWORD textRgb =
-                g_textMode.load() && g_validCustomText.load()
-                ? g_customText.load() : baseText;
+                OsdTextRgb(light);
             const DWORD trackRgb =
-                g_trackMode.load() && g_validCustomTrack.load()
-                ? g_customTrack.load() : baseTrack;
+                OsdTrackRgb(light);
             const DWORD accentRgb =
-                g_accentMode.load() && g_validCustomAccent.load()
-                ? g_customAccent.load() : SystemAccentRgb();
+                OsdAccentRgb();
             const BYTE backgroundAlpha = static_cast<BYTE>(
                 (g_backgroundOpacity.load() * 255 + 50) / 100);
             const Gdiplus::Color card =
@@ -4169,306 +4140,204 @@ void HandleMainBarWheel(int delta) {
         AdjustBrightnessWheel(steps);
 }
 
-// -- SMTC: lean WinRT ABI implementation. Avoid the enormous C++/WinRT
-// projection headers in the Windhawk/Clang compile unit. All calls occur on
-// this private MTA worker and are bounded. No UI or DDCCI calls occur here.
-// The interface IIDs and vtable slots follow public Windows Runtime metadata.
-// WinRT IInspectable adds GetIids/GetRuntimeClassName/GetTrustLevel after
-// IUnknown's three entries, so class-specific methods begin at slot 6.
-namespace smtc_abi {
-using RawHString = void*;
-constexpr GUID kManagerStatics = {0x2050c4ee,0x11a0,0x57de,{0xae,0xd7,0xc9,0x7c,0x70,0x33,0x82,0x45}};
-constexpr GUID kIAsyncInfo = {0x00000036,0,0,{0xc0,0,0,0,0,0,0,0x46}};
-constexpr GUID kIBufferFactory = {0x71af914d,0xc10f,0x484b,{0xbc,0x50,0x14,0xbc,0x62,0x3b,0x3a,0x27}};
-constexpr GUID kIBufferAccess = {0x905a0fef,0xbc53,0x11df,{0x8c,0x49,0,0x1e,0x4f,0xc6,0x86,0xda}};
-constexpr GUID kInputStream = {0x905a0fe2,0xbc53,0x11df,{0x8c,0x49,0,0x1e,0x4f,0xc6,0x86,0xda}};
-constexpr GUID kRandomStream = {0x905a0fe1,0xbc53,0x11df,{0x8c,0x49,0,0x1e,0x4f,0xc6,0x86,0xda}};
+// -- SMTC: C++/WinRT projections. Restricted to the private MTA worker.
+// No synchronous WinRT waits or media metadata calls run on Explorer's UI
+// thread. Poll async completion with a bounded wait so Windhawk unload joins
+// cannot be held indefinitely by media-player or broker operations.
+namespace smtc_projection {
+namespace wf = winrt::Windows::Foundation;
+namespace mc = winrt::Windows::Media::Control;
+namespace wm = winrt::Windows::Media;
+namespace streams = winrt::Windows::Storage::Streams;
+using Session = mc::GlobalSystemMediaTransportControlsSession;
+using Manager = mc::GlobalSystemMediaTransportControlsSessionManager;
 
-// Only Windows ABI method invocations (no synthesized WinRT generic types).
-template <typename... Args>
-HRESULT Call(IUnknown* obj, size_t index, Args... args) {
-    if (!obj) return E_POINTER;
-    auto table = *reinterpret_cast<void***>(obj);
-    using Method = HRESULT(STDMETHODCALLTYPE*)(void*, Args...);
-    return reinterpret_cast<Method>(table[index])(obj, args...);
-}
-
-using CPtr = Microsoft::WRL::ComPtr<IUnknown>;
-using RoInit = HRESULT(WINAPI*)(int);
-using RoUninit = void(WINAPI*)();
-using RoFactory = HRESULT(WINAPI*)(RawHString, REFIID, void**);
-using CreateString = HRESULT(WINAPI*)(PCWSTR, UINT32, RawHString*);
-using DeleteString = HRESULT(WINAPI*)(RawHString);
-using GetRawString = PCWSTR(WINAPI*)(RawHString, UINT32*);
-
-struct Runtime {
-    HMODULE dll = nullptr;
-    RoUninit uninit = nullptr;
-    RoFactory factory = nullptr;
-    CreateString make = nullptr;
-    DeleteString remove = nullptr;
-    GetRawString raw = nullptr;
-    bool initialized = false;
-
-    bool Init() {
-        dll = LoadLibraryExW(L"combase.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!dll) return false;
-        auto init = reinterpret_cast<RoInit>(GetProcAddress(dll, "RoInitialize"));
-        uninit = reinterpret_cast<RoUninit>(GetProcAddress(dll, "RoUninitialize"));
-        factory = reinterpret_cast<RoFactory>(GetProcAddress(dll, "RoGetActivationFactory"));
-        make = reinterpret_cast<CreateString>(GetProcAddress(dll, "WindowsCreateString"));
-        remove = reinterpret_cast<DeleteString>(GetProcAddress(dll, "WindowsDeleteString"));
-        raw = reinterpret_cast<GetRawString>(GetProcAddress(dll, "WindowsGetStringRawBuffer"));
-        if (!init || !uninit || !factory || !make || !remove || !raw)
-            return false;
-        HRESULT hr = init(1); // RO_INIT_MULTITHREADED
-        initialized = SUCCEEDED(hr);
-        return initialized;
-    }
-    ~Runtime() {
-        if (initialized && uninit) uninit();
-        if (dll) FreeLibrary(dll);
-    }
-
-    std::wstring Text(RawHString h) {
-        if (!h) return {};
-        UINT32 n = 0;
-        PCWSTR p = raw(h, &n);
-        if (!p) return {};
-        // Media metadata is untrusted. Limit allocations independently of
-        // the advertised HSTRING length; avoid cutting a UTF-16 surrogate.
-        constexpr UINT32 kMaxMediaTextChars = 4096;
-        UINT32 length = std::min(n, kMaxMediaTextChars);
-        if (length < n && length &&
-            p[length - 1] >= 0xD800 && p[length - 1] <= 0xDBFF)
-            --length;
-        return std::wstring(p, length);
-    }
-
-    HRESULT Activate(PCWSTR className, REFIID iid, CPtr& result) {
-        RawHString name = nullptr;
-        HRESULT hr = make(className, static_cast<UINT32>(wcslen(className)), &name);
-        if (FAILED(hr)) return hr;
-        IUnknown* object = nullptr;
-        hr = factory(name, iid, reinterpret_cast<void**>(&object));
-        remove(name);
-        if (SUCCEEDED(hr)) result.Attach(object);
-        else if (object) object->Release();
-        return hr;
-    }
-};
-
-// WinRT IAsyncInfo::Status: Started=0, Completed=1, Canceled=2, Error=3.
-// Poll only within the on-demand worker, not on Explorer's UI thread.
-HRESULT Wait(CPtr& operation, DWORD timeout = 1800) {
-    if (!operation) return E_POINTER;
-    CPtr info;
-    HRESULT hr = operation->QueryInterface(kIAsyncInfo,
-        reinterpret_cast<void**>(info.GetAddressOf()));
-    if (FAILED(hr)) return hr;
-    ULONGLONG start = GetTickCount64();
+template <typename Operation>
+bool AwaitReady(Operation const& operation, DWORD timeoutMs = 1800) {
+    if (!operation) return false;
+    auto info = operation.template as<wf::IAsyncInfo>();
+    const ULONGLONG start = GetTickCount64();
     for (;;) {
-        INT32 status = 0;
-        hr = Call(info.Get(), 7, &status); // IAsyncInfo::get_Status
-        if (FAILED(hr)) return hr;
-        if (status == 1) return S_OK;
-        if (status == 2 || status == 3) return E_FAIL;
-        if (g_mediaStop.load(std::memory_order_relaxed))
-            return HRESULT_FROM_WIN32(ERROR_CANCELLED);
-        if (GetTickCount64() - start >= timeout)
-            return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+        const auto state = info.Status();
+        if (state == wf::AsyncStatus::Completed) return true;
+        if (state == wf::AsyncStatus::Error ||
+            state == wf::AsyncStatus::Canceled) return false;
+        if (g_mediaStop.load(std::memory_order_relaxed) ||
+            GetTickCount64() - start >= timeoutMs) return false;
         Sleep(15);
     }
 }
 
-HRESULT GetAsyncObject(CPtr& operation, CPtr& result,
-                       size_t resultsSlot = 8) {
-    HRESULT hr = Wait(operation);
-    if (FAILED(hr)) return hr;
-    IUnknown* out = nullptr;
-    hr = Call(operation.Get(), resultsSlot, &out);
-    if (SUCCEEDED(hr)) result.Attach(out);
-    else if (out) out->Release();
-    return hr;
+bool ResultOf(wf::IAsyncOperation<bool> const& task) {
+    return AwaitReady(task) && task.get();
 }
 
-// Nullable WinRT playback properties are IReference<T> objects. Missing
-// values are not interpreted as false/off: the control stays unavailable.
-bool ReadOptionalState(IUnknown* info, size_t slot, BOOLEAN& value) {
-    CPtr reference;
-    if (FAILED(Call(info, slot, reference.GetAddressOf())) || !reference)
-        return false;
-    return SUCCEEDED(Call(reference.Get(), 6, &value));
-}
-bool ReadOptionalMode(IUnknown* info, INT32& mode) {
-    CPtr reference;
-    if (FAILED(Call(info, 9, reference.GetAddressOf())) || !reference)
-        return false;
-    return SUCCEEDED(Call(reference.Get(), 6, &mode)) &&
-           mode >= 0 && mode <= 2;
+// Media metadata is untrusted. Cap UTF-16 size, keeping surrogate pairs intact.
+std::wstring MediaText(winrt::hstring const& value) {
+    constexpr size_t kMaxChars = 4096;
+    size_t count = std::min<size_t>(value.size(), kMaxChars);
+    const wchar_t* ptr = value.c_str();
+    if (count < value.size() && count &&
+        ptr[count - 1] >= 0xD800 && ptr[count - 1] <= 0xDBFF)
+        --count;
+    return std::wstring(ptr, count);
 }
 
-void RequestMediaAction(CPtr& session, const MediaCommand& command) {
+void RequestMediaAction(Session const& session, MediaCommand const& command) {
     if (command.action == 5 || command.action == 6) {
-        CPtr info, controls;
-        if (FAILED(Call(session.Get(), 9, info.GetAddressOf())) || !info ||
-            FAILED(Call(info.Get(), 6, controls.GetAddressOf())) || !controls)
-            return;
-        BOOLEAN enabled = FALSE;
-        const size_t capabilitySlot = command.action == 5 ? 17 : 18;
-        if (FAILED(Call(controls.Get(), capabilitySlot, &enabled)) || !enabled)
-            return;
-        CPtr task;
+        auto info = session.GetPlaybackInfo();
+        if (!info) return;
+        auto controls = info.Controls();
+        if (!controls) return;
         if (command.action == 5) {
-            BOOLEAN active = FALSE;
-            if (!ReadOptionalState(info.Get(), 11, active)) return;
-            // ABI slot 23: TryChangeShuffleActiveAsync(boolean).
-            if (FAILED(Call(session.Get(), 23, BOOLEAN(!active),
-                            task.GetAddressOf())) || !task) return;
+            if (!controls.IsShuffleEnabled()) return;
+            auto active = info.IsShuffleActive();
+            if (!active) return;
+            (void)ResultOf(session.TryChangeShuffleActiveAsync(!active.Value()));
         } else {
-            INT32 mode = -1;
-            if (!ReadOptionalMode(info.Get(), mode)) return;
-            // Repeat off -> list -> track -> off.
-            const INT32 next = mode == 0 ? 2 : mode == 2 ? 1 : 0;
-            // ABI slot 21: TryChangeAutoRepeatModeAsync(enum int32).
-            if (FAILED(Call(session.Get(), 21, next,
-                            task.GetAddressOf())) || !task) return;
-        }
-        if (SUCCEEDED(Wait(task, 1800))) {
-            BOOLEAN succeeded = FALSE;
-            (void)Call(task.Get(), 8, &succeeded);
+            if (!controls.IsRepeatEnabled()) return;
+            auto current = info.AutoRepeatMode();
+            if (!current) return;
+            using Mode = wm::MediaPlaybackAutoRepeatMode;
+            const Mode mode = current.Value();
+            // None -> List -> Track -> None, matching the existing OSD.
+            const Mode next = mode == Mode::None ? Mode::List :
+                              mode == Mode::List ? Mode::Track : Mode::None;
+            (void)ResultOf(session.TryChangeAutoRepeatModeAsync(next));
         }
         return;
     }
     if (command.action == 4) {
-        // WinRT IGlobalSystemMediaTransportControlsSession vtable slot 24:
-        // TryChangePlaybackPositionAsync(INT64 requestedPlaybackPosition).
-        // Honor the player's seek capability: some streams have a timeline
-        // without permitting user-initiated position changes.
-        CPtr info, controls;
-        BOOLEAN allowed = FALSE;
-        if (FAILED(Call(session.Get(), 9, info.GetAddressOf())) || !info ||
-            FAILED(Call(info.Get(), 6, controls.GetAddressOf())) || !controls ||
-            FAILED(Call(controls.Get(), 20, &allowed)) || !allowed)
-            return;
-        CPtr seekTask;
-        if (SUCCEEDED(Call(session.Get(), 24, command.position,
-                           seekTask.GetAddressOf())) && seekTask) {
-            if (SUCCEEDED(Wait(seekTask, 1800))) {
-                BOOLEAN completed = FALSE;
-                (void)Call(seekTask.Get(), 8, &completed);
-            }
-        }
+        auto info = session.GetPlaybackInfo();
+        if (!info || !info.Controls() ||
+            !info.Controls().IsPlaybackPositionEnabled()) return;
+        // GSMTC takes an Int64 Windows tick count, not a Foundation TimeSpan.
+        (void)ResultOf(session.TryChangePlaybackPositionAsync(command.position));
         return;
     }
-    const int action = command.action;
-    // GlobalSystemMediaTransportControlsSession vtable:
-    // 16=TrySkipNextAsync, 17=TrySkipPreviousAsync,
-    // 20=TryTogglePlayPauseAsync, 10/11=TryPlay/PauseAsync.
-    size_t slot = action == 1 ? 17 : action == 3 ? 16 : 20;
-    if (action == 2) {
-        CPtr info;
-        if (SUCCEEDED(Call(session.Get(), 9, info.GetAddressOf())) && info) {
-            int status = 0;
-            if (SUCCEEDED(Call(info.Get(), 7, &status)))
-                (void)status;
-            // Fallback to toggle if player supports it; failed commands
-            // simply leave the current media session unchanged.
-            CPtr controls;
-            if (SUCCEEDED(Call(info.Get(), 6, controls.GetAddressOf())) && controls) {
-                BOOLEAN supported = 0;
-                if (FAILED(Call(controls.Get(), 16, &supported)) || !supported)
-                    slot = status == 4 ? 11 : 10;
-            }
-        }
-    }
-    CPtr task;
-    if (SUCCEEDED(Call(session.Get(), slot, task.GetAddressOf())) && task) {
-        if (SUCCEEDED(Wait(task, 1800))) {
-            BOOLEAN succeeded = 0;
-            (void)Call(task.Get(), 8, &succeeded); // IAsyncOperation<bool>::GetResults
+    if (command.action == 1) {
+        (void)ResultOf(session.TrySkipPreviousAsync());
+    } else if (command.action == 3) {
+        (void)ResultOf(session.TrySkipNextAsync());
+    } else if (command.action == 2) {
+        auto info = session.GetPlaybackInfo();
+        mc::GlobalSystemMediaTransportControlsSessionPlaybackControls controls{nullptr};
+        if (info) controls = info.Controls();
+        if (controls && !controls.IsPlayPauseToggleEnabled()) {
+            const bool playing = info.PlaybackStatus() ==
+                mc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+            (void)ResultOf(playing ? session.TryPauseAsync()
+                                   : session.TryPlayAsync());
+        } else {
+            (void)ResultOf(session.TryTogglePlayPauseAsync());
         }
     }
 }
 
-// GlobalSystemMediaTransportControlsSession::GetTimelineProperties is slot
-// 8; GlobalSystemMediaTransportControlsSessionTimelineProperties is a WinRT
-// IInspectable whose StartTime/EndTime/Position/LastUpdatedTime getters are
-// slots 6/7/10/11. Foundation TimeSpan/DateTime are signed 100-ns integers.
-void ReadTimeline(CPtr& session, MediaSnapshot& snapshot) {
-    CPtr timeline;
-    if (FAILED(Call(session.Get(), 8, timeline.GetAddressOf())) || !timeline)
-        return;
-    INT64 start = 0, end = 0, pos = 0, updated = 0;
-    if (FAILED(Call(timeline.Get(), 6, &start)) ||
-        FAILED(Call(timeline.Get(), 7, &end)) ||
-        FAILED(Call(timeline.Get(), 10, &pos)) || end <= start)
-        return; // Live streams / unknown duration must not show invented time.
-    // Clamp nonsensical values without dividing by a zero/negative range.
-    if (end - start <= 0) return;
-    pos = std::clamp(pos, start, end);
-    if (snapshot.playing && SUCCEEDED(Call(timeline.Get(), 11, &updated)) &&
-        updated > 0) {
+void ReadTimeline(Session const& session, MediaSnapshot& snapshot) {
+    auto timeline = session.GetTimelineProperties();
+    if (!timeline) return;
+    const INT64 start = timeline.StartTime().count();
+    const INT64 end = timeline.EndTime().count();
+    INT64 position = timeline.Position().count();
+    if (end <= start) return; // Live streams and unknown duration.
+    position = std::clamp(position, start, end);
+    const INT64 updated = timeline.LastUpdatedTime().time_since_epoch().count();
+    if (snapshot.playing && updated > 0) {
         FILETIME now{};
         GetSystemTimeAsFileTime(&now);
         ULARGE_INTEGER absolute{};
         absolute.LowPart = now.dwLowDateTime;
         absolute.HighPart = now.dwHighDateTime;
-        constexpr INT64 kMaxTimeLag = INT64(24) * 60 * 60 * 10000000;
+        constexpr INT64 kMaxLag = INT64(24) * 60 * 60 * 10000000;
         const INT64 now100ns = static_cast<INT64>(absolute.QuadPart);
-        if (now100ns >= updated && now100ns - updated <= kMaxTimeLag)
-            pos += std::min(end - pos, now100ns - updated);
+        if (now100ns >= updated && now100ns - updated <= kMaxLag)
+            position += std::min(end - position, now100ns - updated);
     }
     snapshot.hasTimeline = true;
     snapshot.timelineStart = start;
     snapshot.timelineEnd = end;
-    snapshot.timelinePosition = pos;
+    snapshot.timelinePosition = position;
     snapshot.timelineObservedTick = GetTickCount64();
 }
 
-// Read artwork through ABI IBuffer/IBufferByteAccess rather than importing
-// Windows.Storage.Streams C++/WinRT projections. Limited to 1 MiB.
-void ReadArtwork(Runtime& api, IUnknown* thumbnail,
+void ReadArtwork(streams::IRandomAccessStreamReference const& thumbnail,
                  std::vector<BYTE>& output) {
-    if (!thumbnail || !g_showMediaArtwork.load(std::memory_order_relaxed)) return;
-    CPtr openAsync;
-    if (FAILED(Call(thumbnail, 6, openAsync.GetAddressOf())) || !openAsync) return;
-    CPtr stream;
-    if (FAILED(GetAsyncObject(openAsync, stream)) || !stream) return;
-    CPtr randomStream;
-    if (FAILED(stream->QueryInterface(kRandomStream,
-            reinterpret_cast<void**>(randomStream.GetAddressOf()))) || !randomStream) return;
-    UINT64 length = 0;
-    if (FAILED(Call(randomStream.Get(), 6, &length))) return; // Size
-    constexpr UINT32 kMaxArtwork = 1024u * 1024u;
-    // Reject oversize files rather than decoding a truncated stream.
-    if (!length || length > kMaxArtwork) return;
-    UINT32 count = static_cast<UINT32>(length);
-    CPtr factory;
-    if (FAILED(api.Activate(L"Windows.Storage.Streams.Buffer", kIBufferFactory, factory)))
+    if (!thumbnail || !g_showMediaArtwork.load(std::memory_order_relaxed))
         return;
-    CPtr buffer;
-    if (FAILED(Call(factory.Get(), 6, count, buffer.GetAddressOf())) || !buffer)
-        return; // IBufferFactory::Create
-    CPtr input;
-    if (FAILED(stream->QueryInterface(kInputStream,
-            reinterpret_cast<void**>(input.GetAddressOf()))) || !input) return;
-    CPtr readAsync;
-    if (FAILED(Call(input.Get(), 6, buffer.Get(), count, UINT32(0),
-                    readAsync.GetAddressOf())) || !readAsync) return;
-    CPtr bytes;
-    if (FAILED(GetAsyncObject(readAsync, bytes, 10)) || !bytes) return;
-    UINT32 actual = 0;
-    if (FAILED(Call(bytes.Get(), 7, &actual)) || !actual || actual > kMaxArtwork)
-        return;
-    CPtr access;
-    if (FAILED(bytes->QueryInterface(kIBufferAccess,
-            reinterpret_cast<void**>(access.GetAddressOf()))) || !access) return;
-    BYTE* ptr = nullptr;
-    if (SUCCEEDED(Call(access.Get(), 3, &ptr)) && ptr)
-        output.assign(ptr, ptr + actual);
+    auto open = thumbnail.OpenReadAsync();
+    if (!AwaitReady(open)) return;
+    auto stream = open.get();
+    if (!stream) return;
+    constexpr uint32_t kMaxArtwork = 1024u * 1024u;
+    const uint64_t size = stream.Size();
+    if (!size || size > kMaxArtwork) return;
+    const auto count = static_cast<uint32_t>(size);
+    streams::Buffer buffer(count);
+    auto read = stream.ReadAsync(buffer, count, streams::InputStreamOptions::None);
+    if (!AwaitReady(read)) return;
+    auto bytes = read.get();
+    if (!bytes || !bytes.Length() || bytes.Length() > kMaxArtwork) return;
+    output.resize(bytes.Length());
+    auto reader = streams::DataReader::FromBuffer(bytes);
+    reader.ReadBytes(winrt::array_view<uint8_t>(
+        output.data(), output.data() + output.size()));
 }
-} // namespace smtc_abi
+
+void FillSnapshot(Session const& session, MediaSnapshot const& previous,
+                  MediaSnapshot& snapshot) {
+    snapshot.available = true;
+    auto info = session.GetPlaybackInfo();
+    if (info) {
+        snapshot.playing = info.PlaybackStatus() ==
+            mc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+        auto controls = info.Controls();
+        if (controls) {
+            snapshot.canPrevious = controls.IsPreviousEnabled();
+            snapshot.canNext = controls.IsNextEnabled();
+            snapshot.canToggle = controls.IsPlayPauseToggleEnabled() ||
+                                 controls.IsPlayEnabled() ||
+                                 controls.IsPauseEnabled();
+            snapshot.canSeek = controls.IsPlaybackPositionEnabled();
+            snapshot.canShuffle = controls.IsShuffleEnabled();
+            snapshot.canRepeat = controls.IsRepeatEnabled();
+        }
+        if (snapshot.canShuffle) {
+            auto active = info.IsShuffleActive();
+            if (active) {
+                snapshot.shuffleKnown = true;
+                snapshot.shuffleActive = active.Value();
+            }
+        }
+        if (snapshot.canRepeat) {
+            auto mode = info.AutoRepeatMode();
+            if (mode) snapshot.repeatMode = static_cast<int>(mode.Value());
+        }
+    }
+    auto propsAsync = session.TryGetMediaPropertiesAsync();
+    if (AwaitReady(propsAsync)) {
+        auto props = propsAsync.get();
+        if (props) {
+            snapshot.title = MediaText(props.Title());
+            snapshot.artist = MediaText(props.Artist());
+            if (g_showMediaArtwork.load(std::memory_order_relaxed)) {
+                if (snapshot.title == previous.title &&
+                    snapshot.artist == previous.artist &&
+                    !previous.artwork.empty()) {
+                    snapshot.artwork = previous.artwork;
+                } else {
+                    try {
+                        ReadArtwork(props.Thumbnail(), snapshot.artwork);
+                    } catch (winrt::hresult_error const&) {
+                        // Missing artwork must not discard valid metadata.
+                    }
+                }
+            }
+        }
+    }
+    ReadTimeline(session, snapshot);
+}
+} // namespace smtc_projection
 
 void RequestMedia(int command = 0, INT64 position = 0) {
     if (!g_mediaWake || g_mediaStop.load()) return;
@@ -4489,115 +4358,69 @@ void RequestMedia(int command = 0, INT64 position = 0) {
 }
 
 DWORD WINAPI MediaThreadProc(void*) {
-    using namespace smtc_abi;
-    Runtime api;
-    if (!api.Init()) {
-        Wh_Log(L"SMTC WinRT runtime unavailable");
+    namespace mc = winrt::Windows::Media::Control;
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"SMTC apartment initialization failed: 0x%08lX",
+               static_cast<unsigned long>(e.code().value));
         return 0;
     }
-    CPtr statics;
-    HRESULT hr = api.Activate(
-        L"Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager",
-        kManagerStatics, statics);
-    if (FAILED(hr) || !statics) {
-        Wh_Log(L"SMTC activation factory unavailable: 0x%08lX",
-               static_cast<unsigned long>(hr));
-        return 0;
-    }
-    CPtr managerAsync;
-    hr = Call(statics.Get(), 6, managerAsync.GetAddressOf()); // RequestAsync
-    CPtr manager;
-    if (FAILED(hr) || !managerAsync ||
-        FAILED(GetAsyncObject(managerAsync, manager)) || !manager) {
-        Wh_Log(L"SMTC manager initialization failed");
-        return 0;
-    }
-    MediaSnapshot lastSnapshot;
-    while (WaitForSingleObject(g_mediaWake, INFINITE) == WAIT_OBJECT_0) {
-        if (g_mediaStop.load()) break;
-        CPtr session;
-        HRESULT getSessionHr = Call(manager.Get(), 6, session.GetAddressOf());
-        if (FAILED(getSessionHr)) {
-            Wh_Log(L"SMTC GetCurrentSession failed: 0x%08lX",
-                   static_cast<unsigned long>(getSessionHr));
-            continue;
+    struct ScopedApartment {
+        ~ScopedApartment() { winrt::uninit_apartment(); }
+    } apartment;
+    try {
+        auto initial = mc::GlobalSystemMediaTransportControlsSessionManager::RequestAsync();
+        if (!smtc_projection::AwaitReady(initial)) {
+            Wh_Log(L"SMTC manager initialization timed out or failed");
+            return 0;
         }
-        std::vector<MediaCommand> commands;
-        AcquireSRWLockExclusive(&g_mediaCommandLock);
-        commands.swap(g_mediaCommands);
-        ReleaseSRWLockExclusive(&g_mediaCommandLock);
-        if (session) {
-            for (const auto& command : commands)
-                RequestMediaAction(session, command);
-        }
-        MediaSnapshot snapshot;
-        if (session) {
-            snapshot.available = true;
-            CPtr info;
-            if (SUCCEEDED(Call(session.Get(), 9, info.GetAddressOf())) && info) {
-                int status = 0;
-                if (SUCCEEDED(Call(info.Get(), 7, &status)))
-                    snapshot.playing = status == 4;
-                CPtr controls;
-                if (SUCCEEDED(Call(info.Get(), 6, controls.GetAddressOf())) && controls) {
-                    BOOLEAN flag = 0;
-                    if (SUCCEEDED(Call(controls.Get(), 13, &flag))) snapshot.canPrevious = flag != 0;
-                    if (SUCCEEDED(Call(controls.Get(), 12, &flag))) snapshot.canNext = flag != 0;
-                    if (SUCCEEDED(Call(controls.Get(), 16, &flag))) snapshot.canToggle = flag != 0;
-                    if (SUCCEEDED(Call(controls.Get(), 20, &flag))) snapshot.canSeek = flag != 0;
-                    if (SUCCEEDED(Call(controls.Get(), 17, &flag)))
-                        snapshot.canShuffle = flag != 0;
-                    if (SUCCEEDED(Call(controls.Get(), 18, &flag)))
-                        snapshot.canRepeat = flag != 0;
-                    if (!snapshot.canToggle && SUCCEEDED(Call(controls.Get(), 6, &flag))) snapshot.canToggle = flag != 0;
-                    if (!snapshot.canToggle && SUCCEEDED(Call(controls.Get(), 7, &flag))) snapshot.canToggle = flag != 0;
-                }
-                if (snapshot.canShuffle) {
-                    BOOLEAN active = FALSE;
-                    if (ReadOptionalState(info.Get(), 11, active)) {
-                        snapshot.shuffleKnown = true;
-                        snapshot.shuffleActive = active != FALSE;
+        auto manager = initial.get();
+        if (!manager) return 0;
+        MediaSnapshot lastSnapshot;
+        while (WaitForSingleObject(g_mediaWake, INFINITE) == WAIT_OBJECT_0) {
+            if (g_mediaStop.load()) break;
+            try {
+                auto session = manager.GetCurrentSession();
+                std::vector<MediaCommand> commands;
+                AcquireSRWLockExclusive(&g_mediaCommandLock);
+                commands.swap(g_mediaCommands);
+                ReleaseSRWLockExclusive(&g_mediaCommandLock);
+                if (session) {
+                    for (auto const& command : commands) {
+                        try {
+                            smtc_projection::RequestMediaAction(session, command);
+                        } catch (winrt::hresult_error const& e) {
+                            Wh_Log(L"SMTC media command failed: 0x%08lX",
+                                   static_cast<unsigned long>(e.code().value));
+                        }
                     }
                 }
-                if (snapshot.canRepeat) {
-                    INT32 mode = -1;
-                    if (ReadOptionalMode(info.Get(), mode))
-                        snapshot.repeatMode = mode;
+                MediaSnapshot snapshot;
+                if (session) {
+                    try {
+                        smtc_projection::FillSnapshot(session, lastSnapshot, snapshot);
+                    } catch (winrt::hresult_error const& e) {
+                        Wh_Log(L"SMTC metadata read failed: 0x%08lX",
+                               static_cast<unsigned long>(e.code().value));
+                    }
                 }
+                lastSnapshot = snapshot;
+                AcquireSRWLockExclusive(&g_mediaLock);
+                g_mediaPending = std::move(snapshot);
+                ReleaseSRWLockExclusive(&g_mediaLock);
+                HWND receiver = FindWindowExW(HWND_MESSAGE, nullptr, kWindowClass, nullptr);
+                if (receiver) PostMessageW(receiver, kMediaUpdateMessage, 0, 0);
+            } catch (winrt::hresult_error const& e) {
+                Wh_Log(L"SMTC worker cycle failed: 0x%08lX",
+                       static_cast<unsigned long>(e.code().value));
             }
-            CPtr propsAsync;
-            if (SUCCEEDED(Call(session.Get(), 7, propsAsync.GetAddressOf())) && propsAsync) {
-                CPtr props;
-                if (SUCCEEDED(GetAsyncObject(propsAsync, props)) && props) {
-                    RawHString title = nullptr, artist = nullptr;
-                    if (SUCCEEDED(Call(props.Get(), 6, &title))) {
-                        snapshot.title = api.Text(title);
-                        if (title) api.remove(title);
-                    }
-                    if (SUCCEEDED(Call(props.Get(), 9, &artist))) {
-                        snapshot.artist = api.Text(artist);
-                        if (artist) api.remove(artist);
-                    }
-                    if (g_showMediaArtwork.load() &&
-                        snapshot.title == lastSnapshot.title &&
-                        snapshot.artist == lastSnapshot.artist &&
-                        !lastSnapshot.artwork.empty()) {
-                        snapshot.artwork = lastSnapshot.artwork;
-                    } else if (g_showMediaArtwork.load()) {
-                        CPtr thumbnail;
-                        if (SUCCEEDED(Call(props.Get(), 15, thumbnail.GetAddressOf())) && thumbnail)
-                            ReadArtwork(api, thumbnail.Get(), snapshot.artwork);
-                    }
-                }
-            }
-            ReadTimeline(session, snapshot);
         }
-        lastSnapshot = snapshot;
-        AcquireSRWLockExclusive(&g_mediaLock);
-        g_mediaPending = std::move(snapshot);
-        ReleaseSRWLockExclusive(&g_mediaLock);
-        HWND receiver = FindWindowExW(HWND_MESSAGE, nullptr, kWindowClass, nullptr);
-        if (receiver) PostMessageW(receiver, kMediaUpdateMessage, 0, 0);
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"SMTC projection unavailable: 0x%08lX",
+               static_cast<unsigned long>(e.code().value));
+    } catch (...) {
+        Wh_Log(L"SMTC projection worker encountered an unexpected exception");
     }
     return 0;
 }
@@ -4877,8 +4700,7 @@ void DrawMediaControl(Gdiplus::Graphics& gfx, float cx, float cy,
 void DrawPanelCard(Gdiplus::Graphics& gfx, float width, float height,
                    bool alignToMainVolume = false) {
     bool light = IsLightTheme();
-    DWORD bg = g_backgroundMode.load() && g_validCustomBackground.load()
-               ? g_customBackground.load() : light ? 0xFAFAFC : 0x26262A;
+    DWORD bg = OsdBackgroundRgb(light);
     BYTE alpha = static_cast<BYTE>((g_backgroundOpacity.load() * 255 + 50) / 100);
     const bool vertical = g_verticalVolumeBrightness.load();
     const float topInset = vertical ? 6.0f : 10.0f;
@@ -5149,8 +4971,7 @@ void DrawMediaPanel(Gdiplus::Graphics& gfx) {
     DrawPanelCard(gfx, w, h, true);
     const MediaLayout layout = ComputeMediaLayout(h, w);
     const bool light = IsLightTheme();
-    const DWORD rgb = g_textMode.load() && g_validCustomText.load()
-        ? g_customText.load() : light ? 0x1C1C20 : 0xFAFAFB;
+    const DWORD rgb = OsdTextRgb(light);
     const Gdiplus::Color fg = ToGdiColor(rgb);
     const Gdiplus::Color quiet(190, fg.GetR(), fg.GetG(), fg.GetB());
     const float imgW = layout.artSize;
@@ -5194,10 +5015,8 @@ void DrawMediaPanel(Gdiplus::Graphics& gfx) {
              12.0f * std::min(layout.contentScale, 1.35f), quiet);
     if (g_mediaCurrent.hasTimeline &&
         g_mediaCurrent.timelineEnd > g_mediaCurrent.timelineStart) {
-        const DWORD trackRgb = g_trackMode.load() && g_validCustomTrack.load()
-            ? g_customTrack.load() : light ? 0xDEDFE3 : 0x595A60;
-        const DWORD accentRgb = g_accentMode.load() && g_validCustomAccent.load()
-            ? g_customAccent.load() : SystemAccentRgb();
+        const DWORD trackRgb = OsdTrackRgb(light);
+        const DWORD accentRgb = OsdAccentRgb();
         Gdiplus::GraphicsPath track;
         AddRoundedRect(track, layout.textX, layout.timelineY,
                        layout.timelineWidth, 5.0f, 2.5f);
@@ -5254,8 +5073,7 @@ void DrawMediaPanel(Gdiplus::Graphics& gfx) {
         AddRoundedRect(circle, layout.controlsX[i] - radius,
                        layout.controlsY - radius,
                        radius * 2, radius * 2, radius);
-        const DWORD accentRgb = g_accentMode.load() && g_validCustomAccent.load()
-            ? g_customAccent.load() : SystemAccentRgb();
+        const DWORD accentRgb = OsdAccentRgb();
         Gdiplus::SolidBrush fill(pressed || tapped
             ? ToGdiColor(accentRgb, pressed ? 96 : static_cast<BYTE>(
                 (kMediaFeedbackMs - (now - g_mediaFeedbackTick)) * 85 /
@@ -5286,8 +5104,7 @@ void DrawMediaPanel(Gdiplus::Graphics& gfx) {
         };
         const bool active[2] = {g_mediaCurrent.shuffleActive,
                                 g_mediaCurrent.repeatMode > 0};
-        const DWORD accentRgb = g_accentMode.load() && g_validCustomAccent.load()
-            ? g_customAccent.load() : SystemAccentRgb();
+        const DWORD accentRgb = OsdAccentRgb();
         for (int i = 0; i < 2; ++i) {
             if (!enabled[i]) continue;
             const int action = 5 + i;
@@ -5346,8 +5163,7 @@ void DrawNoticeDetails(Gdiplus::Graphics& gfx) {
     DrawPanelCard(gfx, 340.0f, h);
     const bool light = IsLightTheme();
     const Gdiplus::Color fg = ToGdiColor(
-        g_textMode.load() && g_validCustomText.load() ? g_customText.load()
-        : (light ? 0x1C1C20 : 0xFAFAFB));
+        OsdTextRgb(light));
     DrawText(gfx, Tr(OsdText::EventDetails), 16, 10, 290, 24, 15, fg);
     const int visible = NoticeVisibleRows();
     const int maxStart = std::max<int>(0, static_cast<int>(g_noticeDetails.size()) - visible);
@@ -5356,8 +5172,7 @@ void DrawNoticeDetails(Gdiplus::Graphics& gfx) {
         DrawText(gfx, g_noticeDetails[i + g_noticeScroll], 18,
                  42.0f + i * 28.0f, 304, 25, 13, fg);
     if (maxStart > 0) {
-        const DWORD accent = g_accentMode.load() && g_validCustomAccent.load()
-            ? g_customAccent.load() : SystemAccentRgb();
+        const DWORD accent = OsdAccentRgb();
         Gdiplus::SolidBrush b(ToGdiColor(accent));
         const float travel = std::max(12.0f, h - 52.0f);
         const float thumb = std::max(12.0f, travel * visible / g_noticeDetails.size());
@@ -5372,12 +5187,9 @@ void DrawMixerPanel(Gdiplus::Graphics& gfx) {
     DrawPanelCard(gfx, width, h, true);
     const bool horizontal = !g_verticalVolumeBrightness.load();
     const bool light = IsLightTheme();
-    const DWORD textRgb = g_textMode.load() && g_validCustomText.load()
-        ? g_customText.load() : light ? 0x1C1C20 : 0xFAFAFB;
-    const DWORD accentRgb = g_accentMode.load() && g_validCustomAccent.load()
-        ? g_customAccent.load() : SystemAccentRgb();
-    const DWORD trackRgb = g_trackMode.load() && g_validCustomTrack.load()
-        ? g_customTrack.load() : light ? 0xE0E1E7 : 0x5E5E65;
+    const DWORD textRgb = OsdTextRgb(light);
+    const DWORD accentRgb = OsdAccentRgb();
+    const DWORD trackRgb = OsdTrackRgb(light, true);
     const Gdiplus::Color fg = ToGdiColor(textRgb);
     Gdiplus::SolidBrush track(ToGdiColor(trackRgb));
     Gdiplus::SolidBrush active(ToGdiColor(accentRgb));
@@ -5638,8 +5450,7 @@ void DrawExpandChevron(Gdiplus::Graphics& gfx, float x, float y,
     Gdiplus::SolidBrush fill(surface);
     gfx.FillEllipse(&fill, x - radius, y - radius,
                     radius * 2.0f, radius * 2.0f);
-    const DWORD accentRgb = g_accentMode.load() && g_validCustomAccent.load()
-        ? g_customAccent.load() : SystemAccentRgb();
+    const DWORD accentRgb = OsdAccentRgb();
     Gdiplus::Pen outline(expanded
         ? ToGdiColor(accentRgb, 205)
         : light ? Gdiplus::Color(180, 185, 196, 210)
@@ -5690,14 +5501,10 @@ void DrawHorizontalVolume(Gdiplus::Graphics& gfx) {
     const float logicalH = MainLogicalHeight();
     const float centerY = MainCenterY();
     bool light = IsLightTheme();
-    DWORD bg = g_backgroundMode.load() && g_validCustomBackground.load()
-        ? g_customBackground.load() : light ? 0xFAFAFC : 0x26262A;
-    DWORD fgRgb = g_textMode.load() && g_validCustomText.load()
-        ? g_customText.load() : light ? 0x1C1C20 : 0xFAFAFB;
-    DWORD accentRgb = g_accentMode.load() && g_validCustomAccent.load()
-        ? g_customAccent.load() : SystemAccentRgb();
-    DWORD trackRgb = g_trackMode.load() && g_validCustomTrack.load()
-        ? g_customTrack.load() : light ? 0xDEDFE3 : 0x595A60;
+    DWORD bg = OsdBackgroundRgb(light);
+    DWORD fgRgb = OsdTextRgb(light);
+    DWORD accentRgb = OsdAccentRgb();
+    DWORD trackRgb = OsdTrackRgb(light);
     Gdiplus::GraphicsPath body;
     AddRoundedRect(body, 13.0f, 10.0f, logicalW - 26.0f,
                    logicalH - 23.0f, static_cast<float>(g_cornerRadius.load()));
@@ -5745,10 +5552,8 @@ void DrawHorizontalVolume(Gdiplus::Graphics& gfx) {
 void DrawLockStatus(Gdiplus::Graphics& gfx) {
     DrawPanelCard(gfx, 178.0f, 66.0f);
     const bool light = IsLightTheme();
-    const DWORD rgb = g_textMode.load() && g_validCustomText.load()
-        ? g_customText.load() : light ? 0x1C1C20 : 0xFAFAFB;
-    const DWORD accentRgb = g_accentMode.load() && g_validCustomAccent.load()
-        ? g_customAccent.load() : SystemAccentRgb();
+    const DWORD rgb = OsdTextRgb(light);
+    const DWORD accentRgb = OsdAccentRgb();
     const Gdiplus::Color fg = ToGdiColor(rgb);
     const Gdiplus::Color quiet(168, fg.GetR(), fg.GetG(), fg.GetB());
     const int key = std::clamp(g_lastLock, 0, 3);
