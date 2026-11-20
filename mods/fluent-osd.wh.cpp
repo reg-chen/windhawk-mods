@@ -732,6 +732,7 @@ HANDLE g_thread = nullptr;
 struct Snapshot {
     int percent = 0;
     bool muted = false;
+    bool traditionalChinese = false;
     DWORD durationMs = 3000;
     RECT anchor{};
     DWORD background = 0x232327, text = 0xf8f8fc;
@@ -760,7 +761,9 @@ void DrawSnapshot(State& state) {
     ReleaseSRWLockShared(&g_snapshotLock);
 
     state.value.Text(winrt::hstring(
-        std::wstring(value.muted ? L"靜音  " : L"音量  ") +
+        std::wstring(value.traditionalChinese
+            ? (value.muted ? L"靜音  " : L"音量  ")
+            : (value.muted ? L"Muted  " : L"Volume  ")) +
         std::to_wstring(std::clamp(value.percent, 0, 100)) + L"%"));
     state.bar.Value(std::clamp(value.percent, 0, 100));
     state.card.Background(Brush(value.background));
@@ -803,10 +806,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DrawSnapshot(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.2: draw exception 0x%08lX",
+                    Wh_Log(L"XAML v1.0.2: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
+                    g_failed.store(true);
+                    g_ready.store(nullptr, std::memory_order_release);
+                    ShowWindow(hwnd, SW_HIDE);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.2: unexpected draw exception");
+                    Wh_Log(L"XAML v1.0.2: unexpected draw exception; disabling renderer");
+                    g_failed.store(true);
+                    g_ready.store(nullptr, std::memory_order_release);
+                    ShowWindow(hwnd, SW_HIDE);
                 }
             }
             return 0;
@@ -958,7 +967,7 @@ void Start() {
 }
 bool Show(const Snapshot& snapshot) {
     const HWND hwnd = g_ready.load(std::memory_order_acquire);
-    if (!hwnd || g_stopping.load()) return false;
+    if (!hwnd || g_stopping.load() || g_failed.load()) return false;
     AcquireSRWLockExclusive(&g_snapshotLock);
     g_pending = snapshot;
     ReleaseSRWLockExclusive(&g_snapshotLock);
@@ -6906,6 +6915,7 @@ void ShowNativeVolumePopup() {
         xaml_volume::Snapshot data;
         data.percent = g_nativePercent;
         data.muted = g_nativeMuted;
+        data.traditionalChinese = UseTraditionalChinese();
         data.durationMs = OsdDuration(DurationKind::Volume);
         data.anchor = target;
         data.background = OsdBackgroundRgb(light);
@@ -6913,6 +6923,11 @@ void ShowNativeVolumePopup() {
         data.accent = OsdAccentRgb();
         data.track = OsdTrackRgb(light);
         if (xaml_volume::Show(data)) {
+            static bool loggedXamlRouting = false; // Existing UI thread only.
+            if (!loggedXamlRouting) {
+                Wh_Log(L"Fluent OSD v1.0.2: native volume -> XAML backend");
+                loggedXamlRouting = true;
+            }
             // Do not render two copies of the same OSD. Keep native hooks
             // and Core Audio state unchanged; only presentation is swapped.
             ClosePanel();
