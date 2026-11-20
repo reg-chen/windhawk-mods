@@ -2,7 +2,7 @@
 // @id              fluent-osd-media
 // @name            Fluent OSD & Media
 // @description     Fluent-style Windows 11 OSDs for volume, DDC/CI brightness, media controls, per-app audio mixer, lock keys, clipboard and device events.
-// @version         1.7.3
+// @version         1.7.4
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -107,6 +107,23 @@ resources. It does not monitor or intercept system shutdown separately;
 Windows owns process cleanup when Explorer exits. This limits one potential
 source of "GDI+ Window is preventing shutdown" without claiming to resolve
 shutdown blockers originating in other processes.
+
+## Spotify SMTC controls
+
+When the active Windows media session identifies as the Spotify desktop
+application, this mod reads its advertised GSMTC shuffle and repeat
+capabilities and nullable states. Supported controls appear as compact
+buttons in the SMTC card's existing canvas (without changing user-defined
+card width or height), and commands run only on the existing media worker.
+Repeat cycles off -> list -> track -> off. Unsupported or unreported
+capabilities remain hidden. Browser-hosted Spotify is not identified as the
+desktop application.
+
+"Add to Liked Songs" cannot be implemented using GSMTC: Spotify's official
+Web API requires separate OAuth authorization and a Spotify track URI.
+This mod intentionally does not emulate focus-stealing keyboard shortcuts,
+access another application's internal tokens, or silently request Spotify
+account permissions. No favorite button is claimed or displayed.
 
 ## Main volume interaction
 
@@ -1052,6 +1069,12 @@ struct MediaSnapshot {
     bool canPrevious = false;
     bool canToggle = false;
     bool canNext = false;
+    // Spotify-specific controls only when a Windows SMTC session explicitly
+    // advertises support and reports a known state.
+    bool isSpotify = false;
+    bool canShuffle = false, shuffleKnown = false, shuffleActive = false;
+    bool canRepeat = false;
+    int repeatMode = -1; // Windows MediaPlaybackAutoRepeatMode: 0=None, 1=Track, 2=List
     std::wstring title;
     std::wstring artist;
     std::vector<BYTE> artwork;
@@ -1078,6 +1101,8 @@ INT64 g_mediaPreviewPosition = 0;
 ULONGLONG g_mediaSeekHoldUntil = 0;
 int g_mediaPressedIndex = -1;
 bool g_mediaPressedInside = false;
+int g_spotifyPressedAction = 0; // UI thread only, 5=shuffle, 6=repeat
+bool g_spotifyPressedInside = false;
 int g_mediaFeedbackIndex = -1;
 ULONGLONG g_mediaFeedbackTick = 0;
 ULONGLONG g_mediaLastRefreshTick = 0;
@@ -1086,7 +1111,7 @@ HANDLE g_mediaThread = nullptr;
 std::atomic<bool> g_mediaStop{false};
 SRWLOCK g_mediaCommandLock = SRWLOCK_INIT;
 struct MediaCommand {
-    int action = 0;  // 1=previous; 2=toggle; 3=next; 4=seek
+    int action = 0;  // 1=previous; 2=toggle; 3=next; 4=seek; 5=shuffle; 6=repeat
     INT64 position = 0; // SMTC 100-ns ticks for action 4
 };
 std::vector<MediaCommand> g_mediaCommands; // Bounded, worker-owned after swap.
@@ -3806,7 +3831,67 @@ HRESULT GetAsyncObject(CPtr& operation, CPtr& result,
     return hr;
 }
 
+// Check exact desktop app identity, not track/artist text. Browser-hosted
+// Spotify sessions intentionally do not masquerade as the Spotify app.
+bool IsSpotifySession(Runtime& api, CPtr& session) {
+    RawHString source = nullptr;
+    if (FAILED(Call(session.Get(), 6, &source)) || !source) return false;
+    const std::wstring app = api.Text(source);
+    api.remove(source);
+    constexpr PCWSTR storePrefix = L"SpotifyAB.SpotifyMusic_";
+    return _wcsicmp(app.c_str(), L"Spotify.exe") == 0 ||
+           _wcsicmp(app.c_str(), L"Spotify") == 0 ||
+           _wcsnicmp(app.c_str(), storePrefix, wcslen(storePrefix)) == 0;
+}
+
+// Nullable WinRT playback properties are IReference<T> objects. Missing
+// values are not interpreted as false/off: the control stays unavailable.
+bool ReadOptionalState(IUnknown* info, size_t slot, BOOLEAN& value) {
+    CPtr reference;
+    if (FAILED(Call(info, slot, reference.GetAddressOf())) || !reference)
+        return false;
+    return SUCCEEDED(Call(reference.Get(), 6, &value));
+}
+bool ReadOptionalMode(IUnknown* info, INT32& mode) {
+    CPtr reference;
+    if (FAILED(Call(info, 9, reference.GetAddressOf())) || !reference)
+        return false;
+    return SUCCEEDED(Call(reference.Get(), 6, &mode)) &&
+           mode >= 0 && mode <= 2;
+}
+
 void RequestMediaAction(CPtr& session, const MediaCommand& command) {
+    if (command.action == 5 || command.action == 6) {
+        CPtr info, controls;
+        if (FAILED(Call(session.Get(), 9, info.GetAddressOf())) || !info ||
+            FAILED(Call(info.Get(), 6, controls.GetAddressOf())) || !controls)
+            return;
+        BOOLEAN enabled = FALSE;
+        const size_t capabilitySlot = command.action == 5 ? 17 : 18;
+        if (FAILED(Call(controls.Get(), capabilitySlot, &enabled)) || !enabled)
+            return;
+        CPtr task;
+        if (command.action == 5) {
+            BOOLEAN active = FALSE;
+            if (!ReadOptionalState(info.Get(), 11, active)) return;
+            // ABI slot 23: TryChangeShuffleActiveAsync(boolean).
+            if (FAILED(Call(session.Get(), 23, BOOLEAN(!active),
+                            task.GetAddressOf())) || !task) return;
+        } else {
+            INT32 mode = -1;
+            if (!ReadOptionalMode(info.Get(), mode)) return;
+            // Spotify order: repeat off -> playlist -> track -> off.
+            const INT32 next = mode == 0 ? 2 : mode == 2 ? 1 : 0;
+            // ABI slot 21: TryChangeAutoRepeatModeAsync(enum int32).
+            if (FAILED(Call(session.Get(), 21, next,
+                            task.GetAddressOf())) || !task) return;
+        }
+        if (SUCCEEDED(Wait(task, 1800))) {
+            BOOLEAN succeeded = FALSE;
+            (void)Call(task.Get(), 8, &succeeded);
+        }
+        return;
+    }
     if (command.action == 4) {
         // WinRT IGlobalSystemMediaTransportControlsSession vtable slot 24:
         // TryChangePlaybackPositionAsync(INT64 requestedPlaybackPosition).
@@ -3993,12 +4078,18 @@ DWORD WINAPI MediaThreadProc(void*) {
         AcquireSRWLockExclusive(&g_mediaCommandLock);
         commands.swap(g_mediaCommands);
         ReleaseSRWLockExclusive(&g_mediaCommandLock);
+        const bool spotify = session && IsSpotifySession(api, session);
         if (session) {
-            for (const auto& command : commands) RequestMediaAction(session, command);
+            for (const auto& command : commands) {
+                // Do not let an old Spotify command target a different player.
+                if (command.action >= 5 && !spotify) continue;
+                RequestMediaAction(session, command);
+            }
         }
         MediaSnapshot snapshot;
         if (session) {
             snapshot.available = true;
+            snapshot.isSpotify = spotify;
             CPtr info;
             if (SUCCEEDED(Call(session.Get(), 9, info.GetAddressOf())) && info) {
                 int status = 0;
@@ -4011,8 +4102,24 @@ DWORD WINAPI MediaThreadProc(void*) {
                     if (SUCCEEDED(Call(controls.Get(), 12, &flag))) snapshot.canNext = flag != 0;
                     if (SUCCEEDED(Call(controls.Get(), 16, &flag))) snapshot.canToggle = flag != 0;
                     if (SUCCEEDED(Call(controls.Get(), 20, &flag))) snapshot.canSeek = flag != 0;
+                    if (spotify && SUCCEEDED(Call(controls.Get(), 17, &flag)))
+                        snapshot.canShuffle = flag != 0;
+                    if (spotify && SUCCEEDED(Call(controls.Get(), 18, &flag)))
+                        snapshot.canRepeat = flag != 0;
                     if (!snapshot.canToggle && SUCCEEDED(Call(controls.Get(), 6, &flag))) snapshot.canToggle = flag != 0;
                     if (!snapshot.canToggle && SUCCEEDED(Call(controls.Get(), 7, &flag))) snapshot.canToggle = flag != 0;
+                }
+                if (spotify && snapshot.canShuffle) {
+                    BOOLEAN active = FALSE;
+                    if (ReadOptionalState(info.Get(), 11, active)) {
+                        snapshot.shuffleKnown = true;
+                        snapshot.shuffleActive = active != FALSE;
+                    }
+                }
+                if (spotify && snapshot.canRepeat) {
+                    INT32 mode = -1;
+                    if (ReadOptionalMode(info.Get(), mode))
+                        snapshot.repeatMode = mode;
                 }
             }
             CPtr propsAsync;
@@ -4358,6 +4465,12 @@ void DrawPanelCard(Gdiplus::Graphics& gfx, float width, float height,
 // 132px cap. Where the panel is too narrow for a square cover at full height
 // AND a readable transport column, center the entire cover/control group
 // vertically instead of clipping or distorting the artwork.
+bool SpotifyExtraControlsVisible() {
+    return g_mediaCurrent.isSpotify && g_showMediaControls.load() &&
+        ((g_mediaCurrent.canShuffle && g_mediaCurrent.shuffleKnown) ||
+         (g_mediaCurrent.canRepeat && g_mediaCurrent.repeatMode >= 0));
+}
+constexpr float kSpotifyExtraInset = 26.0f; // Reserve a thin bottom control row.
 struct MediaLayout {
     float artX, artY, artSize;
     float textX, textWidth, titleY, artistY;
@@ -4394,7 +4507,10 @@ MediaLayout ComputeMediaLayout(float h, float w) {
         return art + infoWidth <= usableWidth;
     };
     float lo = 1.0f;
-    float hi = contentHeight;
+    // Only the Spotify variant reserves room for extra compact controls.
+    // The configured SMTC canvas dimensions remain completely unchanged.
+    float hi = std::max(1.0f, contentHeight -
+        (SpotifyExtraControlsVisible() ? kSpotifyExtraInset : 0.0f));
     for (int i = 0; i < 18; ++i) {
         const float candidate = (lo + hi) * 0.5f;
         if (fits(candidate)) lo = candidate;
@@ -4504,6 +4620,39 @@ std::wstring FormatMediaTime(INT64 span100ns) {
     return std::to_wstring(seconds / 60) + L":" + sec;
 }
 
+// Two optional Spotify transport actions are positioned in the existing
+// bottom insets. Keeping the panel dimensions unchanged avoids SMTC/main OSD
+// misalignment in both horizontal and vertical layouts.
+struct SpotifyExtraLayout { float x[2], y, radius; };
+bool GetSpotifyExtraLayout(SpotifyExtraLayout& extra) {
+    if (!SpotifyExtraControlsVisible() || g_panelMode != PanelMode::Media ||
+        g_scale <= 0.0f) return false;
+    const float h = g_panelHeight / g_scale;
+    const float w = g_panelWidth / g_scale;
+    const MediaLayout layout = ComputeMediaLayout(h, w);
+    const bool vertical = g_verticalVolumeBrightness.load();
+    const float bottom = vertical ? 6.0f : 13.0f;
+    extra.x[0] = layout.textX + layout.textWidth / 3.0f;
+    extra.x[1] = layout.textX + layout.textWidth * 2.0f / 3.0f;
+    extra.y = h - bottom - 14.0f;
+    extra.radius = 11.0f;
+    return true;
+}
+int SpotifyExtraHitTest(float x, float y) {
+    SpotifyExtraLayout extra{};
+    if (!GetSpotifyExtraLayout(extra)) return 0;
+    const bool allowed[2] = {
+        g_mediaCurrent.canShuffle && g_mediaCurrent.shuffleKnown,
+        g_mediaCurrent.canRepeat && g_mediaCurrent.repeatMode >= 0
+    };
+    for (int i = 0; i < 2; ++i) {
+        const float dx = x - extra.x[i];
+        const float dy = y - extra.y;
+        if (allowed[i] && dx * dx + dy * dy <= extra.radius * extra.radius)
+            return i == 0 ? 5 : 6;
+    }
+    return 0;
+}
 int MediaButtonHitTest(float x, float y) {
     if (g_panelMode != PanelMode::Media || !g_showMediaControls.load() ||
         g_scale <= 0) return -1;
@@ -4685,6 +4834,56 @@ void DrawMediaPanel(Gdiplus::Graphics& gfx) {
                          allowed[i] ? fg : quiet,
                          layout.contentScale * (pressed ? 0.90f : 1.0f));
     }
+    SpotifyExtraLayout extra{};
+    if (GetSpotifyExtraLayout(extra)) {
+        const bool enabled[2] = {
+            g_mediaCurrent.canShuffle && g_mediaCurrent.shuffleKnown,
+            g_mediaCurrent.canRepeat && g_mediaCurrent.repeatMode >= 0
+        };
+        const bool active[2] = {g_mediaCurrent.shuffleActive,
+                                g_mediaCurrent.repeatMode > 0};
+        const DWORD accentRgb = g_accentMode.load() && g_validCustomAccent.load()
+            ? g_customAccent.load() : SystemAccentRgb();
+        for (int i = 0; i < 2; ++i) {
+            if (!enabled[i]) continue;
+            const int action = 5 + i;
+            const bool pressed = g_spotifyPressedAction == action &&
+                                 g_spotifyPressedInside;
+            const float radius = extra.radius * (pressed ? 0.95f : 1.0f);
+            Gdiplus::SolidBrush background(active[i] ?
+                ToGdiColor(accentRgb, 65) :
+                (light ? Gdiplus::Color(255, 233, 234, 238)
+                       : Gdiplus::Color(255, 67, 68, 74)));
+            gfx.FillEllipse(&background, extra.x[i] - radius,
+                extra.y - radius, radius * 2.0f, radius * 2.0f);
+            Gdiplus::Pen pen(active[i] ? ToGdiColor(accentRgb) : fg, 1.6f);
+            pen.SetStartCap(Gdiplus::LineCapRound);
+            pen.SetEndCap(Gdiplus::LineCapRound);
+            const float x = extra.x[i], y = extra.y;
+            if (i == 0) { // Shuffle: crossing paths with directional heads.
+                gfx.DrawLine(&pen, x - 6.0f, y - 4.5f, x - 2.0f, y - 4.5f);
+                gfx.DrawLine(&pen, x - 2.0f, y - 4.5f, x + 3.0f, y + 4.5f);
+                gfx.DrawLine(&pen, x + 3.0f, y + 4.5f, x + 6.0f, y + 4.5f);
+                gfx.DrawLine(&pen, x - 6.0f, y + 4.5f, x - 2.0f, y + 4.5f);
+                gfx.DrawLine(&pen, x - 2.0f, y + 4.5f, x + 3.0f, y - 4.5f);
+                gfx.DrawLine(&pen, x + 3.0f, y - 4.5f, x + 6.0f, y - 4.5f);
+                gfx.DrawLine(&pen, x + 3.5f, y - 7.0f, x + 6.0f, y - 4.5f);
+                gfx.DrawLine(&pen, x + 3.5f, y - 2.0f, x + 6.0f, y - 4.5f);
+                gfx.DrawLine(&pen, x + 3.5f, y + 2.0f, x + 6.0f, y + 4.5f);
+                gfx.DrawLine(&pen, x + 3.5f, y + 7.0f, x + 6.0f, y + 4.5f);
+            } else { // Repeat list / track, with "1" in track mode.
+                gfx.DrawLine(&pen, x - 6.0f, y - 4.5f, x + 5.0f, y - 4.5f);
+                gfx.DrawLine(&pen, x + 5.0f, y - 4.5f, x + 2.8f, y - 6.5f);
+                gfx.DrawLine(&pen, x + 5.0f, y - 4.5f, x + 2.8f, y - 2.5f);
+                gfx.DrawLine(&pen, x + 6.0f, y + 4.5f, x - 5.0f, y + 4.5f);
+                gfx.DrawLine(&pen, x - 5.0f, y + 4.5f, x - 2.8f, y + 6.5f);
+                gfx.DrawLine(&pen, x - 5.0f, y + 4.5f, x - 2.8f, y + 2.5f);
+                if (g_mediaCurrent.repeatMode == 1)
+                    DrawText(gfx, L"1", x - 4.0f, y - 4.0f,
+                             8.0f, 8.0f, 7.0f, fg, true);
+            }
+        }
+    }
 }
 
 int NoticeVisibleRows() {
@@ -4854,9 +5053,12 @@ void RenderPanel() {
 void ClosePanel() {
     if (g_popupWnd) KillTimer(g_popupWnd, kMediaAnimationTimer);
     const bool heldCapture = g_mediaPressedIndex >= 0 ||
+        g_spotifyPressedAction != 0 ||
         g_mixerDrag || g_mixerMutePressedIndex >= 0;
     g_mediaPressedIndex = -1;
     g_mediaPressedInside = false;
+    g_spotifyPressedAction = 0;
+    g_spotifyPressedInside = false;
     g_mediaSeeking = false;
     g_mediaSeekHoldUntil = 0;
     g_mediaFeedbackIndex = -1;
@@ -5523,7 +5725,8 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     overClickableIcon = MixerIconHitTest(x, y) >= 0;
                 else if (g_panelMode == PanelMode::Media)
                     overClickableIcon = MediaButtonHitTest(x, y) >= 0 ||
-                        MediaTimelineHitTest(x, y);
+                        MediaTimelineHitTest(x, y) ||
+                        SpotifyExtraHitTest(x, y) != 0;
             }
         }
         SetCursor(LoadCursorW(nullptr,
@@ -5658,6 +5861,13 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 PreviewMediaSeek(x);
                 return 0;
             }
+            g_spotifyPressedAction = SpotifyExtraHitTest(x, y);
+            g_spotifyPressedInside = g_spotifyPressedAction != 0;
+            if (g_spotifyPressedAction) {
+                SetCapture(hwnd);
+                RenderPanel();
+                return 0;
+            }
             g_mediaPressedIndex = MediaButtonHitTest(x, y);
             g_mediaPressedInside = g_mediaPressedIndex >= 0;
             if (g_mediaPressedIndex >= 0) {
@@ -5669,6 +5879,16 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_MOUSEMOVE && g_mediaSeeking) {
             const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
             PreviewMediaSeek(x);
+            return 0;
+        }
+        if (msg == WM_MOUSEMOVE && g_spotifyPressedAction) {
+            const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
+            const float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
+            const bool inside = SpotifyExtraHitTest(x, y) == g_spotifyPressedAction;
+            if (inside != g_spotifyPressedInside) {
+                g_spotifyPressedInside = inside;
+                RenderPanel();
+            }
             return 0;
         }
         if (msg == WM_MOUSEMOVE && g_mediaPressedIndex >= 0) {
@@ -5690,6 +5910,21 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_mediaSeekHoldUntil = GetTickCount64() + 2000;
                 if (GetCapture() == hwnd) ReleaseCapture();
                 RequestMedia(4, g_mediaPreviewPosition);
+                RenderPanel();
+                ResetHideTimerFor(DurationKind::Interactive);
+                return 0;
+            }
+            if (g_spotifyPressedAction) {
+                const int action = g_spotifyPressedAction;
+                const bool activated = SpotifyExtraHitTest(x, y) == action;
+                g_spotifyPressedAction = 0;
+                g_spotifyPressedInside = false;
+                if (GetCapture() == hwnd) ReleaseCapture();
+                if (activated) {
+                    g_mediaFeedbackIndex = action - 2; // 3=shuffle, 4=repeat
+                    g_mediaFeedbackTick = GetTickCount64();
+                    RequestMedia(action);
+                }
                 RenderPanel();
                 ResetHideTimerFor(DurationKind::Interactive);
                 return 0;
@@ -5740,9 +5975,11 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_mediaSeekHoldUntil = 0;
             if (g_panelMode == PanelMode::Media) RenderPanel();
         }
-        if (g_mediaPressedIndex >= 0) {
+        if (g_mediaPressedIndex >= 0 || g_spotifyPressedAction) {
             g_mediaPressedIndex = -1;
             g_mediaPressedInside = false;
+            g_spotifyPressedAction = 0;
+            g_spotifyPressedInside = false;
             if (g_panelMode == PanelMode::Media) RenderPanel();
         }
         g_mixerMutePressedIndex = -1;
@@ -5977,7 +6214,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD & Media v1.7.3 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD & Media v1.7.4 initialized (%s)", name);
     return TRUE;
 }
 
