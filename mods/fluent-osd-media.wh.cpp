@@ -2,7 +2,7 @@
 // @id              fluent-osd-media
 // @name            Fluent OSD & Media
 // @description     Fluent-style Windows 11 OSDs for volume, DDC/CI brightness, media controls, per-app audio mixer, lock keys, clipboard and device events.
-// @version         1.7.1
+// @version         1.7.2
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -233,20 +233,23 @@ trademarks remain the property of their respective owners.
           $name:zh-TW: 顯示各程式音量混音器展開箭頭
           $description: Click the arrow to adjust Core Audio session volumes in an interactive popup.
           $description:zh-TW: 點擊箭頭以展開互動式面板，調整個別 Core Audio 工作階段音量。
-        - showCapsLockOsd: true
-          $name: Show custom Caps Lock OSD
-          $name:zh-TW: 顯示自訂 Caps Lock OSD
-        - showNumLockOsd: true
-          $name: Show custom Num Lock OSD
-          $name:zh-TW: 顯示自訂 Num Lock OSD
-        - showScrollLockOsd: true
-          $name: Show custom Scroll Lock OSD
-          $name:zh-TW: 顯示自訂 Scroll Lock OSD
-        - showInsertOsd: false
-          $name: Show custom Insert OSD
-          $name:zh-TW: 顯示自訂 Insert OSD
-          $description: Insert state is not a system-wide toggle on every application; this indicator tracks its key presses only.
-          $description:zh-TW: 並非所有應用程式都將 Insert 視為全系統切換狀態；此提示僅追蹤按鍵動作。
+        - LockKeys:
+            - showCapsLockOsd: true
+              $name: Show custom Caps Lock OSD
+              $name:zh-TW: 顯示自訂 Caps Lock OSD
+            - showNumLockOsd: true
+              $name: Show custom Num Lock OSD
+              $name:zh-TW: 顯示自訂 Num Lock OSD
+            - showScrollLockOsd: true
+              $name: Show custom Scroll Lock OSD
+              $name:zh-TW: 顯示自訂 Scroll Lock OSD
+            - showInsertOsd: false
+              $name: Show custom Insert OSD
+              $name:zh-TW: 顯示自訂 Insert OSD
+              $description: Insert state is not a system-wide toggle on every application; this indicator tracks its key presses only.
+              $description:zh-TW: 並非所有應用程式都將 Insert 視為全系統切換狀態；此提示僅追蹤按鍵動作。
+          $name: Lock key OSDs
+          $name:zh-TW: 鍵盤鎖定鍵提示
         - showClipboardOsd: false
           $name: Show clipboard OSD (opt-in)
           $name:zh-TW: 顯示剪貼簿 OSD（需自行啟用）
@@ -1242,7 +1245,8 @@ void LoadSettings() {
     g_showMixerArrow.store(Wh_GetIntSetting(L"CustomOSD.Switches.showVolumeMixerArrow") != 0);
     g_mixerMaxRows.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.mixerMaxRows"), 3, 16));
     constexpr PCWSTR lockNames[] = {
-        L"CustomOSD.Switches.showCapsLockOsd", L"CustomOSD.Switches.showNumLockOsd", L"CustomOSD.Switches.showScrollLockOsd", L"CustomOSD.Switches.showInsertOsd"
+        L"CustomOSD.Switches.LockKeys.showCapsLockOsd", L"CustomOSD.Switches.LockKeys.showNumLockOsd",
+        L"CustomOSD.Switches.LockKeys.showScrollLockOsd", L"CustomOSD.Switches.LockKeys.showInsertOsd"
     };
     for (int i = 0; i < 4; ++i)
         g_showLockKeys[i].store(Wh_GetIntSetting(lockNames[i]) != 0);
@@ -5826,7 +5830,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD & Media v1.7.1 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD & Media v1.7.2 initialized (%s)", name);
     return TRUE;
 }
 
