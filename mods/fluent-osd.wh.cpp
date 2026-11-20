@@ -851,7 +851,7 @@ void DrawSnapshot(State& state) {
             freeHeight / (value.showValue ? 4.0 : 3.0));
         const double gap = std::min(
             std::max(trackThickness, wantedThumb),
-            std::max(0.0, (freeHeight - (value.showValue ? 2.0 : 2.0) * pad) /
+            std::max(0.0, (freeHeight - 2.0 * pad) /
                 (value.showValue ? 2.0 : 1.0)));
         const double iconTop = bodyH - pad - iconH;
         const double trackTop = value.showValue ? pad + labelH + gap : pad;
@@ -909,7 +909,7 @@ void DrawSnapshot(State& state) {
             freeWidth / (value.showValue ? 4.0 : 3.0));
         const double gap = std::min(std::max(iconH, labelH),
             std::max(0.0,
-                (freeWidth - (value.showValue ? 2.0 : 2.0) * pad) /
+                (freeWidth - 2.0 * pad) /
                 (value.showValue ? 2.0 : 1.0)));
         const double iconX = pad;
         const double valueX = bodyW - pad - labelW;
