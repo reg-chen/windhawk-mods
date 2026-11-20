@@ -2,7 +2,7 @@
 // @id              fluent-osd-media
 // @name            Fluent OSD & Media
 // @description     Fluent-style Windows 11 OSDs for volume, DDC/CI brightness, media controls, per-app audio mixer, lock keys, clipboard and device events.
-// @version         1.6.8
+// @version         1.6.9
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -107,6 +107,15 @@ resources. It does not monitor or intercept system shutdown separately;
 Windows owns process cleanup when Explorer exits. This limits one potential
 source of "GDI+ Window is preventing shutdown" without claiming to resolve
 shutdown blockers originating in other processes.
+
+## Resource and input limits
+
+Cross-process brightness notifications are checked for structure size, bounded
+DDC/CI values, monitor index and null-terminated display ID before use.
+The producer PID is informational; it is not treated as authentication.
+SMTC text is capped at 4,096 UTF-16 code units; album-art reads are capped
+at 1 MiB and decoded artwork is rejected above 4,096 px per dimension or
+8 Mi pixels. Clipboard previews remain optional and transient.
 
 ## License and acknowledgements
 
@@ -3330,7 +3339,15 @@ struct Runtime {
         if (!h) return {};
         UINT32 n = 0;
         PCWSTR p = raw(h, &n);
-        return p ? std::wstring(p, n) : std::wstring();
+        if (!p) return {};
+        // Media metadata is untrusted. Limit allocations independently of
+        // the advertised HSTRING length; avoid cutting a UTF-16 surrogate.
+        constexpr UINT32 kMaxMediaTextChars = 4096;
+        UINT32 length = std::min(n, kMaxMediaTextChars);
+        if (length < n && length &&
+            p[length - 1] >= 0xD800 && p[length - 1] <= 0xDBFF)
+            --length;
+        return std::wstring(p, length);
     }
 
     HRESULT Activate(PCWSTR className, REFIID iid, CPtr& result) {
@@ -3482,8 +3499,9 @@ void ReadArtwork(Runtime& api, IUnknown* thumbnail,
     UINT64 length = 0;
     if (FAILED(Call(randomStream.Get(), 6, &length))) return; // Size
     constexpr UINT32 kMaxArtwork = 1024u * 1024u;
-    UINT32 count = static_cast<UINT32>(std::min<UINT64>(length, kMaxArtwork));
-    if (!count) return;
+    // Reject oversize files rather than decoding a truncated stream.
+    if (!length || length > kMaxArtwork) return;
+    UINT32 count = static_cast<UINT32>(length);
     CPtr factory;
     if (FAILED(api.Activate(L"Windows.Storage.Streams.Buffer", kIBufferFactory, factory)))
         return;
@@ -4024,8 +4042,14 @@ void UpdateMediaArtworkCache() {
     // The stream now owns the HGLOBAL; keep the stream until bitmap deletion.
     g_cachedArtworkStream.Attach(stream);
     g_cachedArtwork.reset(new Gdiplus::Bitmap(stream));
+    // Encoded bytes are limited in ReadArtwork, but a small compressed
+    // image can still describe a huge decoded bitmap.
+    const UINT artworkWidth = g_cachedArtwork->GetWidth();
+    const UINT artworkHeight = g_cachedArtwork->GetHeight();
     if (g_cachedArtwork->GetLastStatus() != Gdiplus::Ok ||
-        !g_cachedArtwork->GetWidth() || !g_cachedArtwork->GetHeight()) {
+        !artworkWidth || !artworkHeight ||
+        artworkWidth > 4096 || artworkHeight > 4096 ||
+        static_cast<uint64_t>(artworkWidth) * artworkHeight > 8388608ULL) {
         g_cachedArtwork.reset();
         g_cachedArtworkStream.Reset();
     }
@@ -4937,7 +4961,18 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (WCHAR ch : ev.device) {
             if (!ch) { terminator = true; break; }
         }
-        if (!terminator) return FALSE;
+        if (!terminator || g_closing.load()) return FALSE;
+        // DDC/CI VCP values are 16-bit. Reject malformed cross-process
+        // notices before their values can influence slider geometry.
+        constexpr DWORD kMaxVcpValue = 0xFFFF;
+        if (ev.physicalIndex >= 32 ||
+            ev.value > kMaxVcpValue || ev.minimum > kMaxVcpValue ||
+            ev.maximum > kMaxVcpValue ||
+            (ev.maximum == 0 && ev.minimum != 0) ||
+            (ev.maximum != 0 && (ev.maximum <= ev.minimum ||
+                                  ev.value < ev.minimum || ev.value > ev.maximum)))
+            return FALSE;
+        // producerPid is descriptive metadata, not sender authentication.
         if (!g_showDdcBrightness.load()) return TRUE;
         ClosePanel();
         g_visible = ev;
@@ -5462,7 +5497,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD & Media v1.6.8 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD & Media v1.6.9 initialized (%s)", name);
     return TRUE;
 }
 
