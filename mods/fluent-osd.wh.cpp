@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.15
+// @version         1.0.16
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.15)
+## XAML migration experiment (v1.0.16)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -29,14 +29,14 @@ simultaneously because their Windows OSD hooks still target the same
 Explorer functions. Restore the official `@id fluent-osd` only when
 merging the renderer back into the production branch.
 
-Branch-only, opt-in XAML volume backend. Every native volume event is
-routed to the separate STA XAML Island when enabled. Other OSD categories
-still use GDI+; disabling the XAML switch restores the original GDI+
-volume renderer. **No GDI+ fallback occurs for volume events while XAML
-is enabled:** initialization/render failures are logged and may result in
-no volume popup. Media, mixer, vertical-layout and multi-monitor mirror
-settings are not yet implemented in the XAML view. The XAML view is
-noninteractive and does not yet have full animation, layout or opacity parity.
+Branch-only, opt-in native XAML Island renderer for **migrated OSD
+categories**: system volume and Windows native brightness. One existing
+toggle directly chooses XAML for both; if XAML is unavailable, those
+categories are not silently painted by GDI+. The individual Show switches
+still decide which OSD events appear. DDC/CI brightness is **not migrated
+yet**, because its per-display simultaneous value routing requires
+independent XAML hosts; all other unported categories remain on GDI+.
+XAML is currently noninteractive and lacks full animation/opacity parity.
 
 ## Features
 
@@ -136,10 +136,10 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
           $description: The only switch that enables the custom Windows volume indicator. Media card, mixer arrow, and vertical layout only customize it and never enable it implicitly.
           $description:zh-TW: 只有此開關會啟用自訂 Windows 音量提示。媒體卡片、混音器箭頭及垂直版面只調整外觀，不會間接啟用音量 OSD。
         - experimentalXamlVolume: false
-          $name: Experimental XAML volume renderer (no fallback)
-          $name:zh-TW: 實驗性 XAML 音量渲染器（不回退）
-          $description: Route all enabled custom volume events to XAML. An unavailable/failed XAML renderer shows no volume popup, rather than silently falling back to GDI+. Other OSD types stay unchanged. Does not enable custom volume itself.
-          $description:zh-TW: 所有已啟用的自訂音量事件只走 XAML；XAML 未就緒或失敗時不顯示音量 OSD，不會默默切回 GDI+。其他提示類型不變，且不會自行啟用音量 OSD。
+          $name: Experimental XAML renderer for migrated OSDs (no fallback)
+          $name:zh-TW: XAML 已遷移提示渲染開關（不回退）
+          $description: Control XAML rendering for migrated categories: volume and native brightness. No GDI+ fallback if XAML fails. DDC/CI, media, mixer and other unported categories keep their existing renderer. Individual Show switches remain independent.
+          $description:zh-TW: 直接控制已遷移的音量與 Windows 原生亮度提示，XAML 失敗不回退 GDI+；DDC/CI、媒體、混音器與其他未遷移類別仍用舊渲染器。各項 Show 開關繼續獨立。
         - showCustomBrightness: false
           $name: Show custom Windows brightness OSD
           $name:zh-TW: 顯示自訂 Windows 亮度 OSD
@@ -743,7 +743,11 @@ HANDLE g_thread = nullptr;
 
 struct Snapshot {
     int percent = 0;
+    int rawValue = 0;
+    bool valueKnown = true;
     bool muted = false;
+    bool brightness = false;
+    bool showIcon = true;
     DWORD durationMs = 3000;
     RECT anchor{};          // GDI-era positioning canvas in physical pixels.
     float scale = 1.0f;     // Original DPI * user-defined scale.
@@ -800,7 +804,9 @@ void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
         state.iconSlotWidth = 0.0;
         state.iconSlotHeight = 0.0;
         // Both volume/mute glyphs affect intrinsic TextBlock dimensions.
-        constexpr const wchar_t* kSpeakerGlyphs[] = {L"\uE74F", L"\uE767"};
+        // Fixed slot across speaker, mute and the verified brightness glyph.
+        constexpr const wchar_t* kSpeakerGlyphs[] = {
+            L"\uE74F", L"\uE767", L"\uE706"};
         for (const auto glyph : kSpeakerGlyphs) {
             state.icon.Text(glyph);
             state.icon.Measure(unconstrained);
@@ -814,11 +820,7 @@ void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
         state.measuredIconFontSize = iconFontSize;
     }
 
-    // A collapsed TextBlock measures to zero. Defer the cache update
-    // until the percentage is visible, so toggling Show Value back on
-    // never reuses an invalid zero-width label slot.
-    if (state.value.Visibility() == wx::Visibility::Visible &&
-        state.measuredValueFontSize != valueFontSize) {
+    if (state.measuredValueFontSize != valueFontSize) {
         const winrt::hstring current = state.value.Text();
         state.value.Width(autoWidth);
         state.valueSlotWidth = 0.0;
@@ -876,29 +878,55 @@ void DrawSnapshot(State& state) {
 
     const int percent = std::clamp(value.percent, 0, 100);
     // Segoe Fluent Icons is provided by Windows; no external font assets.
-    state.icon.Text(value.muted || percent == 0 ? L"\uE74F" : L"\uE767");
+    state.icon.Text(value.brightness ? L"\uE706" :
+        (value.muted || percent == 0 ? L"\uE74F" : L"\uE767"));
     const int iconFontSize = std::clamp(value.iconSize, 10, 24);
     const int numberFontSize = std::clamp(value.fontSize, 10, 24);
     state.icon.FontSize(iconFontSize);
-    state.value.Text(winrt::hstring(std::to_wstring(percent) + L"%"));
+    state.value.Text(winrt::hstring(value.valueKnown
+        ? std::to_wstring(percent) + L"%"
+        : std::to_wstring(value.rawValue)));
     state.value.FontSize(numberFontSize);
-    state.value.Visibility(value.showValue
-        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+    // Measure visible text even if the previous event hid the label/icon.
+    state.icon.Visibility(wx::Visibility::Visible);
+    state.value.Visibility(wx::Visibility::Visible);
 
     const double trackThickness =
         static_cast<double>(std::clamp(value.barThickness, 2, 18));
+    const int fillPercent = value.valueKnown ? percent : 0;
     const double wantedThumb =
         static_cast<double>(std::clamp(value.thumbDiameter, 0, 20));
 
     // Measure the intrinsic maximum among possible glyphs and labels.
     // Do not base the available track width on the *current* percentage.
     UpdateTextSlots(state, iconFontSize, numberFontSize);
-    const double iconW = state.iconSlotWidth;
-    const double iconH = state.iconSlotHeight;
+    // Non-normalized native brightness values can exceed 100. Reserve
+    // five decimal digits for that category without making each event's
+    // track width depend on its current raw reading.
+    if (value.brightness && !value.valueKnown) {
+        const winrt::hstring current = state.value.Text();
+        state.value.Width(std::numeric_limits<double>::quiet_NaN());
+        state.value.Text(L"65535");
+        state.value.Measure(winrt::Windows::Foundation::Size{
+            std::numeric_limits<float>::infinity(),
+            std::numeric_limits<float>::infinity()});
+        const auto measured = state.value.DesiredSize();
+        state.valueSlotWidth = std::max(
+            state.valueSlotWidth, static_cast<double>(measured.Width));
+        state.valueSlotHeight = std::max(
+            state.valueSlotHeight, static_cast<double>(measured.Height));
+        state.value.Text(current);
+    }
+    state.icon.Visibility(value.showIcon
+        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+    state.value.Visibility(value.showValue
+        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+    const double iconW = value.showIcon ? state.iconSlotWidth : 0.0;
+    const double iconH = value.showIcon ? state.iconSlotHeight : 0.0;
     const double labelW = value.showValue ? state.valueSlotWidth : 0.0;
     const double labelH = value.showValue ? state.valueSlotHeight : 0.0;
-    // A single centered icon slot keeps speaker/mute glyph changes stable.
-    state.icon.Width(iconW);
+    // A measured icon slot keeps speaker, mute and brightness aligned.
+    state.icon.Width(state.iconSlotWidth);
     state.icon.TextAlignment(wx::TextAlignment::Center);
     const double inner = std::max(0.0, static_cast<double>(value.innerPadding));
 
@@ -919,7 +947,7 @@ void DrawSnapshot(State& state) {
         const double trackTop = value.showValue ? pad + labelH + gap : pad;
         const double trackBottom = std::max(trackTop, iconTop - gap);
         const double length = trackBottom - trackTop;
-        const double filled = length * percent / 100.0;
+        const double filled = length * fillPercent / 100.0;
         const double centerX = bodyW / 2.0;
         const double thumbSize = std::min(wantedThumb, length);
 
@@ -943,7 +971,7 @@ void DrawSnapshot(State& state) {
 
         state.thumb.Width(thumbSize);
         state.thumb.Height(thumbSize);
-        state.thumb.Visibility(thumbSize > 0.0
+        state.thumb.Visibility(thumbSize > 0.0 && value.valueKnown
             ? wx::Visibility::Visible : wx::Visibility::Collapsed);
         const double thumbHalf = thumbSize / 2.0;
         const double thumbY = std::clamp(trackBottom - filled,
@@ -979,7 +1007,7 @@ void DrawSnapshot(State& state) {
         const double trackRight = value.showValue
             ? valueX - gap : bodyW - pad;
         const double trackW = std::max(0.0, trackRight - trackX);
-        const double filled = trackW * percent / 100.0;
+        const double filled = trackW * fillPercent / 100.0;
         const double midY = bodyH / 2.0;
         const double thumbSize = std::min(wantedThumb, trackW);
 
@@ -1003,7 +1031,7 @@ void DrawSnapshot(State& state) {
 
         state.thumb.Width(thumbSize);
         state.thumb.Height(thumbSize);
-        state.thumb.Visibility(thumbSize > 0.0
+        state.thumb.Visibility(thumbSize > 0.0 && value.valueKnown
             ? wx::Visibility::Visible : wx::Visibility::Collapsed);
         const double thumbHalf = thumbSize / 2.0;
         const double thumbX = std::clamp(filled, thumbHalf,
@@ -1023,7 +1051,7 @@ void DrawSnapshot(State& state) {
 
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.15: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.16: show failed (%lu)", GetLastError());
         return;
     }
     KillTimer(state.host, kHideTimer);
@@ -1044,13 +1072,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DrawSnapshot(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.15: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.16: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.15: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.16: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
@@ -1178,7 +1206,7 @@ DWORD WINAPI ThreadProc(void*) {
             const HRESULT borderHr = DwmSetWindowAttribute(
                 state.host, DWMWA_BORDER_COLOR,
                 &noBorder, sizeof(noBorder));
-            Wh_Log(L"XAML v1.0.15: DWM round=0x%08lX border-none=0x%08lX",
+            Wh_Log(L"XAML v1.0.16: DWM round=0x%08lX border-none=0x%08lX",
                    static_cast<unsigned long>(dwm),
                    static_cast<unsigned long>(borderHr));
             if (!g_stopping.load()) {
@@ -1197,7 +1225,7 @@ DWORD WINAPI ThreadProc(void*) {
                     winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
                 CreateContent(state);
                 g_ready.store(state.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.15: renderer ready");
+                Wh_Log(L"XAML v1.0.16: renderer ready");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -1206,11 +1234,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.15: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.16: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.15: startup exception");
+        Wh_Log(L"XAML v1.0.16: startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -1226,12 +1254,12 @@ DWORD WINAPI ThreadProc(void*) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.15: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.16: island close failed"); }
         state.source = nullptr;
     }
     if (state.manager) {
         try { state.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.15: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.16: manager close failed"); }
         state.manager = nullptr;
     }
     if (state.host) DestroyWindow(state.host);
@@ -1246,7 +1274,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.15: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.16: STA creation failed (%lu)", GetLastError());
     }
 }
 bool Show(const Snapshot& snapshot) {
@@ -1606,7 +1634,7 @@ std::atomic<int> g_displayLanguage{0}; // 0=Auto, 1=English, 2=zh-TW
 std::atomic<bool> g_hideAllNativeOsd{false};
 std::atomic<bool> g_hide[static_cast<int>(Kind::Count)]{};
 std::atomic<bool> g_showCustomNative[static_cast<int>(Kind::Count)]{};
-std::atomic<bool> g_experimentalXamlVolume{false};
+std::atomic<bool> g_xamlForMigrated{false};
 std::atomic<bool> g_showDdcBrightness{false};
 std::atomic<bool> g_verticalVolumeBrightness{true};
 std::atomic<bool> g_fromExplorer{true};
@@ -2264,7 +2292,7 @@ void LoadSettings() {
         Wh_GetIntSetting(L"NativeHide.hideAllNativeOsd") != 0);
     LoadBoolSettings(g_hide, kNativeHideSettingKeys);
     LoadBoolSettings(g_showCustomNative, kCustomNativeSettingKeys);
-    g_experimentalXamlVolume.store(
+    g_xamlForMigrated.store(
         Wh_GetIntSetting(L"CustomOSD.Switches.experimentalXamlVolume") != 0);
     g_showDdcBrightness.store(Wh_GetIntSetting(L"CustomOSD.Switches.showDdcBrightness") != 0);
     g_verticalVolumeBrightness.store(Wh_GetIntSetting(L"CustomOSD.Layout.verticalVolumeBrightness") != 0);
@@ -7188,7 +7216,7 @@ void ShowNativeVolumePopup() {
     // Deliberately no fallback in this test branch: when XAML is selected,
     // every native volume event is a XAML-only test even if the XAML backend
     // is unavailable, or media/mixer/vertical presentation is unsupported.
-    if (g_experimentalXamlVolume.load()) {
+    if (g_xamlForMigrated.load()) {
         // Hide the old GDI+ popup before closing an expanded panel:
         // ClosePanel() can otherwise repaint during composite recentering.
         // No XAML startup/error condition is allowed to show it again.
@@ -7206,7 +7234,7 @@ void ShowNativeVolumePopup() {
 
         RECT target{};
         if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-            Wh_Log(L"Fluent OSD v1.0.15: XAML volume not delivered (missing anchor HWND)");
+            Wh_Log(L"Fluent OSD v1.0.16: XAML volume not delivered (missing anchor HWND)");
             return;
         }
         const bool light = IsLightTheme();
@@ -7232,12 +7260,12 @@ void ShowNativeVolumePopup() {
         static bool loggedXamlUnavailable = false;
         if (xaml_volume::Show(data)) {
             if (!loggedXamlRouting) {
-                Wh_Log(L"Fluent OSD v1.0.15: native volume -> XAML only");
+                Wh_Log(L"Fluent OSD v1.0.16: native volume -> XAML only");
                 loggedXamlRouting = true;
             }
             loggedXamlUnavailable = false;
         } else if (!loggedXamlUnavailable) {
-            Wh_Log(L"Fluent OSD v1.0.15: XAML volume unavailable; NO GDI+ fallback");
+            Wh_Log(L"Fluent OSD v1.0.16: XAML volume unavailable; NO GDI+ fallback");
             loggedXamlUnavailable = true;
         }
         return;
@@ -8177,7 +8205,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.15 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.16 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
@@ -8218,14 +8246,14 @@ void Wh_ModAfterInit() {
             g_mediaWake = nullptr;
         }
     }
-    if (g_experimentalXamlVolume.load())
+    if (g_xamlForMigrated.load())
         xaml_volume::Start();
 }
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
     if (g_isExplorer && !g_closing.load()) {
-        if (g_experimentalXamlVolume.load())
+        if (g_xamlForMigrated.load())
             xaml_volume::Start();
         else
             xaml_volume::Hide();
