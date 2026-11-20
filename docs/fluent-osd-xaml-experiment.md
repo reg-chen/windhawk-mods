@@ -321,6 +321,39 @@ v1.0.1 branch is unchanged.
 - GDI+ rendering of *unported* OSD categories remains in this test build.
   The volume XAML route does not fall back to GDI+.
 
+## v1.0.15 — Invariant progress-track geometry at every volume
+
+### Root cause
+
+v1.0.14 derived `labelW` directly from the currently rendered
+`TextBlock.DesiredSize().Width`. Changing `98%` to `100%` therefore
+changed the **available track width**, not just its fill percentage.
+The speaker icon slot could similarly change when switching to mute.
+
+### Correction
+
+- On the existing XAML STA, use the **actual visible TextBlock**
+  controls to measure every possible value from **0% through 100%**,
+  plus both speaker/mute glyph variants, with unconstrained intrinsic
+  sizes. Reserve the **maximum** width and height for each category.
+- Cache the resulting slot metrics per font size. Only setting changes
+  that affect the corresponding font size trigger a new measurement;
+  normal volume/mute events reuse the same dimensions.
+- Reapply the current glyph and label after measurement. The icon
+  renders centered inside its fixed-width *measured* slot; the
+  percentage remains right-aligned within its stable slot.
+- If Show Value is disabled, defer its cache update; a collapsed XAML
+  `TextBlock` otherwise reports a zero `DesiredSize`.
+- The track length is now a function of card dimensions, typography,
+  user padding, and settings, **independent of the current volume**.
+  The fill clip still uses `trackW × percent / 100`.
+
+**Regression checks:** compare `0%, 1%, 8%, 9%, 10%, 98%, 99%, 100%`
+in both layouts and through mute/unmute. Track background endpoints
+must stay fixed throughout. Also toggle Show Value off/on and change
+font size to exercise cache invalidation. This requires the user's
+Windhawk runtime test; no Windows compiler/runtime validation was run.
+
 ## Migration gates
 
 1. **Host viability:** Windows compilation, Island activation, show/hide, transparency behavior, DPI, multimonitor placement, nonactivation and clean unloading.
