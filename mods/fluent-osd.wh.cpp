@@ -781,6 +781,7 @@ struct State {
     int measuredValueFontSize = -1;
     double iconSlotWidth = 0.0, iconSlotHeight = 0.0;
     double valueSlotWidth = 0.0, valueSlotHeight = 0.0;
+    double rawSlotWidth = 0.0, rawSlotHeight = 0.0;
 };
 media::SolidColorBrush Brush(DWORD rgb) {
     return media::SolidColorBrush(winrt::Windows::UI::Color{
@@ -825,6 +826,8 @@ void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
         state.value.Width(autoWidth);
         state.valueSlotWidth = 0.0;
         state.valueSlotHeight = 0.0;
+        state.rawSlotWidth = 0.0;
+        state.rawSlotHeight = 0.0;
         // Actual maximum over *all* possible labels, not an arbitrary
         // text-box width or an assumption that "100%" is widest.
         for (int percent = 0; percent <= 100; ++percent) {
@@ -837,6 +840,11 @@ void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
             state.valueSlotHeight = std::max(
                 state.valueSlotHeight, static_cast<double>(desired.Height));
         }
+        state.value.Text(L"65535");
+        state.value.Measure(unconstrained);
+        const auto raw = state.value.DesiredSize();
+        state.rawSlotWidth = raw.Width;
+        state.rawSlotHeight = raw.Height;
         state.value.Text(current);
         state.measuredValueFontSize = valueFontSize;
     }
@@ -900,31 +908,21 @@ void DrawSnapshot(State& state) {
     // Measure the intrinsic maximum among possible glyphs and labels.
     // Do not base the available track width on the *current* percentage.
     UpdateTextSlots(state, iconFontSize, numberFontSize);
-    // Non-normalized native brightness values can exceed 100. Reserve
-    // five decimal digits for that category without making each event's
-    // track width depend on its current raw reading.
-    if (value.brightness && !value.valueKnown) {
-        const winrt::hstring current = state.value.Text();
-        state.value.Width(std::numeric_limits<double>::quiet_NaN());
-        state.value.Text(L"65535");
-        state.value.Measure(winrt::Windows::Foundation::Size{
-            std::numeric_limits<float>::infinity(),
-            std::numeric_limits<float>::infinity()});
-        const auto measured = state.value.DesiredSize();
-        state.valueSlotWidth = std::max(
-            state.valueSlotWidth, static_cast<double>(measured.Width));
-        state.valueSlotHeight = std::max(
-            state.valueSlotHeight, static_cast<double>(measured.Height));
-        state.value.Text(current);
-    }
+    // Choose a *separate* cached raw-number slot for non-normalized
+    // native brightness. It must not permanently widen volume labels.
+    const bool rawLabel = value.brightness && !value.valueKnown;
     state.icon.Visibility(value.showIcon
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
     state.value.Visibility(value.showValue
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
     const double iconW = value.showIcon ? state.iconSlotWidth : 0.0;
     const double iconH = value.showIcon ? state.iconSlotHeight : 0.0;
-    const double labelW = value.showValue ? state.valueSlotWidth : 0.0;
-    const double labelH = value.showValue ? state.valueSlotHeight : 0.0;
+    const double labelW = !value.showValue ? 0.0 :
+        rawLabel ? std::max(state.valueSlotWidth, state.rawSlotWidth) :
+                   state.valueSlotWidth;
+    const double labelH = !value.showValue ? 0.0 :
+        rawLabel ? std::max(state.valueSlotHeight, state.rawSlotHeight) :
+                   state.valueSlotHeight;
     // A measured icon slot keeps speaker, mute and brightness aligned.
     state.icon.Width(state.iconSlotWidth);
     state.icon.TextAlignment(wx::TextAlignment::Center);
@@ -7209,65 +7207,80 @@ void ResetHideTimerFor(DurationKind kind) {
     ResetHideTimer(OsdDuration(kind));
 }
 
+// Shared routing for every category completed in the experimental XAML
+// renderer. The original GDI+ event handler remains ONLY behind an explicit
+// XAML-off setting; failure/initialization never silently paints the old UI.
+void ShowMigratedXamlLevel(PopupKind kind) {
+    const bool brightness = kind == PopupKind::NativeBrightness;
+
+    // Hide the old layered GDI+ surface before closing a panel, which may
+    // otherwise recenter and briefly repaint it. This stays on the UI thread.
+    if (g_popupWnd) {
+        KillTimer(g_popupWnd, kHideTimer);
+        KillTimer(g_popupWnd, kFadeTimer);
+        KillTimer(g_popupWnd, kMediaAnimationTimer);
+        g_fadeActive = false;
+        ShowWindow(g_popupWnd, SW_HIDE);
+    }
+    ClosePanel();
+    if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
+    UpdateArrowHitWindow();
+    UpdateSpeakerHitWindow();
+
+    RECT target{};
+    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
+        Wh_Log(L"Fluent OSD v1.0.16: XAML %s unavailable (no anchor HWND)",
+               brightness ? L"brightness" : L"volume");
+        return;
+    }
+
+    const bool light = IsLightTheme();
+    xaml_volume::Snapshot data;
+    data.percent = g_nativePercent;
+    data.rawValue = g_nativePercent;
+    data.valueKnown = g_nativePercentKnown;
+    data.muted = !brightness && g_nativeMuted;
+    data.brightness = brightness;
+    data.showIcon = !brightness || g_showSun.load();
+    data.durationMs = OsdDuration(brightness ?
+        DurationKind::NativeBrightness : DurationKind::Volume);
+    data.anchor = target;
+    data.scale = g_scale;
+    data.vertical = g_verticalVolumeBrightness.load();
+    data.showValue = g_showValue.load();
+    data.innerPadding = g_innerPadding.load();
+    data.iconSize = g_iconSize.load();
+    data.fontSize = g_fontSize.load();
+    data.barThickness = g_barThickness.load();
+    data.thumbDiameter = g_thumbDiameter.load();
+    data.background = OsdBackgroundRgb(light);
+    data.text = OsdTextRgb(light);
+    data.accent = OsdAccentRgb();
+    data.track = OsdTrackRgb(light);
+
+    // Post failure is observable; never try GDI+ when XAML is selected.
+    static bool loggedRoute[2]{};
+    static bool loggedUnavailable[2]{};
+    const int category = brightness ? 1 : 0;
+    if (xaml_volume::Show(data)) {
+        if (!loggedRoute[category]) {
+            Wh_Log(L"Fluent OSD v1.0.16: native %s -> XAML only",
+                   brightness ? L"brightness" : L"volume");
+            loggedRoute[category] = true;
+        }
+        loggedUnavailable[category] = false;
+    } else if (!loggedUnavailable[category]) {
+        Wh_Log(L"Fluent OSD v1.0.16: XAML %s unavailable; NO GDI+ fallback",
+               brightness ? L"brightness" : L"volume");
+        loggedUnavailable[category] = true;
+    }
+}
+
 void ShowNativeVolumePopup() {
     BrightnessEvent ev{};
     MovePopupToDisplay(ev);
-
-    // Deliberately no fallback in this test branch: when XAML is selected,
-    // every native volume event is a XAML-only test even if the XAML backend
-    // is unavailable, or media/mixer/vertical presentation is unsupported.
     if (g_xamlForMigrated.load()) {
-        // Hide the old GDI+ popup before closing an expanded panel:
-        // ClosePanel() can otherwise repaint during composite recentering.
-        // No XAML startup/error condition is allowed to show it again.
-        if (g_popupWnd) {
-            KillTimer(g_popupWnd, kHideTimer);
-            KillTimer(g_popupWnd, kFadeTimer);
-            KillTimer(g_popupWnd, kMediaAnimationTimer);
-            g_fadeActive = false;
-            ShowWindow(g_popupWnd, SW_HIDE);
-        }
-        ClosePanel();
-        if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
-        UpdateArrowHitWindow();
-        UpdateSpeakerHitWindow();
-
-        RECT target{};
-        if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-            Wh_Log(L"Fluent OSD v1.0.16: XAML volume not delivered (missing anchor HWND)");
-            return;
-        }
-        const bool light = IsLightTheme();
-        xaml_volume::Snapshot data;
-        data.percent = g_nativePercent;
-        data.muted = g_nativeMuted;
-        data.durationMs = OsdDuration(DurationKind::Volume);
-        data.anchor = target;
-        data.scale = g_scale;
-        data.vertical = g_verticalVolumeBrightness.load();
-        data.showValue = g_showValue.load();
-        data.innerPadding = g_innerPadding.load();
-        data.iconSize = g_iconSize.load();
-        data.fontSize = g_fontSize.load();
-        data.barThickness = g_barThickness.load();
-        data.thumbDiameter = g_thumbDiameter.load();
-        data.background = OsdBackgroundRgb(light);
-        data.text = OsdTextRgb(light);
-        data.accent = OsdAccentRgb();
-        data.track = OsdTrackRgb(light);
-
-        static bool loggedXamlRouting = false; // Existing UI thread only.
-        static bool loggedXamlUnavailable = false;
-        if (xaml_volume::Show(data)) {
-            if (!loggedXamlRouting) {
-                Wh_Log(L"Fluent OSD v1.0.16: native volume -> XAML only");
-                loggedXamlRouting = true;
-            }
-            loggedXamlUnavailable = false;
-        } else if (!loggedXamlUnavailable) {
-            Wh_Log(L"Fluent OSD v1.0.16: XAML volume unavailable; NO GDI+ fallback");
-            loggedXamlUnavailable = true;
-        }
+        ShowMigratedXamlLevel(PopupKind::NativeVolume);
         return;
     }
     // Original volume GDI+ renderer is used ONLY when XAML was disabled.
@@ -7389,13 +7402,21 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             ShowNativeVolumePopup();
         } else {
-            ClosePanel();
-            BrightnessEvent ev{};
-            MovePopupToDisplay(ev);
-            SetPopupInteractive(false);
-            ShowPopupAnimated();
-            UpdateArrowHitWindow();
-            ResetHideTimerFor(DurationKind::NativeBrightness);
+            // Brightness has joined volume in the migrated XAML categories.
+            // The XAML switch directly controls it, without any fallback.
+            if (g_xamlForMigrated.load()) {
+                BrightnessEvent ev{};
+                MovePopupToDisplay(ev);
+                ShowMigratedXamlLevel(PopupKind::NativeBrightness);
+            } else {
+                ClosePanel();
+                BrightnessEvent ev{};
+                MovePopupToDisplay(ev);
+                SetPopupInteractive(false);
+                ShowPopupAnimated();
+                UpdateArrowHitWindow();
+                ResetHideTimerFor(DurationKind::NativeBrightness);
+            }
         }
         return 0;
     }
