@@ -2,7 +2,7 @@
 
 **Branch:** `fluent-osd-xaml`  
 **Baseline:** `fluent-osd` v1.0.1 (`8ff2d4352d8c081e78208266ff1561b5e5bfe31b`)  
-**Status:** XAML Island host **prototype committed**; **not yet compiled or run on Windows**.
+**Status:** standalone XAML Island probe v0.1.3 has passed the user's Windows rendering / DWM rounded-corner visual test; integrated Fluent OSD v1.0.2 is committed but **has not been compiled or runtime-tested**.
 
 ## Goal / non-goals
 
@@ -98,6 +98,62 @@ the visible result and the HRESULT. Do not blindly restore HRGN: that
 would restore the jagged edges.
 
 Microsoft reference: [Apply rounded corners in desktop apps](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/ui/apply-rounded-corners).
+
+## First integrated backend — Fluent OSD v1.0.2 (branch only)
+
+The existing `mods/fluent-osd.wh.cpp` now contains an **opt-in** XAML
+volume backend within the **same** mod, using the actual Windows native
+HardwareConfirmator event stream. It is not another hotkey-only probe.
+
+### What changed
+
+- New setting: `CustomOSD.Switches.experimentalXamlVolume` (**false** by default).
+- Hook/event capture, Core Audio endpoint reading, settings and display selection remain in the original code.
+- In `ShowNativeVolumePopup`, the existing MTA UI thread prepares a
+  plain owned `xaml_volume::Snapshot` (percentage, mute, duration, language,
+  RGB palette and expected popup rectangle).
+- A separate **STA thread** hosts the already-tested `Windows.UI.Xaml`
+  Island with the DWM rounded-window hint; an asynchronous Win32 message
+  conveys that snapshot. XAML/COM references never move into the MTA.
+- GDI+ is retained for the default path, vertical volume, media cards,
+  mixer UI, all-monitor mirroring, or failed XAML startup. A render-time
+  exception disables XAML for subsequent events; the current failed event
+  may be lost.
+- The new backend has no mouse volume control, animation parity, matching
+  dimensions or per-pixel opacity yet. **Do not treat this as a complete
+  frontend/backend split:** rendering choice and some state still live in
+  the original monolithic UI workflow.
+
+### Manual test — full event integration
+
+1. **Disable the separate** `fluent-osd-xaml-island-probe` test mod,
+   so only one experimental XAML host is loaded.
+2. Open `mods/fluent-osd.wh.cpp` from the **fluent-osd-xaml** branch
+   in Windhawk. Its metadata must say **Fluent OSD (XAML Experimental)**
+   and `@version 1.0.2`. It has the **same mod ID** `fluent-osd` as the
+   normal mod; do not run both variants at once.
+3. Enable `Show custom Windows volume OSD`; enable
+   `Experimental XAML volume backend (horizontal only)`.
+   Set a **horizontal** volume layout, turn off SMTC-on-volume and mixer
+   arrow, and do not select **all-monitor mirroring**. Keep the native
+   Hide switch independent as before.
+4. Change volume with the native volume keys. Expected Windhawk logs:
+   `XAML v1.0.2: renderer ready` (once) and
+   `Fluent OSD v1.0.2: native volume -> XAML backend` (first routed event).
+   XAML should receive the real current volume/mute, unlike the manual
+   standalone probe.
+5. Disable the XAML backend toggle and repeat. The original GDI+ OSD
+   should work again. Also test brightness, lock status, and switching
+   layouts to verify the normal backend is unaffected.
+6. Disable/re-enable the mod to verify Explorer shutdown/reinitialization.
+   If a log shows `startup failed`, it should stay on GDI+.
+
+**Caveat:** legacy XAML Manager shutdown can still hang and thus block
+Explorer unload because thread joining intentionally does not abandon
+a live DLL thread. Do not merge or use as a daily driver before verifying
+cleanup, failure cases, cross-monitor DPI and resource consumption.
+
+The 1.0.1 production source and branch remain unchanged.
 
 ## Migration gates
 
