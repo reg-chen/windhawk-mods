@@ -3331,6 +3331,8 @@ void UpdateBarWheelWindow() {
 }
 
 void ShowPopupAnimated() {
+    // Never leave a previous XAML volume popup over a GDI+ event.
+    xaml_volume::Hide();
     if (!g_popupWnd) return;
     const bool wasVisible = IsWindowVisible(g_popupWnd) != FALSE;
     const bool reversingFade = g_fadeActive && g_fadeOut;
@@ -6889,6 +6891,42 @@ void ResetHideTimerFor(DurationKind kind) {
 void ShowNativeVolumePopup() {
     BrightnessEvent ev{};
     MovePopupToDisplay(ev);
+
+    // First migration slice: only the simple, horizontal, single-display
+    // native-volume event. Leave SMTC, Mixer, vertical UI, mirror mode and
+    // all interactive controls on the fully functional GDI+ backend.
+    const bool tryXaml = g_experimentalXamlVolume.load() &&
+        !g_verticalVolumeBrightness.load() &&
+        !g_showSmtcOnVolume.load() && !g_showMixerArrow.load() &&
+        g_displayOutputMode.load() != 3 && g_nativePercentKnown &&
+        !g_closing.load();
+    RECT target{};
+    if (tryXaml && g_popupWnd && GetWindowRect(g_popupWnd, &target)) {
+        const bool light = IsLightTheme();
+        xaml_volume::Snapshot data;
+        data.percent = g_nativePercent;
+        data.muted = g_nativeMuted;
+        data.durationMs = OsdDuration(DurationKind::Volume);
+        data.anchor = target;
+        data.background = OsdBackgroundRgb(light);
+        data.text = OsdTextRgb(light);
+        data.accent = OsdAccentRgb();
+        data.track = OsdTrackRgb(light);
+        if (xaml_volume::Show(data)) {
+            // Do not render two copies of the same OSD. Keep native hooks
+            // and Core Audio state unchanged; only presentation is swapped.
+            ClosePanel();
+            KillTimer(g_popupWnd, kHideTimer);
+            KillTimer(g_popupWnd, kFadeTimer);
+            g_fadeActive = false;
+            ShowWindow(g_popupWnd, SW_HIDE);
+            if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
+            UpdateArrowHitWindow();
+            UpdateSpeakerHitWindow();
+            return;
+        }
+    }
+    // Startup, XAML activation failure, or unsupported layout: GDI+.
     SetPopupInteractive(false);
     ShowPopupAnimated();
     UpdateArrowHitWindow();
@@ -7823,7 +7861,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.2 (XAML experimental) initialized (%s)", name);
     return TRUE;
 }
 
@@ -7864,10 +7902,18 @@ void Wh_ModAfterInit() {
             g_mediaWake = nullptr;
         }
     }
+    if (g_experimentalXamlVolume.load())
+        xaml_volume::Start();
 }
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
+    if (g_isExplorer && !g_closing.load()) {
+        if (g_experimentalXamlVolume.load())
+            xaml_volume::Start();
+        else
+            xaml_volume::Hide();
+    }
     // Windhawk's settings callback is not the OSD UI thread.
     HWND target = g_networkReceiver.load(std::memory_order_acquire);
     if (g_isExplorer && target && !g_closing.load())
@@ -7880,6 +7926,8 @@ void Wh_ModBeforeUninit() {
     // Prevent callbacks from posting into a receiver that is going away.
     g_closing.store(true);
     g_networkReceiver.store(nullptr);
+    // WinRT/XAML is STA-owned and must exit before the module unloads.
+    xaml_volume::Stop();
     // Stop all worker threads before the UI windows or DLL can be unloaded.
     g_wheelWriteStop.store(true);
     if (g_wheelWriteWake) SetEvent(g_wheelWriteWake);
