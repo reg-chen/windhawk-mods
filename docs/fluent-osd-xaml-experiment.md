@@ -20,7 +20,7 @@ This is a **real Windows.UI.Xaml Island** proof of concept, not a screenshot or 
 It creates:
 
 1. Its own STA thread within `explorer.exe`, independently of the existing OSD's MTA/GDI+ thread.
-2. A native topmost no-activate Win32 host HWND with `WS_EX_NOREDIRECTIONBITMAP`.
+2. A native topmost no-activate Win32 host HWND. The diagnostic version intentionally **does not** set `WS_EX_NOREDIRECTIONBITMAP` so that a conventional redirected surface can establish whether the host itself is visible.
 3. A `Windows.UI.Xaml.Hosting.WindowsXamlManager` and `DesktopWindowXamlSource` attached to that HWND.
 4. A native XAML visual tree: `Border`, `StackPanel`, `TextBlock` and `ProgressBar`.
 5. An on-demand volume snapshot via Core Audio (default multimedia render endpoint), **not** continual polling.
@@ -31,10 +31,12 @@ This standalone module has a separate Windhawk ID (`fluent-osd-xaml-island-probe
 
 1. Open Windhawk and create a separate local mod from the entire probe source. Do **not** replace the installed Fluent OSD mod.
 2. Compile it using Windhawk's included compiler. Verify there are no missing C++/WinRT/XAML headers or link errors.
-3. Enable the probe; press **Ctrl+Alt+Shift+O**. A native XAML volume preview should appear near the bottom-right of the monitor under the mouse, using the current default multimedia output level.
+3. Enable the probe. After ~0.75 seconds, a native XAML volume preview should **automatically** appear in the **center** of the monitor containing the pointer for **12 seconds**. The shortcut **Ctrl+Alt+Shift+O** manually reopens it. If this does not appear, consult the Windhawk log before changing the styling code.
 4. Wait for the preview to hide. Repeat after switching the Windows output device and at different screen scales (100%, 125%, 150%).
 5. Disable the probe and verify that Explorer remains responsive, no host HWND remains, and there are no shutdown blockers.
-6. Check the Windhawk log: `XAML probe ready`, `startup failed`, `hotkey registration failed`, or an STA-exit warning.
+6. Check the **probe's** Windhawk log, and paste the lines beginning `XAML probe:`. Expected checkpoints: `mod init` → `STA worker starting` → `STA initialized` → `Win32 host created` → `initializing WindowsXamlManager` → `manager initialized` → `island attached` → `XAML controls created` → `startup auto-preview scheduled` → `preview requested (startup)` → `preview at ... hostVisible=1 islandVisible=1`. If it stops at the manager or attach step, include the logged HRESULT.
+
+   Microsoft documents a host **manifest / MaxTestedVersion** requirement for UWP XAML Islands. A Win32 desktop process may fail XAML runtime activation even if the mod compiles; the injection scenario requires runtime evidence, not assumptions. [Microsoft UWP XAML hosting API](https://learn.microsoft.com/en-us/windows/uwp/xaml-islands/using-the-xaml-hosting-api#troubleshooting).
 
 **Do not use this prototype as a daily-driver OSD.** It has not passed a compilation, runtime, resource, or compatibility test, and its top-level transparency and rounded outside corners have not been validated. It also does not yet implement UI input, fade animations, mixer, SMTC, device notices or monitor mirroring.
 
