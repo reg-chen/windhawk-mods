@@ -814,7 +814,11 @@ void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
         state.measuredIconFontSize = iconFontSize;
     }
 
-    if (state.measuredValueFontSize != valueFontSize) {
+    // A collapsed TextBlock measures to zero. Defer the cache update
+    // until the percentage is visible, so toggling Show Value back on
+    // never reuses an invalid zero-width label slot.
+    if (state.value.Visibility() == wx::Visibility::Visible &&
+        state.measuredValueFontSize != valueFontSize) {
         const winrt::hstring current = state.value.Text();
         state.value.Width(autoWidth);
         state.valueSlotWidth = 0.0;
