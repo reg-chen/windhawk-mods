@@ -699,6 +699,291 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 
 namespace {
 
+// Optional native XAML volume renderer. WinRT and HWND ownership stay entirely
+// on a dedicated STA. The existing Hook/UI threads exchange only value data.
+namespace xaml_volume {
+namespace wx = winrt::Windows::UI::Xaml;
+namespace controls = winrt::Windows::UI::Xaml::Controls;
+namespace media = winrt::Windows::UI::Xaml::Media;
+namespace hosting = winrt::Windows::UI::Xaml::Hosting;
+using Microsoft::WRL::ComPtr;
+
+struct IDesktopWindowXamlSourceNative : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE AttachToWindow(HWND) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND*) = 0;
+};
+constexpr GUID kInteropIID = {
+    0x3cbcf1bf, 0x2f76, 0x4e9c,
+    {0x96, 0xab, 0xe8, 0x4b, 0x37, 0x97, 0x25, 0x54}};
+constexpr wchar_t kClass[] = L"Windhawk.FluentOSD.XamlMigration.Host";
+constexpr UINT kShowMessage = WM_APP + 680;
+constexpr UINT kHideMessage = WM_APP + 681;
+constexpr UINT_PTR kHideTimer = 683;
+constexpr int kWidth = 344, kHeight = 124;
+
+std::atomic<HWND> g_ready{nullptr};
+std::atomic<DWORD> g_threadId{0};
+std::atomic<bool> g_stopping{false};
+std::atomic<bool> g_failed{false};
+std::mutex g_startLock;
+SRWLOCK g_snapshotLock = SRWLOCK_INIT;
+HANDLE g_thread = nullptr;
+
+struct Snapshot {
+    int percent = 0;
+    bool muted = false;
+    DWORD durationMs = 3000;
+    RECT anchor{};
+    DWORD background = 0x232327, text = 0xf8f8fc;
+    DWORD accent = 0x67acff, track = 0x56565c;
+};
+Snapshot g_pending{};
+
+struct State {
+    HWND host = nullptr, island = nullptr;
+    hosting::WindowsXamlManager manager{nullptr};
+    hosting::DesktopWindowXamlSource source{nullptr};
+    controls::Border card{nullptr};
+    controls::TextBlock value{nullptr};
+    controls::ProgressBar bar{nullptr};
+};
+media::SolidColorBrush Brush(DWORD rgb) {
+    return media::SolidColorBrush(winrt::Windows::UI::Color{
+        255, static_cast<BYTE>(rgb >> 16), static_cast<BYTE>(rgb >> 8),
+        static_cast<BYTE>(rgb)});
+}
+void DrawSnapshot(State& state) {
+    if (!state.host || !state.card || !state.value || !state.bar) return;
+    Snapshot value;
+    AcquireSRWLockShared(&g_snapshotLock);
+    value = g_pending;
+    ReleaseSRWLockShared(&g_snapshotLock);
+
+    state.value.Text(winrt::hstring(
+        std::wstring(value.muted ? L"靜音  " : L"音量  ") +
+        std::to_wstring(std::clamp(value.percent, 0, 100)) + L"%"));
+    state.bar.Value(std::clamp(value.percent, 0, 100));
+    state.card.Background(Brush(value.background));
+    state.value.Foreground(Brush(value.text));
+    state.bar.Foreground(Brush(value.accent));
+    state.bar.Background(Brush(value.track));
+
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(MonitorFromRect(
+            &value.anchor, MONITOR_DEFAULTTONEAREST), &mi))
+        return;
+    const int midX = value.anchor.left +
+        (value.anchor.right - value.anchor.left) / 2;
+    const int midY = value.anchor.top +
+        (value.anchor.bottom - value.anchor.top) / 2;
+    const int x = std::clamp(midX - kWidth / 2, mi.rcWork.left,
+        std::max(mi.rcWork.left, mi.rcWork.right - kWidth));
+    const int y = std::clamp(midY - kHeight / 2, mi.rcWork.top,
+        std::max(mi.rcWork.top, mi.rcWork.bottom - kHeight));
+    if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, kWidth, kHeight,
+                      SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+        Wh_Log(L"XAML v1.0.2: show failed (%lu)", GetLastError());
+        return;
+    }
+    KillTimer(state.host, kHideTimer);
+    SetTimer(state.host, kHideTimer,
+        std::clamp(value.durationMs, DWORD(500), DWORD(20000)), nullptr);
+}
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        return TRUE;
+    }
+    auto* state = reinterpret_cast<State*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case kShowMessage:
+            if (state) {
+                try { DrawSnapshot(*state); }
+                catch (const winrt::hresult_error& ex) {
+                    Wh_Log(L"XAML v1.0.2: draw exception 0x%08lX",
+                           static_cast<unsigned long>(ex.code()));
+                } catch (...) {
+                    Wh_Log(L"XAML v1.0.2: unexpected draw exception");
+                }
+            }
+            return 0;
+        case kHideMessage:
+            KillTimer(hwnd, kHideTimer);
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        case WM_SIZE:
+            if (state && state->island && wp != SIZE_MINIMIZED)
+                SetWindowPos(state->island, nullptr, 0, 0,
+                    LOWORD(lp), HIWORD(lp),
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        case WM_TIMER:
+            if (wp == kHideTimer) {
+                KillTimer(hwnd, kHideTimer);
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            return 0;
+        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+        case WM_CLOSE: PostQuitMessage(0); return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+void CreateContent(State& state) {
+    controls::Border card;
+    card.CornerRadius(wx::CornerRadius{14.0, 14.0, 14.0, 14.0});
+    card.Padding(wx::Thickness{20.0, 14.0, 20.0, 14.0});
+    card.Background(Brush(0x232327));
+    controls::StackPanel stack;
+    stack.Orientation(controls::Orientation::Vertical);
+    controls::TextBlock heading;
+    heading.Text(L"FLUENT OSD / XAML");
+    heading.FontSize(12.0);
+    heading.Foreground(Brush(0xa8b6d0));
+    stack.Children().Append(heading);
+    controls::TextBlock value;
+    value.Text(L"音量");
+    value.FontSize(21.0);
+    value.Margin(wx::Thickness{0.0, 6.0, 0.0, 0.0});
+    value.Foreground(Brush(0xf8f8fc));
+    stack.Children().Append(value);
+    controls::ProgressBar bar;
+    bar.Minimum(0);
+    bar.Maximum(100);
+    bar.Value(0);
+    bar.Height(8.0);
+    bar.Margin(wx::Thickness{0.0, 9.0, 0.0, 0.0});
+    bar.Foreground(Brush(0x67acff));
+    stack.Children().Append(bar);
+    card.Child(stack);
+    state.source.Content(card);
+    state.card = card;
+    state.value = value;
+    state.bar = bar;
+}
+DWORD WINAPI ThreadProc(void*) {
+    State state;
+    MSG msg{};
+    bool apartment = false, registered = false;
+    const HINSTANCE inst = GetModuleHandleW(nullptr);
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    g_threadId.store(GetCurrentThreadId(), std::memory_order_release);
+    try {
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
+        apartment = true;
+        if (!g_stopping.load()) {
+            WNDCLASSEXW wc{sizeof(wc)};
+            wc.lpfnWndProc = WndProc;
+            wc.hInstance = inst;
+            wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+            wc.lpszClassName = kClass;
+            registered = RegisterClassExW(&wc) != 0;
+            if (!registered)
+                winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
+            state.host = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                kClass, L"", WS_POPUP, 0, 0, kWidth, kHeight,
+                nullptr, nullptr, inst, &state);
+            if (!state.host)
+                winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
+            const DWM_WINDOW_CORNER_PREFERENCE rounding = DWMWCP_ROUND;
+            const HRESULT dwm = DwmSetWindowAttribute(
+                state.host, DWMWA_WINDOW_CORNER_PREFERENCE,
+                &rounding, sizeof(rounding));
+            Wh_Log(L"XAML v1.0.2: DWM round HRESULT=0x%08lX",
+                   static_cast<unsigned long>(dwm));
+            if (!g_stopping.load()) {
+                state.manager =
+                    hosting::WindowsXamlManager::InitializeForCurrentThread();
+                state.source = hosting::DesktopWindowXamlSource{};
+                ComPtr<IDesktopWindowXamlSourceNative> interop;
+                winrt::check_hresult(winrt::get_unknown(state.source)->
+                    QueryInterface(kInteropIID,
+                        reinterpret_cast<void**>(interop.GetAddressOf())));
+                winrt::check_hresult(interop->AttachToWindow(state.host));
+                winrt::check_hresult(interop->get_WindowHandle(&state.island));
+                if (!state.island) winrt::throw_hresult(E_POINTER);
+                if (!SetWindowPos(state.island, nullptr, 0, 0, kWidth, kHeight,
+                     SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW))
+                    winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
+                CreateContent(state);
+                g_ready.store(state.host, std::memory_order_release);
+                Wh_Log(L"XAML v1.0.2: renderer ready");
+                while (!g_stopping.load() &&
+                       GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"XAML v1.0.2: startup failed 0x%08lX (%s)",
+               static_cast<unsigned long>(ex.code()), ex.message().c_str());
+        g_failed.store(true);
+    } catch (...) {
+        Wh_Log(L"XAML v1.0.2: startup exception");
+        g_failed.store(true);
+    }
+    g_ready.store(nullptr, std::memory_order_release);
+    if (state.host) KillTimer(state.host, kHideTimer);
+    state.bar = nullptr;
+    state.value = nullptr;
+    state.card = nullptr;
+    if (state.source) {
+        try { state.source.Content(nullptr); state.source.Close(); }
+        catch (...) { Wh_Log(L"XAML v1.0.2: island close failed"); }
+        state.source = nullptr;
+    }
+    if (state.manager) {
+        try { state.manager.Close(); }
+        catch (...) { Wh_Log(L"XAML v1.0.2: manager close failed"); }
+        state.manager = nullptr;
+    }
+    if (state.host) DestroyWindow(state.host);
+    if (registered) UnregisterClassW(kClass, inst);
+    if (apartment) winrt::uninit_apartment();
+    g_threadId.store(0, std::memory_order_release);
+    return 0;
+}
+void Start() {
+    std::lock_guard<std::mutex> guard(g_startLock);
+    if (g_thread || g_stopping.load() || g_failed.load()) return;
+    g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
+    if (!g_thread) {
+        g_failed.store(true);
+        Wh_Log(L"XAML v1.0.2: STA creation failed (%lu)", GetLastError());
+    }
+}
+bool Show(const Snapshot& snapshot) {
+    const HWND hwnd = g_ready.load(std::memory_order_acquire);
+    if (!hwnd || g_stopping.load()) return false;
+    AcquireSRWLockExclusive(&g_snapshotLock);
+    g_pending = snapshot;
+    ReleaseSRWLockExclusive(&g_snapshotLock);
+    return PostMessageW(hwnd, kShowMessage, 0, 0) != FALSE;
+}
+void Hide() {
+    const HWND hwnd = g_ready.load(std::memory_order_acquire);
+    if (hwnd) PostMessageW(hwnd, kHideMessage, 0, 0);
+}
+void Stop() {
+    std::lock_guard<std::mutex> guard(g_startLock);
+    g_stopping.store(true);
+    const HWND hwnd = g_ready.exchange(nullptr);
+    if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    const DWORD id = g_threadId.load(std::memory_order_acquire);
+    if (id) PostThreadMessageW(id, WM_QUIT, 0, 0);
+    if (g_thread) {
+        // Do not unload executing code. Shutdown of legacy XAML may block.
+        WaitForSingleObject(g_thread, INFINITE);
+        CloseHandle(g_thread);
+        g_thread = nullptr;
+    }
+}
+} // namespace xaml_volume
+
 constexpr WCHAR kWindowClass[] = L"WH.NativeOSD.DDC.01E7AFB2";
 constexpr ULONG_PTR kCopyDataTag = 0x1E7AFB2;
 constexpr UINT_PTR kHideTimer = 320;
