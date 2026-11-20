@@ -76,6 +76,29 @@ alpha-composited overlay.
 References: [SetWindowRgn](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowrgn),
 [CreateRoundRectRgn](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createroundrectrgn).
 
+## v0.1.3 — DWM compositor rounding trial
+
+The v0.1.2 host region removed the opaque black corner squares, but
+`SetWindowRgn` clips against integer pixel boundaries, producing a
+visibly jagged outline. Windows documentation also states that **window
+regions prevent DWM rounding**, even when a corner preference is requested.
+
+v0.1.3 removes **all** `HRGN` host clipping and requests
+`DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND` with
+`DwmSetWindowAttribute`; it links to `dwmapi`. DWM is responsible for
+anti-aliased corner clipping, if this borderless popup is eligible.
+The existing XAML `Border.CornerRadius` is retained.
+
+**Manual validation**: enable the test mod, inspect the corners on a
+contrasting desktop background, and look for
+`XAML probe v0.1.3: DWM rounded-corner request HRESULT=...` in Windhawk.
+`S_OK` confirms attribute submission, **not** that DWM actually rounded
+this specific window. If the black rectangular corners return, report both
+the visible result and the HRESULT. Do not blindly restore HRGN: that
+would restore the jagged edges.
+
+Microsoft reference: [Apply rounded corners in desktop apps](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/ui/apply-rounded-corners).
+
 ## Migration gates
 
 1. **Host viability:** Windows compilation, Island activation, show/hide, transparency behavior, DPI, multimonitor placement, nonactivation and clean unloading.
