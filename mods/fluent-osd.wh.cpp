@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.2
+// @version         1.0.3
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,14 +20,16 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.2)
+## XAML migration experiment (v1.0.3)
 
-Branch-only, opt-in XAML volume backend. It routes **plain horizontal
-volume events** through a dedicated STA XAML Island while keeping the
-existing HardwareConfirmator hooks and Core Audio event data. Media,
-mixer, vertical, multi-monitor mirror modes and failed XAML activation
-fall back to GDI+. The XAML view is initially noninteractive and does
-not yet implement full animation, layout or opacity parity.
+Branch-only, opt-in XAML volume backend. Every native volume event is
+routed to the separate STA XAML Island when enabled. Other OSD categories
+still use GDI+; disabling the XAML switch restores the original GDI+
+volume renderer. **No GDI+ fallback occurs for volume events while XAML
+is enabled:** initialization/render failures are logged and may result in
+no volume popup. Media, mixer, vertical-layout and multi-monitor mirror
+settings are not yet implemented in the XAML view. The XAML view is
+noninteractive and does not yet have full animation, layout or opacity parity.
 
 ## Features
 
@@ -127,10 +129,10 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
           $description: The only switch that enables the custom Windows volume indicator. Media card, mixer arrow, and vertical layout only customize it and never enable it implicitly.
           $description:zh-TW: 只有此開關會啟用自訂 Windows 音量提示。媒體卡片、混音器箭頭及垂直版面只調整外觀，不會間接啟用音量 OSD。
         - experimentalXamlVolume: false
-          $name: Experimental XAML volume backend (horizontal only)
-          $name:zh-TW: 實驗性 XAML 音量後端（僅水平布局）
-          $description: Opt-in XAML Island for plain horizontal volume. SMTC, mixer, vertical, mirrored and unavailable XAML fall back to GDI+. Does not enable custom volume itself.
-          $description:zh-TW: 純水平音量 OSD 可選用 XAML Island；SMTC、Mixer、垂直、鏡像或無法啟用 XAML 時使用 GDI+。不會自行啟用音量 OSD。
+          $name: Experimental XAML volume renderer (no fallback)
+          $name:zh-TW: 實驗性 XAML 音量渲染器（不回退）
+          $description: Route all enabled custom volume events to XAML. An unavailable/failed XAML renderer shows no volume popup, rather than silently falling back to GDI+. Other OSD types stay unchanged. Does not enable custom volume itself.
+          $description:zh-TW: 所有已啟用的自訂音量事件只走 XAML；XAML 未就緒或失敗時不顯示音量 OSD，不會默默切回 GDI+。其他提示類型不變，且不會自行啟用音量 OSD。
         - showCustomBrightness: false
           $name: Show custom Windows brightness OSD
           $name:zh-TW: 顯示自訂 Windows 亮度 OSD
@@ -6901,16 +6903,29 @@ void ShowNativeVolumePopup() {
     BrightnessEvent ev{};
     MovePopupToDisplay(ev);
 
-    // First migration slice: only the simple, horizontal, single-display
-    // native-volume event. Leave SMTC, Mixer, vertical UI, mirror mode and
-    // all interactive controls on the fully functional GDI+ backend.
-    const bool tryXaml = g_experimentalXamlVolume.load() &&
-        !g_verticalVolumeBrightness.load() &&
-        !g_showSmtcOnVolume.load() && !g_showMixerArrow.load() &&
-        g_displayOutputMode.load() != 3 && g_nativePercentKnown &&
-        !g_closing.load();
-    RECT target{};
-    if (tryXaml && g_popupWnd && GetWindowRect(g_popupWnd, &target)) {
+    // Deliberately no fallback in this test branch: when XAML is selected,
+    // every native volume event is a XAML-only test even if the XAML backend
+    // is unavailable, or media/mixer/vertical presentation is unsupported.
+    if (g_experimentalXamlVolume.load()) {
+        // Always clear the previously painted GDI+ volume/panel surfaces,
+        // even when XAML startup or event delivery fails.
+        ClosePanel();
+        if (g_popupWnd) {
+            KillTimer(g_popupWnd, kHideTimer);
+            KillTimer(g_popupWnd, kFadeTimer);
+            KillTimer(g_popupWnd, kMediaAnimationTimer);
+            g_fadeActive = false;
+            ShowWindow(g_popupWnd, SW_HIDE);
+        }
+        if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
+        UpdateArrowHitWindow();
+        UpdateSpeakerHitWindow();
+
+        RECT target{};
+        if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
+            Wh_Log(L"Fluent OSD v1.0.3: XAML volume not delivered (missing anchor HWND)");
+            return;
+        }
         const bool light = IsLightTheme();
         xaml_volume::Snapshot data;
         data.percent = g_nativePercent;
@@ -6922,26 +6937,22 @@ void ShowNativeVolumePopup() {
         data.text = OsdTextRgb(light);
         data.accent = OsdAccentRgb();
         data.track = OsdTrackRgb(light);
+
+        static bool loggedXamlRouting = false; // Existing UI thread only.
+        static bool loggedXamlUnavailable = false;
         if (xaml_volume::Show(data)) {
-            static bool loggedXamlRouting = false; // Existing UI thread only.
             if (!loggedXamlRouting) {
-                Wh_Log(L"Fluent OSD v1.0.2: native volume -> XAML backend");
+                Wh_Log(L"Fluent OSD v1.0.3: native volume -> XAML only");
                 loggedXamlRouting = true;
             }
-            // Do not render two copies of the same OSD. Keep native hooks
-            // and Core Audio state unchanged; only presentation is swapped.
-            ClosePanel();
-            KillTimer(g_popupWnd, kHideTimer);
-            KillTimer(g_popupWnd, kFadeTimer);
-            g_fadeActive = false;
-            ShowWindow(g_popupWnd, SW_HIDE);
-            if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
-            UpdateArrowHitWindow();
-            UpdateSpeakerHitWindow();
-            return;
+            loggedXamlUnavailable = false;
+        } else if (!loggedXamlUnavailable) {
+            Wh_Log(L"Fluent OSD v1.0.3: XAML volume unavailable; NO GDI+ fallback");
+            loggedXamlUnavailable = true;
         }
+        return;
     }
-    // Startup, XAML activation failure, or unsupported layout: GDI+.
+    // Original volume GDI+ renderer is used ONLY when XAML was disabled.
     SetPopupInteractive(false);
     ShowPopupAnimated();
     UpdateArrowHitWindow();
@@ -7876,7 +7887,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.2 (XAML experimental) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.3 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
