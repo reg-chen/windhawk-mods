@@ -403,14 +403,6 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
           #! $min: 10
           #! $max: 24
           #! $format: slider
-        - ddcIconStrokeWidth: 2
-          $name: Vertical OSD icon stroke width (logical px)
-          $name:zh-TW: 垂直 OSD 圖示線條粗細（邏輯像素）
-          $description: One stroke width is shared by both icon types, independent of speaker volume level.
-          $description:zh-TW: 兩類圖示共用線條粗細設定，不受喇叭音量大小影響。
-          #! $min: 1
-          #! $max: 3
-          #! $format: slider
         - ddcShowSun: true
           $name: Show sun icon
           $name:zh-TW: 顯示太陽圖示
@@ -3775,17 +3767,11 @@ constexpr UINT_PTR kDdcBatchTimer = 324;
 constexpr UINT kDdcBatchDelayMs = 90;
 constexpr UINT_PTR kMediaAnimationTimer = 323;
 constexpr UINT kMediaAnimationIntervalMs = 100;
-constexpr ULONGLONG kMediaFeedbackMs = 240;
 constexpr ULONGLONG kMediaRefreshIntervalMs = 3000;
 constexpr UINT kBrightnessWheelResultMessage = WM_APP + 326;
 constexpr UINT kBluetoothQueueMessage = WM_APP + 327;
 constexpr UINT kBluetoothConfigMessage = WM_APP + 328;
 constexpr int kMaxMixerOutputDevices = 64;
-constexpr float kOutputPickerTop = 10.0f;
-constexpr float kOutputPickerHeight = 28.0f;
-constexpr float kOutputPickerMenuTop = 42.0f;
-constexpr float kOutputPickerRowHeight = 30.0f;
-constexpr int kOutputPickerMaxRows = 4;
 constexpr int kWheelStepPercent = osd_input::kWheelStepPercent; // Shared with XAML.
 constexpr UINT kNativeOsdMessage = WM_APP + 320;
 constexpr UINT kMediaUpdateMessage = WM_APP + 321;
@@ -3862,29 +3848,11 @@ constexpr DWORD kMaxVcpValue = 0xFFFF;
 // USB, Bluetooth, network and text-only clipboard notices.
 constexpr float kStatusNoticeWidth = 296.0f;
 constexpr float kStatusNoticeHeight = 92.0f;
-constexpr float kStatusIconX = 18.0f;
-constexpr float kStatusIconY = 19.0f;
-constexpr float kStatusIconSize = 52.0f;
-constexpr float kStatusTextX = 84.0f;
 constexpr float kClipboardImageCanvasW = 264.0f;
 constexpr float kClipboardImageCanvasH = 224.0f;
 constexpr float kClipboardImageMaxW = 224.0f;
 constexpr float kClipboardImageMaxH = 164.0f;
-constexpr float kMixerRowStep = 30.0f;
-constexpr float kMixerFirstRowY = 45.0f;
-constexpr float kMixerTrackStart = 62.0f;
-constexpr float kMixerTrackLength = 216.0f;
-constexpr float kMixerTrackHeight = 7.0f;
 constexpr int kLockVk[4] = {VK_CAPITAL, VK_NUMLOCK, VK_SCROLL, VK_INSERT};
-constexpr int kLogicalWidth = 380;
-constexpr int kLogicalHeight = 72;
-constexpr float kHorizontalArrowRadius = 12.5f;
-constexpr float kVerticalArrowRadius = 11.5f;
-constexpr float kArrowHitDiameter = 30.0f;
-// Minimum clear gaps between SMTC transport and auxiliary button surfaces.
-constexpr float kMediaExtraGroupGap = 10.0f;
-constexpr float kMediaExtraStackGap = 8.0f;
-constexpr float kTau = 6.28318530718f;
 
 // --- Stable setting key tables (same ordinal as their state arrays) ---
 constexpr PCWSTR kNativeHideSettingKeys[] = {
@@ -4106,7 +4074,6 @@ std::atomic<int> g_globalDurationMs{3000};
 std::atomic<bool> g_individualDurations{false};
 std::atomic<int> g_durationOverrides[static_cast<int>(DurationKind::Count)]{};
 // Only the dedicated OSD UI thread reads/writes this current category.
-DurationKind g_activeDurationKind = DurationKind::Volume;
 
 std::atomic<int> g_ddcTheme{0};
 std::atomic<int> g_ddcSizePercent{75};
@@ -4157,7 +4124,6 @@ std::atomic<int> g_backgroundOpacity{96};
 std::atomic<int> g_cornerRadius{17};
 std::atomic<int> g_fontSize{15};
 std::atomic<int> g_iconSize{16};
-std::atomic<int> g_iconStrokeWidth{2};
 std::atomic<bool> g_showSun{true};
 std::atomic<bool> g_showValue{true};
 // 0=source, 1=primary, 2=selected DISPLAYn, 3=all screens
@@ -4197,8 +4163,6 @@ struct NoticeBatch {
 };
 NoticeBatch g_noticeBatch;
 std::vector<std::wstring> g_noticeDetails;
-int g_noticeScroll = 0;
-bool g_noticeClickable = false;
 std::unordered_map<std::wstring, std::wstring> g_usbNames;
 struct NetInterfaceState { std::wstring name; bool connected = false; };
 std::unordered_map<std::string, NetInterfaceState> g_networkInterfaces;
@@ -4206,8 +4170,6 @@ std::unordered_map<std::string, NetInterfaceState> g_networkInterfaces;
 // Owned thumbnail, created only when the user enables clipboard previews.
 // Its dimensions are bounded before display; never store clipboard data.
 HBITMAP g_clipboardThumbnail = nullptr;
-DWORD g_usbLastEvent = 0;
-WPARAM g_usbLastEventType = 0;
 
 // The SMTC worker never touches HWND/GDI+/CoreAudio objects directly.
 struct MediaSnapshot {
@@ -4359,8 +4321,6 @@ NativeEventInfo g_nativeEventCurrent;         // UI thread only
 int g_nativePercent = 0;                        // UI thread only
 bool g_nativePercentKnown = false;              // UI thread only
 bool g_nativeMuted = false;                     // UI thread only
-int g_width = kLogicalWidth;
-int g_height = kLogicalHeight;
 
 // ============================================================
 // Shared helpers: localization, settings, UI state and geometry
@@ -4464,18 +4424,6 @@ void LoadBoolSettings(std::atomic<bool> (&target)[N],
         target[i].store(Wh_GetIntSetting(keys[i]) != 0);
 }
 
-// Preserve 32-bit top-down BI_RGB backing storage for premultiplied BGRA.
-HBITMAP CreateArgbDib(HDC screen, int width, int height, void** pixels) {
-    BITMAPINFO bitmapInfo{};
-    bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
-    bitmapInfo.bmiHeader.biWidth = width;
-    bitmapInfo.bmiHeader.biHeight = -height;
-    bitmapInfo.bmiHeader.biPlanes = 1;
-    bitmapInfo.bmiHeader.biBitCount = 32;
-    bitmapInfo.bmiHeader.biCompression = BI_RGB;
-    return CreateDIBSection(screen, &bitmapInfo, DIB_RGB_COLORS,
-                            pixels, nullptr, 0);
-}
 
 BYTE OsdBackgroundAlpha() {
     return static_cast<BYTE>((g_backgroundOpacity.load() * 255 + 50) / 100);
@@ -4490,20 +4438,6 @@ float MainLogicalWidth() {
 float MainLogicalHeight() {
     return static_cast<float>(g_verticalVolumeBrightness.load()
         ? g_verticalOsdHeight.load() : g_horizontalOsdHeight.load());
-}
-float MainCenterY() { return MainLogicalHeight() / 2.0f - 2.0f; }
-float HorizontalChevronX() { return MainLogicalWidth() - 33.0f; }
-float HorizontalChevronY() { return MainCenterY(); }
-float VerticalChevronX() { return MainLogicalWidth() / 2.0f; }
-float VerticalChevronY() { return MainLogicalHeight() - 25.0f; }
-FlyoutDirection InverseDirection(FlyoutDirection dir) {
-    switch (dir) {
-        case FlyoutDirection::Left: return FlyoutDirection::Right;
-        case FlyoutDirection::Right: return FlyoutDirection::Left;
-        case FlyoutDirection::Up: return FlyoutDirection::Down;
-        case FlyoutDirection::Down: return FlyoutDirection::Up;
-    }
-    return FlyoutDirection::Right;
 }
 bool PositionIsTop(int pos) {
     return pos == 3 || pos == 5 || pos == 6;
@@ -4698,7 +4632,6 @@ void LoadSettings() {
     g_cornerRadius.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcCornerRadius"), 0, 34));
     g_fontSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcFontSize"), 10, 24));
     g_iconSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcIconSize"), 10, 24));
-    g_iconStrokeWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcIconStrokeWidth"), 1, 3));
     g_showSun.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowSun") != 0);
     g_showValue.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowValue") != 0);
     PCWSTR outputMode = Wh_GetStringSetting(L"CustomOSD.Layout.displayOutputMode");
@@ -5347,13 +5280,8 @@ bool ToggleDefaultAudioMute() {
     return true;
 }
 
-// Draws independently constructed Fluent-style outline symbols in one shared
-// 20 x 20 coordinate space. Both symbols use the same size, stroke width and
-// visual anchor. Speaker detail follows the current volume level; both
-// symbols are locally drawn vector paths, with no external glyph assets.
-// ============================================================
-// Shared vector drawing and main OSD painters
-// ============================================================
+// Clipboard image acquisition uses an ephemeral Win32 HBITMAP. Only
+// bounded pixel bytes cross to the XAML STA renderer.
 void ClearClipboardThumbnail() {
     if (g_clipboardThumbnail) {
         DeleteObject(g_clipboardThumbnail);
@@ -5395,8 +5323,6 @@ void FlushNoticeBatch() {
     g_noticeBatch = NoticeBatch{};
     if (batch.names.empty()) return;
     g_noticeDetails = batch.names;
-    g_noticeScroll = 0;
-    g_noticeClickable = batch.names.size() > 1;
     std::wstring title;
     std::wstring body;
     if (batch.names.size() == 1) {
@@ -5497,9 +5423,7 @@ void ProcessClipboard() {
     }
     CloseClipboard();
     ClearClipboardThumbnail();
-    g_noticeClickable = false;
     g_noticeDetails.clear();
-    g_noticeScroll = 0;
     g_clipboardThumbnail = newThumbnail;
     ShowNotice(std::move(title), std::move(body), DurationKind::Clipboard,
                NoticeIcon::Clipboard);
@@ -6077,8 +6001,6 @@ void MovePopupToDisplay(const BrightnessEvent& ev) {
     }
     osd_placement::Publish(place);
     g_scale = place.scale;
-    g_width = place.width;
-    g_height = place.height;
     // XAML owns the visible HWND; this adapter publishes owned geometry.
 }
 
@@ -6306,7 +6228,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
     }
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.28: DDC batch not delivered; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.28: DDC batch not delivered");
     return ok;
 }
 
@@ -7279,7 +7201,7 @@ void ToggleMixerMute(int index) {
 }
 
 // ============================================================
-// Expanded media/mixer/details panel rendering
+// Lock key hook and XAML-only category routing
 // ============================================================
 LRESULT CALLBACK LockKeyProc(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && lp) {
@@ -7302,9 +7224,7 @@ LRESULT CALLBACK LockKeyProc(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(g_lockHook, code, wp, lp);
 }
 
-// The main layered OSD remains mouse-transparent. A dedicated, nearly
-// invisible hit window covers only the visible mixer button, keeping the
-// rest of the popup click-through and free of focus changes.
+// XAML Island controls all pointer input; no detached hit HWND is needed.
 void ShowMigratedXamlLevel(PopupKind kind) {
     const bool brightness = kind == PopupKind::NativeBrightness;
     if(!brightness&&g_showSmtcOnVolume.load()&&
@@ -7649,8 +7569,7 @@ osd_model::MediaModel BuildXamlMediaModel() {
     }
     return m;
 }
-// Existing panel attachment/monitor geometry is shared with GDI+,
-// but neither XAML Island queries a GDI HWND for its position.
+// Controller-owned monitor and panel geometry; no renderer HWND lookup.
 bool BuildAttachedPanelAnchors(
         RECT& main, RECT& panel, float scale, bool isMedia) {
     if (!osd_placement::CurrentAnchor(main)) return false;
@@ -7731,7 +7650,7 @@ bool ShowXamlMediaPanel(bool passiveRefresh) {
     media.passiveRefresh=passiveRefresh;
     media.media=BuildXamlMediaModel();
     if(!ShowXamlMirroredBatch({volume,media})) {
-        Wh_Log(L"XAML SMTC: panel unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML SMTC: panel unavailable");
         ResetXamlMediaController();
         return false;
     }
@@ -7764,7 +7683,7 @@ void ShowXamlMixerPanel() {
     mixer.mixerChevron = false;
     mixer.mixer = BuildMixerModel();
     if (!ShowXamlMirroredBatch({volume, mixer})) {
-        Wh_Log(L"XAML Mixer: panel unavailable; no GDI+ fallback");
+        Wh_Log(L"XAML Mixer: panel unavailable");
         ResetXamlMixerController();
     }
 }
@@ -8087,14 +8006,9 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == kMediaUpdateMessage && hwnd == g_receiveWnd) {
-        const std::wstring previousSource = g_mediaCurrent.sourceId;
-        const uint32_t previousSelection = g_mediaCurrent.selectionSerial;
         AcquireSRWLockShared(&g_mediaLock);
         g_mediaCurrent = g_mediaPending;
         ReleaseSRWLockShared(&g_mediaLock);
-        if (previousSource != g_mediaCurrent.sourceId ||
-            previousSelection != g_mediaCurrent.selectionSerial) {
-        }
         g_mediaLastRefreshTick = GetTickCount64();
         if (g_popupKind == PopupKind::NativeVolume &&
             !g_xamlMixerOpen && xaml_osd::IsPrimaryVisible()) {
