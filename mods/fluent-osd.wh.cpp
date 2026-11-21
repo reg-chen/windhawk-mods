@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.32
+// @version         1.0.33
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML-only renderer (v1.0.32)
+## XAML-only renderer (v1.0.33)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -2377,7 +2377,7 @@ bool ShouldFallback(const BrushSpec& spec) {
         L"EnableTransparency", RRF_RT_REG_DWORD, nullptr,
         &enabled, &size) == ERROR_SUCCESS && enabled == 0;
 }
-class OsdBlurBrush final : public media::XamlCompositionBrushBaseT<OsdBlurBrush> {
+class OsdBlurBrush : public media::XamlCompositionBrushBaseT<OsdBlurBrush> {
 public:
     OsdBlurBrush(wx::UIElement const& owner, BrushSpec settings)
         : compositor(hosting::ElementCompositionPreview::GetElementVisual(
@@ -3304,7 +3304,7 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
     if (!SetWindowPos(state.host, HWND_TOPMOST,
                        placed.x, placed.y, placed.width, placed.height,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.32: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.33: show failed (%lu)", GetLastError());
         return;
     }
     if (!wasVisible) {
@@ -4631,13 +4631,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.32: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.33: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.32: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.33: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
@@ -4959,7 +4959,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     // Island; the XAML Border provides the only visible card background.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
-    Wh_Log(L"XAML v1.0.32: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+    Wh_Log(L"XAML v1.0.33: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
         static_cast<unsigned long>(rounded),
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
@@ -5026,7 +5026,7 @@ void CloseSurface(State& state) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.32: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.33: island close failed"); }
         state.source = nullptr;
     }
     state.island = nullptr;
@@ -5074,7 +5074,7 @@ void DeliverPending(State& root) {
             peer->viewOnly = readOnly;
             try { CreateSurface(*peer, GetModuleHandleW(nullptr)); }
             catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.32: peer create failed 0x%08lX",
+                Wh_Log(L"XAML v1.0.33: peer create failed 0x%08lX",
                     static_cast<unsigned long>(ex.code()));
                 CloseSurface(*peer);
                 return nullptr;
@@ -5121,7 +5121,7 @@ void TryEnableIslandTransparency() {
     try {
         auto currentWindow = wx::Window::Current();
         if (!currentWindow) {
-            Wh_Log(L"XAML v1.0.32: Window.Current unavailable for transparency");
+            Wh_Log(L"XAML v1.0.33: Window.Current unavailable for transparency");
             return;
         }
         ComPtr<IXamlSourceTransparency> transparency;
@@ -5130,10 +5130,10 @@ void TryEnableIslandTransparency() {
             reinterpret_cast<void**>(transparency.GetAddressOf()));
         if (SUCCEEDED(hr) && transparency)
             hr = transparency->put_IsBackgroundTransparent(1);
-        Wh_Log(L"XAML v1.0.32: Island transparency HRESULT=0x%08lX",
+        Wh_Log(L"XAML v1.0.33: Island transparency HRESULT=0x%08lX",
             static_cast<unsigned long>(hr));
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.32: transparency initialization exception 0x%08lX",
+        Wh_Log(L"XAML v1.0.33: transparency initialization exception 0x%08lX",
             static_cast<unsigned long>(ex.code()));
     }
 }
@@ -5166,7 +5166,7 @@ DWORD WINAPI ThreadProc(void*) {
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.32: renderer ready (per-display DDC)");
+                Wh_Log(L"XAML v1.0.33: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -5175,11 +5175,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.32: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.33: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.32: unexpected startup exception");
+        Wh_Log(L"XAML v1.0.33: unexpected startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -5195,7 +5195,7 @@ DWORD WINAPI ThreadProc(void*) {
     CloseSurface(root);
     if (root.manager) {
         try { root.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.32: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.33: manager close failed"); }
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
@@ -5209,7 +5209,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.32: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.33: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -7724,7 +7724,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
                 FindMonitorByDeviceName(target.event.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
-                Wh_Log(L"XAML v1.0.32: unresolved DDC display '%s'",
+                Wh_Log(L"XAML v1.0.33: unresolved DDC display '%s'",
                        target.event.device);
                 continue;
             }
@@ -7737,13 +7737,13 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
             push(master, anchor, g_scale);
     }
     if (batch.empty()) {
-        Wh_Log(L"XAML v1.0.32: no resolvable DDC snapshots");
+        Wh_Log(L"XAML v1.0.33: no resolvable DDC snapshots");
         xaml_osd::Hide();
         return false;
     }
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.32: DDC batch not delivered");
+        Wh_Log(L"XAML v1.0.33: DDC batch not delivered");
     return ok;
 }
 
@@ -8784,7 +8784,7 @@ void ShowMigratedXamlLockStatus() {
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.32: lock status missing placement anchor");
+        Wh_Log(L"XAML v1.0.33: lock status missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -8795,7 +8795,7 @@ void ShowMigratedXamlLockStatus() {
         ? Tr(OsdText::On) : Tr(OsdText::Off);
     snapshot.statusActive = g_lastLockValue;
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.32: lock status unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.33: lock status unavailable; NO GDI+ fallback");
 }
 
 // Entire USB/Bluetooth/network category: single-item notifications and
@@ -8806,7 +8806,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.32: device notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.33: device notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -8824,7 +8824,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
         default: return;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.32: device notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.33: device notice unavailable; NO GDI+ fallback");
 }
 
 // A native system event already has one immutable display payload; use
@@ -8834,7 +8834,7 @@ void ShowMigratedXamlNativeEvent() {
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.32: native event missing placement anchor");
+        Wh_Log(L"XAML v1.0.33: native event missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -8892,7 +8892,7 @@ void ShowMigratedXamlNativeEvent() {
             return;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.32: native event unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.33: native event unavailable; NO GDI+ fallback");
 }
 
 // Convert the already-downscaled clipboard HBITMAP into a private, bounded
@@ -8940,7 +8940,7 @@ void ShowMigratedXamlClipboardNotice() {
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         ClearClipboardThumbnail();
-        Wh_Log(L"XAML v1.0.32: clipboard notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.33: clipboard notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -8965,7 +8965,7 @@ void ShowMigratedXamlClipboardNotice() {
         snapshot.scale = g_scale;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.32: clipboard notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.33: clipboard notice unavailable; NO GDI+ fallback");
 }
 
 
@@ -9578,7 +9578,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (target != g_ddcTargets.end())
                     target->event.value = write.previousValue;
                 if (master) g_visible.value = write.previousValue;
-                Wh_Log(L"XAML v1.0.32: DDC write failed for '%s' index %lu",
+                Wh_Log(L"XAML v1.0.33: DDC write failed for '%s' index %lu",
                     write.event.device, write.event.physicalIndex);
                 if (g_popupKind == PopupKind::DdcBrightness)
                     (void)ShowXamlDdcTargets(g_visible);
