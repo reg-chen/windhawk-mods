@@ -1,9 +1,9 @@
 // ==WindhawkMod==
 // @id              fluent-osd-xaml
-// @name            Fluent OSD (XAML Experimental)
+// @name            Fluent OSD (XAML)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.27
+// @version         1.0.28
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.27)
+## XAML-only renderer (v1.0.28)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -31,7 +31,7 @@ merging the renderer back into the production branch.
 
 Branch-only native XAML Island renderer for migrated categories:
 **system volume, native brightness, per-target DDC/CI brightness, lock-key status, USB/Bluetooth/network details, native system status, clipboard text/file/image notices, and interactive Mixer (per-app sliders, mute and output selection)**.
-The existing XAML toggle selects the migrated renderer (no GDI+ fallback).
+Every supported OSD category renders through XAML; there is no renderer toggle.
 Opacity inherits the original background-opacity setting; Native XAML pointer gestures
 relay clicks/drags/wheels to the existing audio and brightness
 workers. DDC targets have independent XAML hosts and their original
@@ -49,7 +49,7 @@ passing GDI handles to the XAML thread. Mixer now has its own attached
 XAML Island and shares the existing Core Audio controller via typed commands.
 SMTC now has a paired native XAML Island; its MTA worker stays independent
 from view drawing. Commands return to the original Explorer controller.
-Legacy GDI+ is available only when experimental XAML is explicitly off.
+The message-only event receiver and media/brightness workers are independent of the XAML STA renderer.
 
 ## Features
 
@@ -148,11 +148,6 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
           $name:zh-TW: 顯示自訂 Windows 音量 OSD
           $description: The only switch that enables the custom Windows volume indicator. Media card, mixer arrow, and vertical layout only customize it and never enable it implicitly.
           $description:zh-TW: 只有此開關會啟用自訂 Windows 音量提示。媒體卡片、混音器箭頭及垂直版面只調整外觀，不會間接啟用音量 OSD。
-        - experimentalXamlVolume: false
-          $name: Experimental XAML renderer for migrated OSDs (no fallback)
-          $name:zh-TW: XAML 已遷移提示渲染開關（不回退）
-          $description: Enables XAML volume, brightness, lock keys, system/device/clipboard notices, Mixer and SMTC. No GDI+ fallback for migrated categories.
-          $description:zh-TW: 音量、亮度、鎖定鍵、系統／裝置／剪貼簿通知、混音器與 SMTC 使用 XAML，已遷移類別不回退 GDI+。
         - showCustomBrightness: false
           $name: Show custom Windows brightness OSD
           $name:zh-TW: 顯示自訂 Windows 亮度 OSD
@@ -1901,7 +1896,7 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
     if (!SetWindowPos(state.host, HWND_TOPMOST,
                        placed.x, placed.y, placed.width, placed.height,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.27: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.28: show failed (%lu)", GetLastError());
         return;
     }
     if (!wasVisible) {
@@ -3160,13 +3155,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.27: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.28: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.27: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.28: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
@@ -3488,7 +3483,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     // Island; the XAML Border provides the only visible card background.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
-    Wh_Log(L"XAML v1.0.27: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+    Wh_Log(L"XAML v1.0.28: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
         static_cast<unsigned long>(rounded),
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
@@ -3549,7 +3544,7 @@ void CloseSurface(State& state) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.27: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.28: island close failed"); }
         state.source = nullptr;
     }
     state.island = nullptr;
@@ -3597,7 +3592,7 @@ void DeliverPending(State& root) {
             peer->viewOnly = readOnly;
             try { CreateSurface(*peer, GetModuleHandleW(nullptr)); }
             catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.27: peer create failed 0x%08lX",
+                Wh_Log(L"XAML v1.0.28: peer create failed 0x%08lX",
                     static_cast<unsigned long>(ex.code()));
                 CloseSurface(*peer);
                 return nullptr;
@@ -3644,7 +3639,7 @@ void TryEnableIslandTransparency() {
     try {
         auto currentWindow = wx::Window::Current();
         if (!currentWindow) {
-            Wh_Log(L"XAML v1.0.27: Window.Current unavailable for transparency");
+            Wh_Log(L"XAML v1.0.28: Window.Current unavailable for transparency");
             return;
         }
         ComPtr<IXamlSourceTransparency> transparency;
@@ -3653,10 +3648,10 @@ void TryEnableIslandTransparency() {
             reinterpret_cast<void**>(transparency.GetAddressOf()));
         if (SUCCEEDED(hr) && transparency)
             hr = transparency->put_IsBackgroundTransparent(1);
-        Wh_Log(L"XAML v1.0.27: Island transparency HRESULT=0x%08lX",
+        Wh_Log(L"XAML v1.0.28: Island transparency HRESULT=0x%08lX",
             static_cast<unsigned long>(hr));
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.27: transparency initialization exception 0x%08lX",
+        Wh_Log(L"XAML v1.0.28: transparency initialization exception 0x%08lX",
             static_cast<unsigned long>(ex.code()));
     }
 }
@@ -3689,7 +3684,7 @@ DWORD WINAPI ThreadProc(void*) {
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.27: renderer ready (per-display DDC)");
+                Wh_Log(L"XAML v1.0.28: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -3698,11 +3693,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.27: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.28: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.27: unexpected startup exception");
+        Wh_Log(L"XAML v1.0.28: unexpected startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -3718,7 +3713,7 @@ DWORD WINAPI ThreadProc(void*) {
     CloseSurface(root);
     if (root.manager) {
         try { root.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.27: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.28: manager close failed"); }
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
@@ -3732,7 +3727,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.27: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.28: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -4103,7 +4098,6 @@ std::atomic<int> g_displayLanguage{0}; // 0=Auto, 1=English, 2=zh-TW
 std::atomic<bool> g_hideAllNativeOsd{false};
 std::atomic<bool> g_hide[static_cast<int>(Kind::Count)]{};
 std::atomic<bool> g_showCustomNative[static_cast<int>(Kind::Count)]{};
-std::atomic<bool> g_xamlForMigrated{false};
 std::atomic<bool> g_showDdcBrightness{false};
 std::atomic<bool> g_verticalVolumeBrightness{true};
 std::atomic<bool> g_fromExplorer{true};
@@ -4772,8 +4766,6 @@ void LoadSettings() {
         Wh_GetIntSetting(L"NativeHide.hideAllNativeOsd") != 0);
     LoadBoolSettings(g_hide, kNativeHideSettingKeys);
     LoadBoolSettings(g_showCustomNative, kCustomNativeSettingKeys);
-    g_xamlForMigrated.store(
-        Wh_GetIntSetting(L"CustomOSD.Switches.experimentalXamlVolume") != 0);
     g_showDdcBrightness.store(Wh_GetIntSetting(L"CustomOSD.Switches.showDdcBrightness") != 0);
     g_verticalVolumeBrightness.store(Wh_GetIntSetting(L"CustomOSD.Layout.verticalVolumeBrightness") != 0);
     g_fromExplorer.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromExplorer") != 0);
@@ -6224,35 +6216,21 @@ void FlushNoticeBatch() {
 
 void ShowNotice(std::wstring title, std::wstring body, DurationKind kind,
                 NoticeIcon icon) {
-    if (g_closing || !g_popupWnd) return;
+    if (g_closing.load() || !g_receiveWnd) return;
     if (kind != DurationKind::Clipboard) ClearClipboardThumbnail();
-    ClosePanel();
     g_popupKind = PopupKind::Notification;
     g_noticeTitle = std::move(title);
     g_noticeBody = std::move(body);
     g_noticeIcon = icon;
-    BrightnessEvent ev{};
-    MovePopupToDisplay(ev);
-    // Every USB/Bluetooth/network notice, including a multi-device batch,
-    // is now native XAML when selected. Never revert interactive details
-    // to GDI+ because a notice has multiple device names.
-    if (g_xamlForMigrated.load()) {
-        if (icon == NoticeIcon::Clipboard) {
-            ShowMigratedXamlClipboardNotice();
-            return;
-        }
-        if (icon == NoticeIcon::Usb || icon == NoticeIcon::Bluetooth ||
-            icon == NoticeIcon::Network) {
-            ShowMigratedXamlDeviceNotice(kind);
-            return;
-        }
-    }
-    SetNoticeHitTesting(g_noticeClickable);
-    ShowPopupAnimated();
-    UpdateArrowHitWindow();
-    ResetHideTimerFor(kind);
+    BrightnessEvent event{};
+    MovePopupToDisplay(event);
+    if (icon == NoticeIcon::Clipboard)
+        ShowMigratedXamlClipboardNotice();
+    else
+        ShowMigratedXamlDeviceNotice(kind);
 }
 
+// ============================================================
 // ============================================================
 // Clipboard event processing
 // ============================================================
@@ -7156,7 +7134,7 @@ void RefreshMirrorOutputs(HMONITOR master) {
         g_popupKind == PopupKind::LockStatus ||
         g_popupKind == PopupKind::NativeEvent ||
         g_popupKind == PopupKind::Notification;
-    if (g_xamlForMigrated.load() && xamlPopup) {
+    if (xamlPopup) {
         DestroyMirroredWindows();
         return;
     }
@@ -7236,9 +7214,7 @@ void MovePopupToDisplay(const BrightnessEvent& ev) {
     g_scale = place.scale;
     g_width = place.width;
     g_height = place.height;
-    SetWindowPos(g_popupWnd, HWND_TOPMOST, place.bounds.left,
-        place.bounds.top, place.width, place.height, SWP_NOACTIVATE);
-    RefreshMirrorOutputs(monitor);
+    // XAML owns the visible HWND; this adapter publishes owned geometry.
 }
 
 // Reapply anchor placement only when opening/closing a panel changes the
@@ -7612,7 +7588,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
                 FindMonitorByDeviceName(target.event.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
-                Wh_Log(L"XAML v1.0.27: unresolved DDC display '%s'",
+                Wh_Log(L"XAML v1.0.28: unresolved DDC display '%s'",
                        target.event.device);
                 continue;
             }
@@ -7621,17 +7597,17 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
     } else {
         // Primary/selected output remains one card with the chosen event.
         RECT anchor{};
-        if (g_popupWnd && GetWindowRect(g_popupWnd, &anchor))
+        if (osd_placement::CurrentAnchor(anchor))
             push(master, anchor, g_scale);
     }
     if (batch.empty()) {
-        Wh_Log(L"XAML v1.0.27: no resolvable DDC snapshots");
+        Wh_Log(L"XAML v1.0.28: no resolvable DDC snapshots");
         xaml_osd::Hide();
         return false;
     }
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.27: DDC batch not delivered; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.28: DDC batch not delivered; NO GDI+ fallback");
     return ok;
 }
 
@@ -7737,20 +7713,12 @@ void DisplayDdcBatch() {
     }
     if (!masterChosen) return;
 
-    ClosePanel();
     g_visible = master;
     g_lastConfirmedDdcBrightness = master.value;
     g_popupKind = PopupKind::DdcBrightness;
     MovePopupToDisplay(master);
-    if (g_xamlForMigrated.load()) {
-        HideGdiLevelForXaml();
-        (void)ShowXamlDdcTargets(master);
-        return;
-    }
-    SetPopupInteractive(false);
-    ShowPopupAnimated();
-    UpdateArrowHitWindow();
-    ResetHideTimerFor(DurationKind::DdcBrightness);
+    HideGdiLevelForXaml();
+    (void)ShowXamlDdcTargets(master);
 }
 
 // ============================================================
@@ -8459,7 +8427,7 @@ void StopMixerOutputNotifications() {
 void ResetXamlMediaController() {
     if (!g_xamlMediaOpen) return;
     g_xamlMediaOpen=false;
-    if (g_popupWnd) KillTimer(g_popupWnd,kMediaAnimationTimer);
+    if (g_receiveWnd) KillTimer(g_receiveWnd,kMediaAnimationTimer);
     ++g_xamlMediaGeneration;
     if (!g_xamlMediaGeneration) ++g_xamlMediaGeneration;
 }
@@ -10063,7 +10031,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"Fluent OSD v1.0.27: XAML %s missing anchor",
+        Wh_Log(L"Fluent OSD v1.0.28: XAML %s missing anchor",
                brightness ? L"brightness" : L"volume");
         return;
     }
@@ -10079,13 +10047,13 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     const int index = brightness ? 1 : 0;
     if (ShowXamlMirrored(snapshot)) {
         if (!routeLogged[index]) {
-            Wh_Log(L"Fluent OSD v1.0.27: native %s -> XAML only",
+            Wh_Log(L"Fluent OSD v1.0.28: native %s -> XAML only",
                    brightness ? L"brightness" : L"volume");
             routeLogged[index] = true;
         }
         unavailableLogged[index] = false;
     } else if (!unavailableLogged[index]) {
-        Wh_Log(L"Fluent OSD v1.0.27: XAML %s unavailable; NO GDI+ fallback",
+        Wh_Log(L"Fluent OSD v1.0.28: XAML %s unavailable; NO GDI+ fallback",
                brightness ? L"brightness" : L"volume");
         unavailableLogged[index] = true;
     }
@@ -10098,7 +10066,7 @@ void ShowMigratedXamlLockStatus() {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.27: lock status missing placement anchor");
+        Wh_Log(L"XAML v1.0.28: lock status missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -10109,7 +10077,7 @@ void ShowMigratedXamlLockStatus() {
         ? Tr(OsdText::On) : Tr(OsdText::Off);
     snapshot.statusActive = g_lastLockValue;
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.27: lock status unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.28: lock status unavailable; NO GDI+ fallback");
 }
 
 // Entire USB/Bluetooth/network category: single-item notifications and
@@ -10120,7 +10088,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.27: device notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.28: device notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -10138,7 +10106,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
         default: return;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.27: device notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.28: device notice unavailable; NO GDI+ fallback");
 }
 
 // A native system event already has one immutable display payload; use
@@ -10148,7 +10116,7 @@ void ShowMigratedXamlNativeEvent() {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.27: native event missing placement anchor");
+        Wh_Log(L"XAML v1.0.28: native event missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -10206,7 +10174,7 @@ void ShowMigratedXamlNativeEvent() {
             return;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.27: native event unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.28: native event unavailable; NO GDI+ fallback");
 }
 
 // Convert the already-downscaled clipboard HBITMAP into a private, bounded
@@ -10254,7 +10222,7 @@ void ShowMigratedXamlClipboardNotice() {
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         ClearClipboardThumbnail();
-        Wh_Log(L"XAML v1.0.27: clipboard notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.28: clipboard notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -10279,7 +10247,7 @@ void ShowMigratedXamlClipboardNotice() {
         snapshot.scale = g_scale;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.27: clipboard notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.28: clipboard notice unavailable; NO GDI+ fallback");
 }
 
 
@@ -10485,8 +10453,8 @@ bool ShowXamlMediaPanel(bool passiveRefresh) {
         return false;
     }
     g_xamlMediaOpen=true;
-    if(g_popupWnd)
-        SetTimer(g_popupWnd,kMediaAnimationTimer,
+    if(g_receiveWnd)
+        SetTimer(g_receiveWnd,kMediaAnimationTimer,
                  kMediaAnimationIntervalMs,nullptr);
     return true;
 }
@@ -10519,59 +10487,11 @@ void ShowXamlMixerPanel() {
 }
 
 void ShowNativeVolumePopup() {
-    BrightnessEvent ev{};
-    MovePopupToDisplay(ev);
-    if (g_xamlForMigrated.load()) {
-        if(g_showSmtcOnVolume.load()&&!g_xamlMixerOpen) RequestMedia();
-        if (g_xamlMixerOpen) ShowXamlMixerPanel();
-        else ShowMigratedXamlLevel(PopupKind::NativeVolume);
-        return;
-    }
-    // Original volume GDI+ renderer is used ONLY when XAML was disabled.
-    SetPopupInteractive(false);
-    ShowPopupAnimated();
-    UpdateArrowHitWindow();
-    RequestMedia();
-    ShowVolumePanelIfReady();
-    ResetHideTimerFor(g_panelMode == PanelMode::Mixer
-        ? DurationKind::Interactive
-        : (g_showSmtcOnVolume.load() ? DurationKind::Media
-                                      : DurationKind::Volume));
-}
-
-void ActivateMixer() {
-    if (g_xamlForMigrated.load()) {
-        // A legacy arrow callback may still arrive while switching modes.
-        // Route it through the same renderer-neutral control command.
-        osd_model::Snapshot source;
-        source.kind = osd_model::Kind::Volume;
-        osd_control::Submit(
-            osd_control::Build(source, osd_control::Action::OpenMixer, 0),
-            g_receiveWnd);
-        return;
-    }
-    if (g_panelMode == PanelMode::Mixer) {
-        ClosePanel();
-        ShowVolumePanelIfReady();
-    } else {
-        ClosePanel();
-        g_panelMode = PanelMode::Mixer;
-        g_mixerScroll = 0;
-        RefreshMixer();
-        StartMixerOutputNotifications();
-        ShowPanel();
-    }
-    RenderPopup();  // The chevron reverses only while the mixer is expanded.
-    ResetHideTimerFor(DurationKind::Interactive);
-}
-
-
-void HandleMixerDrag(LPARAM lp) {
-    float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
-    float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
-    SetMixerSlider(x, y);
-    RenderPanel();
-    ResetHideTimerFor(DurationKind::Interactive);
+    BrightnessEvent event{};
+    MovePopupToDisplay(event);
+    if (g_showSmtcOnVolume.load() && !g_xamlMixerOpen) RequestMedia();
+    if (g_xamlMixerOpen) ShowXamlMixerPanel();
+    else ShowMigratedXamlLevel(PopupKind::NativeVolume);
 }
 
 // Imperative control boundary: returns refresh intents instead of drawing.
@@ -10762,7 +10682,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const auto commands = osd_control::Drain();
         // Event routing owns the active-backend policy; hardware execution
         // does not read an XAML feature flag or depend on renderer types.
-        if (g_xamlForMigrated.load()) {
+        {
             const auto effects = ApplyOsdCommands(commands);
             if (effects.mixer ||
                 (effects.volume && g_xamlMixerOpen)) {
@@ -10785,6 +10705,19 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (hwnd == g_receiveWnd && msg == WM_TIMER && wp == kDdcBatchTimer) {
         KillTimer(hwnd, kDdcBatchTimer);
         DisplayDdcBatch();
+        return 0;
+    }
+    if (hwnd == g_receiveWnd && msg == WM_TIMER &&
+        wp == kMediaAnimationTimer) {
+        if (!g_xamlMediaOpen || !xaml_osd::IsPrimaryVisible()) {
+            KillTimer(hwnd, kMediaAnimationTimer);
+            return 0;
+        }
+        const uint64_t now = GetTickCount64();
+        if (now - g_mediaLastRefreshTick >= kMediaRefreshIntervalMs) {
+            g_mediaLastRefreshTick = now;
+            RequestMedia();
+        }
         return 0;
     }
     if (hwnd == g_receiveWnd && msg == WM_CLIPBOARDUPDATE) {
@@ -10831,14 +10764,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_popupKind = PopupKind::NativeEvent;
         BrightnessEvent ev{};
         MovePopupToDisplay(ev);
-        if (g_xamlForMigrated.load()) {
-            ShowMigratedXamlNativeEvent();
-        } else {
-            SetPopupInteractive(false);
-            ShowPopupAnimated();
-            UpdateArrowHitWindow();
-            ResetHideTimerFor(DurationKind::NativeEvents);
-        }
+        ShowMigratedXamlNativeEvent();
         return 0;
     }
     if (msg == kNativeOsdMessage && hwnd == g_receiveWnd) {
@@ -10863,34 +10789,17 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             ShowNativeVolumePopup();
         } else {
-            // Brightness has joined volume in the migrated XAML categories.
-            // The XAML switch directly controls it, without any fallback.
-            if (g_xamlForMigrated.load()) {
-                BrightnessEvent ev{};
-                MovePopupToDisplay(ev);
-                ShowMigratedXamlLevel(PopupKind::NativeBrightness);
-            } else {
-                ClosePanel();
-                BrightnessEvent ev{};
-                MovePopupToDisplay(ev);
-                SetPopupInteractive(false);
-                ShowPopupAnimated();
-                UpdateArrowHitWindow();
-                ResetHideTimerFor(DurationKind::NativeBrightness);
-            }
+            BrightnessEvent ev{};
+            MovePopupToDisplay(ev);
+            ShowMigratedXamlLevel(PopupKind::NativeBrightness);
         }
         return 0;
     }
     if (msg == kAudioRefreshMessage && hwnd == g_receiveWnd) {
         if (g_mixerNotify) g_mixerNotify->ClearPending();
-        if (g_xamlForMigrated.load() && g_xamlMixerOpen &&
-            !g_closing.load()) {
+        if (g_xamlMixerOpen && !g_closing.load()) {
             RefreshMixer();
             ShowXamlMixerPanel();
-        } else if (g_panelMode == PanelMode::Mixer &&
-                   !g_closing.load()) {
-            RefreshMixer();
-            RenderPanel();
         }
         return 0;
     }
@@ -10902,24 +10811,10 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ReleaseSRWLockShared(&g_mediaLock);
         if (previousSource != g_mediaCurrent.sourceId ||
             previousSelection != g_mediaCurrent.selectionSerial) {
-            g_mediaSeeking = false;
-            g_mediaSeekHoldUntil = 0;
-            g_mediaFeedbackIndex = -1;
         }
         g_mediaLastRefreshTick = GetTickCount64();
-        if (!g_mediaSeeking && g_mediaSeekHoldUntil &&
-            g_mediaCurrent.hasTimeline &&
-            std::llabs(g_mediaCurrent.timelinePosition -
-                       g_mediaPreviewPosition) < 15000000LL)
-            g_mediaSeekHoldUntil = 0;
-        if(!g_xamlForMigrated.load()) {
-            UpdateMediaArtworkCache();
-            if(g_panelMode==PanelMode::Media&&g_panelWnd&&
-               IsWindowVisible(g_panelWnd)) RenderPanel();
-            if(g_popupKind==PopupKind::NativeVolume&&g_popupWnd&&
-               IsWindowVisible(g_popupWnd)) ShowVolumePanelIfReady();
-        } else if(g_popupKind==PopupKind::NativeVolume&&
-                  !g_xamlMixerOpen&&xaml_osd::IsPrimaryVisible()) {
+        if (g_popupKind == PopupKind::NativeVolume &&
+            !g_xamlMixerOpen && xaml_osd::IsPrimaryVisible()) {
             if(g_mediaCurrent.available&&g_showSmtcOnVolume.load())
                 (void)ShowXamlMediaPanel(true);
             else {
@@ -10938,21 +10833,14 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_popupKind = PopupKind::LockStatus;
         BrightnessEvent ev{};
         MovePopupToDisplay(ev);
-        if (g_xamlForMigrated.load()) {
-            ShowMigratedXamlLockStatus();
-        } else {
-            SetPopupInteractive(false);
-            ShowPopupAnimated();
-            UpdateArrowHitWindow();
-            ResetHideTimerFor(DurationKind::LockKeys);
-        }
+        ShowMigratedXamlLockStatus();
         return 0;
     }
     if (msg == kBrightnessWheelResultMessage && hwnd == g_receiveWnd) {
         const DWORD generation = static_cast<DWORD>(wp);
         const bool success = (lp & 1) != 0;
         const bool native = (lp & 2) != 0;
-        if (!native && g_xamlForMigrated.load()) {
+        if (!native) {
             const auto pending = std::find_if(
                 g_pendingDdcWrites.begin(),
                 g_pendingDdcWrites.end(),
@@ -10978,7 +10866,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (target != g_ddcTargets.end())
                     target->event.value = write.previousValue;
                 if (master) g_visible.value = write.previousValue;
-                Wh_Log(L"XAML v1.0.27: DDC write failed for '%s' index %lu",
+                Wh_Log(L"XAML v1.0.28: DDC write failed for '%s' index %lu",
                     write.event.device, write.event.physicalIndex);
                 if (g_popupKind == PopupKind::DdcBrightness)
                     (void)ShowXamlDdcTargets(g_visible);
@@ -10992,18 +10880,9 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (success) g_lastConfirmedNativeBrightness = g_nativePercent;
             else if (g_lastConfirmedNativeBrightness >= 0) {
                 g_nativePercent = g_lastConfirmedNativeBrightness;
-                if (g_xamlForMigrated.load() &&
-                    g_popupKind == PopupKind::NativeBrightness)
+                if (g_popupKind == PopupKind::NativeBrightness)
                     ShowMigratedXamlLevel(PopupKind::NativeBrightness);
-                else RenderPopup();
                 Wh_Log(L"Native brightness wheel write failed; restored value");
-            }
-        } else if (!g_xamlForMigrated.load()) {
-            if (success) g_lastConfirmedDdcBrightness = g_visible.value;
-            else {
-                g_visible.value = g_lastConfirmedDdcBrightness;
-                RenderPopup();
-                Wh_Log(L"DDC brightness wheel write failed; restored value");
             }
         }
         return 0;
@@ -11056,649 +10935,68 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DisplayDdcBatch(); // Timer allocation failure must not lose updates.
         return TRUE;
     }
-    if (msg == WM_TIMER && hwnd == g_popupWnd && wp == kHideTimer) {
-        if (g_mixerDrag || g_mainBarDragging || g_mixerOutputExpanded) return 0;
-        KillTimer(hwnd, kHideTimer);
-        BeginFade(true);
-        return 0;
-    }
-    if (msg == WM_TIMER && hwnd == g_popupWnd &&
-        wp == kMediaAnimationTimer) {
-        if(g_xamlForMigrated.load()) {
-            if(!g_xamlMediaOpen) {
-                KillTimer(hwnd,kMediaAnimationTimer);
-                return 0;
-            }
-            const uint64_t now=GetTickCount64();
-            if(now-g_mediaLastRefreshTick>=kMediaRefreshIntervalMs) {
-                g_mediaLastRefreshTick=now;
-                RequestMedia();
-            }
-            return 0;
-        }
-        if (g_panelMode != PanelMode::Media || !g_panelWnd ||
-            !IsWindowVisible(g_panelWnd)) {
-            KillTimer(hwnd, kMediaAnimationTimer);
-            return 0;
-        }
-        const ULONGLONG now = GetTickCount64();
-        const bool feedbackActive = g_mediaFeedbackIndex >= 0 &&
-            now >= g_mediaFeedbackTick &&
-            now - g_mediaFeedbackTick < kMediaFeedbackMs;
-        if (!feedbackActive) g_mediaFeedbackIndex = -1;
-        const bool seekPreviewExpired = g_mediaSeekHoldUntil &&
-            now >= g_mediaSeekHoldUntil;
-        if (seekPreviewExpired) g_mediaSeekHoldUntil = 0;
-        if ((g_mediaCurrent.hasTimeline && g_mediaCurrent.playing) ||
-            feedbackActive || g_mediaPressedIndex >= 0 || g_mediaSeeking ||
-            g_mediaSeekHoldUntil || seekPreviewExpired)
-            RenderPanel();
-        // Refresh the SMTC snapshot only while its card is open. No
-        // always-on media polling and no WinRT call on the UI thread.
-        if (now - g_mediaLastRefreshTick >= kMediaRefreshIntervalMs) {
-            g_mediaLastRefreshTick = now;
-            RequestMedia();
-        }
-        return 0;
-    }
-    if (msg == WM_TIMER && hwnd == g_popupWnd && wp == kFadeTimer) {
-        if (!g_fadeActive) { KillTimer(hwnd, kFadeTimer); return 0; }
-        const DWORD elapsed = GetTickCount() - g_fadeStart;
-        const DWORD duration = static_cast<DWORD>(g_fadeDuration.load());
-        const float amount = std::min(1.0f,
-            static_cast<float>(elapsed) / std::max<DWORD>(duration, 1));
-        const float eased = amount * amount * (3.0f - 2.0f * amount);
-        g_fadeAlpha = std::clamp(static_cast<int>(std::lround(
-            g_fadeFrom + (g_fadeTo - g_fadeFrom) * eased)), 0, 255);
-        if (amount >= 1.0f) {
-            g_fadeActive = false;
-            KillTimer(hwnd, kFadeTimer);
-            if (g_fadeOut) { FinishPopupHide(); return 0; }
-        }
-        RenderPopup();
-        if (g_panelMode != PanelMode::None) RenderPanel();
-        return 0;
-    }
-    // An interactive control should not vanish beneath a stationary
-    // pointer. WM_MOUSELEAVE re-arms its category's selected duration.
-    // This is event-driven; it adds no polling timer.
-    const bool hoverSurface = hwnd == g_panelWnd || hwnd == g_arrowWnd ||
-        hwnd == g_barWheelWnd || hwnd == g_speakerHitWnd ||
-        (hwnd == g_popupWnd && g_popupKind == PopupKind::Notification &&
-         g_noticeClickable);
-    if (msg == WM_MOUSEMOVE && hoverSurface) {
-        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, hwnd, 0};
-        TrackMouseEvent(&tracking);
-        if (g_popupWnd) KillTimer(g_popupWnd, kHideTimer);
-        if (hwnd == g_arrowWnd && !g_arrowHovered) {
-            g_arrowHovered = true;
-            RenderPopup();
-        }
-    }
-    if (msg == WM_MOUSELEAVE && hoverSurface) {
-        if (hwnd == g_panelWnd && g_panelMode == PanelMode::Mixer) {
-            const bool changed = g_mixerOutputExpanded ||
-                g_mixerOutputHoveredRow >= 0 || g_mixerOutputHeaderHovered;
-            g_mixerOutputExpanded = false;
-            g_mixerOutputHoveredRow = -1;
-            g_mixerOutputHeaderHovered = false;
-            if (changed) RenderPanel();
-        }
-        if (hwnd == g_arrowWnd && g_arrowHovered) {
-            g_arrowHovered = false;
-            if (!g_arrowPressed) RenderPopup();
-        }
-        if (!g_mainBarDragging && g_popupWnd && IsWindowVisible(g_popupWnd))
-            ResetHideTimerFor(g_activeDurationKind);
-        return 0;
-    }
-    if (msg == WM_MOUSEMOVE && hwnd == g_panelWnd &&
-        g_panelMode == PanelMode::Mixer && !g_mixerDrag && g_scale > 0.0f) {
-        const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
-        const float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
-        if (UpdateMixerOutputHover(x, y))
-            RenderPanel(); // Only on hover transition; no per-pixel repaint.
-    }
-    if (msg == WM_NCHITTEST) {
-        if (hwnd == g_popupWnd) return g_popupKind == PopupKind::Notification && g_noticeClickable ? HTCLIENT : HTTRANSPARENT;
-        if (hwnd == g_panelWnd || hwnd == g_arrowWnd ||
-            hwnd == g_barWheelWnd || hwnd == g_speakerHitWnd) return HTCLIENT;
-    }
-    if (msg == WM_SETCURSOR && hwnd == g_popupWnd &&
-        g_popupKind == PopupKind::Notification && g_noticeClickable) {
-        SetCursor(LoadCursorW(nullptr, IDC_HAND));
-        return TRUE;
-    }
-    if (msg == WM_SETCURSOR &&
-        (hwnd == g_panelWnd || hwnd == g_arrowWnd ||
-         hwnd == g_barWheelWnd || hwnd == g_speakerHitWnd)) {
-        bool overClickableIcon = hwnd == g_arrowWnd ||
-            hwnd == g_barWheelWnd || hwnd == g_speakerHitWnd;
-        if (hwnd == g_panelWnd && g_scale > 0) {
-            POINT point{};
-            if (GetCursorPos(&point) && ScreenToClient(hwnd, &point)) {
-                const float x = point.x / g_scale, y = point.y / g_scale;
-                if (g_panelMode == PanelMode::Mixer)
-                    overClickableIcon = MixerOutputHeaderHit(x, y) ||
-                        MixerOutputRowHit(x, y) >= 0 ||
-                        (!g_mixerOutputExpanded && MixerIconHitTest(x, y) >= 0);
-                else if (g_panelMode == PanelMode::Media)
-                    overClickableIcon = MediaCycleHitTest(x, y) ||
-                        MediaButtonHitTest(x, y) >= 0 ||
-                        MediaTimelineHitTest(x, y) ||
-                        MediaExtraHitTest(x, y) != 0;
-            }
-        }
-        SetCursor(LoadCursorW(nullptr,
-            overClickableIcon ? IDC_HAND : IDC_ARROW));
-        return TRUE;
-    }
-    if (msg == WM_MOUSEACTIVATE &&
-        (hwnd == g_popupWnd || hwnd == g_panelWnd ||
-         hwnd == g_arrowWnd || hwnd == g_barWheelWnd ||
-         hwnd == g_speakerHitWnd))
-        return MA_NOACTIVATE;
-    if (msg == WM_LBUTTONUP && hwnd == g_popupWnd &&
-        g_popupKind == PopupKind::Notification && g_noticeClickable) {
-        if (g_panelMode == PanelMode::Details) ClosePanel();
-        else { g_panelMode = PanelMode::Details; g_noticeScroll = 0; ShowPanel(); }
-        ResetHideTimerFor(DurationKind::Interactive);
-        return 0;
-    }
-    if (hwnd == g_speakerHitWnd) {
-        if (msg == WM_LBUTTONDOWN) {
-            if (g_popupKind == PopupKind::NativeVolume && g_popupWnd &&
-                IsWindowVisible(g_popupWnd) && !g_closing.load()) {
-                g_speakerPressed = true;
-                SetCapture(hwnd);
-                KillTimer(g_popupWnd, kHideTimer);
-            }
-            return 0;
-        }
-        if (msg == WM_LBUTTONUP) {
-            RECT area{};
-            GetClientRect(hwnd, &area);
-            const POINT pointer{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            const bool activate = g_speakerPressed &&
-                g_popupKind == PopupKind::NativeVolume &&
-                !g_closing.load() && PtInRect(&area, pointer);
-            g_speakerPressed = false;
-            if (GetCapture() == hwnd) ReleaseCapture();
-            if (activate) ToggleDefaultAudioMute();
-            else if (g_popupWnd && IsWindowVisible(g_popupWnd))
-                ResetHideTimerFor(g_activeDurationKind);
-            return 0;
-        }
-        if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE) {
-            g_speakerPressed = false;
-            if (g_popupWnd && IsWindowVisible(g_popupWnd))
-                ResetHideTimerFor(g_activeDurationKind);
-            return 0;
-        }
-    }
-    if (msg == WM_MOUSEWHEEL && hwnd == g_barWheelWnd) {
-        HandleMainBarWheel(GET_WHEEL_DELTA_WPARAM(wp));
-        return 0;
-    }
-    if (hwnd == g_barWheelWnd) {
-        if (msg == WM_LBUTTONDOWN) {
-            MainBarRect track{};
-            if (MainBarTrackGeometry(track) && g_scale > 0.0f) {
-                g_mainBarDragging = true;
-                g_mainBarDragKind = static_cast<int>(g_popupKind);
-                SetCapture(hwnd);
-                if (g_popupWnd) KillTimer(g_popupWnd, kHideTimer);
-                SetMainBarFromPointer(hwnd, lp); // Click-to-position.
-            }
-            return 0;
-        }
-        if (msg == WM_MOUSEMOVE && g_mainBarDragging) {
-            if (g_mainBarDragKind == static_cast<int>(g_popupKind))
-                SetMainBarFromPointer(hwnd, lp);
-            return 0;
-        }
-        if (msg == WM_LBUTTONUP) {
-            if (g_mainBarDragging &&
-                g_mainBarDragKind == static_cast<int>(g_popupKind))
-                SetMainBarFromPointer(hwnd, lp);
-            g_mainBarDragging = false;
-            g_mainBarDragKind = -1;
-            if (GetCapture() == hwnd) ReleaseCapture();
-            if (g_popupWnd && IsWindowVisible(g_popupWnd))
-                ResetHideTimerFor(g_activeDurationKind);
-            return 0;
-        }
-        if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE) {
-            if (g_mainBarDragging) {
-                g_mainBarDragging = false;
-                g_mainBarDragKind = -1;
-                if (g_popupWnd && IsWindowVisible(g_popupWnd))
-                    ResetHideTimerFor(g_activeDurationKind);
-            }
-            return 0;
-        }
-    }
-    if (hwnd == g_arrowWnd) {
-        if (msg == WM_LBUTTONDOWN) {
-            if (g_popupKind == PopupKind::NativeVolume &&
-                g_showMixerArrow.load()) {
-                g_arrowPressed = true;
-                SetCapture(hwnd);
-                RenderPopup();
-            }
-            return 0;
-        }
-        if (msg == WM_LBUTTONUP) {
-            const bool activate = g_arrowPressed &&
-                g_popupKind == PopupKind::NativeVolume &&
-                g_showMixerArrow.load();
-            RECT area{};
-            GetClientRect(hwnd, &area);
-            POINT pointer{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            const bool inside = PtInRect(&area, pointer) != FALSE;
-            g_arrowPressed = false;
-            if (GetCapture() == hwnd) ReleaseCapture();
-            if (activate && inside) ActivateMixer();
-            else RenderPopup();
-            return 0;
-        }
-        if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE) {
-            if (g_arrowPressed) {
-                g_arrowPressed = false;
-                RenderPopup();
-            }
-            return 0;
-        }
-    }
-    if (hwnd == g_panelWnd && g_panelMode == PanelMode::Media) {
-        if (msg == WM_LBUTTONDOWN) {
-            const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
-            const float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
-            if (MediaCycleHitTest(x, y)) {
-                g_mediaCyclePressed = true;
-                g_mediaCycleInside = true;
-                SetCapture(hwnd);
-                RenderPanel();
-                return 0;
-            }
-            if (MediaTimelineHitTest(x, y)) {
-                g_mediaSeeking = true;
-                g_mediaSeekHoldUntil = 0;
-                SetCapture(hwnd);
-                PreviewMediaSeek(x);
-                return 0;
-            }
-            g_extraPressedAction = MediaExtraHitTest(x, y);
-            g_extraPressedInside = g_extraPressedAction != 0;
-            if (g_extraPressedAction) {
-                SetCapture(hwnd);
-                RenderPanel();
-                return 0;
-            }
-            g_mediaPressedIndex = MediaButtonHitTest(x, y);
-            g_mediaPressedInside = g_mediaPressedIndex >= 0;
-            if (g_mediaPressedIndex >= 0) {
-                SetCapture(hwnd);
-                RenderPanel();
-            }
-            return 0;
-        }
-        if (msg == WM_MOUSEMOVE && g_mediaCyclePressed) {
-            const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
-            const float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
-            const bool inside = MediaCycleHitTest(x, y);
-            if (inside != g_mediaCycleInside) {
-                g_mediaCycleInside = inside;
-                RenderPanel();
-            }
-            return 0;
-        }
-        if (msg == WM_MOUSEMOVE && g_mediaSeeking) {
-            const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
-            PreviewMediaSeek(x);
-            return 0;
-        }
-        if (msg == WM_MOUSEMOVE && g_extraPressedAction) {
-            const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
-            const float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
-            const bool inside = MediaExtraHitTest(x, y) == g_extraPressedAction;
-            if (inside != g_extraPressedInside) {
-                g_extraPressedInside = inside;
-                RenderPanel();
-            }
-            return 0;
-        }
-        if (msg == WM_MOUSEMOVE && g_mediaPressedIndex >= 0) {
-            const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
-            const float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
-            const bool inside = MediaButtonHitTest(x, y) == g_mediaPressedIndex;
-            if (inside != g_mediaPressedInside) {
-                g_mediaPressedInside = inside;
-                RenderPanel();
-            }
-            return 0;
-        }
-        if (msg == WM_LBUTTONUP) {
-            const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
-            const float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
-            if (g_mediaCyclePressed) {
-                const bool activated = MediaCycleHitTest(x, y);
-                g_mediaCyclePressed = false;
-                g_mediaCycleInside = false;
-                if (GetCapture() == hwnd) ReleaseCapture();
-                if (activated) RequestMedia(7);
-                RenderPanel();
-                ResetHideTimerFor(DurationKind::Interactive);
-                return 0;
-            }
-            if (g_mediaSeeking) {
-                PreviewMediaSeek(x);
-                g_mediaSeeking = false;
-                g_mediaSeekHoldUntil = GetTickCount64() + 2000;
-                if (GetCapture() == hwnd) ReleaseCapture();
-                RequestMedia(4, g_mediaPreviewPosition);
-                RenderPanel();
-                ResetHideTimerFor(DurationKind::Interactive);
-                return 0;
-            }
-            if (g_extraPressedAction) {
-                const int action = g_extraPressedAction;
-                const bool activated = MediaExtraHitTest(x, y) == action;
-                g_extraPressedAction = 0;
-                g_extraPressedInside = false;
-                if (GetCapture() == hwnd) ReleaseCapture();
-                if (activated) {
-                    g_mediaFeedbackIndex = action - 2; // 3=shuffle, 4=repeat
-                    g_mediaFeedbackTick = GetTickCount64();
-                    RequestMedia(action);
-                }
-                RenderPanel();
-                ResetHideTimerFor(DurationKind::Interactive);
-                return 0;
-            }
-            const int pressed = g_mediaPressedIndex;
-            const bool activated = pressed >= 0 &&
-                MediaButtonHitTest(x, y) == pressed;
-            g_mediaPressedIndex = -1;
-            g_mediaPressedInside = false;
-            if (GetCapture() == hwnd) ReleaseCapture();
-            if (activated) {
-                g_mediaFeedbackIndex = pressed;
-                g_mediaFeedbackTick = GetTickCount64();
-                RequestMedia(pressed + 1);
-            }
-            RenderPanel();
-            ResetHideTimerFor(DurationKind::Interactive);
-            return 0;
-        }
-    }
-    if (msg == WM_LBUTTONDOWN && hwnd == g_panelWnd &&
-        g_panelMode == PanelMode::Mixer) {
-        float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
-        float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
-        if (MixerOutputHeaderHit(x, y)) {
-            if (!g_mixerOutputExpanded) {
-                RefreshMixer(); // snapshot current devices before showing list
-                g_mixerOutputScroll = 0;
-                g_mixerOutputSwitchFailed = false;
-            }
-            g_mixerOutputExpanded = !g_mixerOutputExpanded &&
-                MixerOutputRows() > 0;
-            g_mixerOutputHoveredRow = -1;
-            RenderPanel();
-            ResetHideTimerFor(DurationKind::Interactive);
-            return 0;
-        }
-        if (g_mixerOutputExpanded) {
-            const int selection = MixerOutputRowHit(x, y);
-            if (selection >= 0) SelectMixerOutput(selection);
-            else {
-                g_mixerOutputExpanded = false;
-                RenderPanel();
-                ResetHideTimerFor(DurationKind::Interactive);
-            }
-            return 0; // never pass a menu click through to a volume slider
-        }
-        const int muteIndex = MixerIconHitTest(x, y);
-        if (muteIndex >= 0) {
-            g_mixerMutePressedIndex = muteIndex;
-            SetCapture(hwnd);
-            return 0;
-        }
-        int row = static_cast<int>(std::floor((y - kMixerFirstRowY + 10.0f) / kMixerRowStep));
-        int index = row + g_mixerScroll;
-        if (x >= kMixerTrackStart - 3.0f &&
-            x <= kMixerTrackStart + MixerTrackLength() + 3.0f &&
-            row >= 0 &&
-            row < MixerVisibleRows() && index >= 0 &&
-            index <= static_cast<int>(g_mixerEntries.size())) {
-            g_mixerDragIndex = index;
-            g_mixerDrag = true;
-            SetCapture(hwnd);
-            HandleMixerDrag(lp);
-        }
-        return 0;
-    }
-    if (msg == WM_CAPTURECHANGED && hwnd == g_panelWnd) {
-        if (g_mediaSeeking) {
-            g_mediaSeeking = false;
-            g_mediaSeekHoldUntil = 0;
-            if (g_panelMode == PanelMode::Media) RenderPanel();
-        }
-        if (g_mediaPressedIndex >= 0 || g_extraPressedAction ||
-            g_mediaCyclePressed) {
-            g_mediaPressedIndex = -1;
-            g_mediaPressedInside = false;
-            g_mediaCyclePressed = false;
-            g_mediaCycleInside = false;
-            g_extraPressedAction = 0;
-            g_extraPressedInside = false;
-            if (g_panelMode == PanelMode::Media) RenderPanel();
-        }
-        g_mixerMutePressedIndex = -1;
-        g_mixerDrag = false;
-        g_mixerDragIndex = -1;
-        return 0;
-    }
-    if (msg == WM_MOUSEMOVE && hwnd == g_panelWnd &&
-        g_panelMode == PanelMode::Mixer && g_mixerDrag) {
-        HandleMixerDrag(lp);
-        return 0;
-    }
-    if (msg == WM_LBUTTONUP && hwnd == g_panelWnd &&
-        g_panelMode == PanelMode::Mixer) {
-        if (g_mixerMutePressedIndex >= 0) {
-            const int pressed = g_mixerMutePressedIndex;
-            g_mixerMutePressedIndex = -1;
-            if (GetCapture() == hwnd) ReleaseCapture();
-            const float x = static_cast<float>(GET_X_LPARAM(lp)) / g_scale;
-            const float y = static_cast<float>(GET_Y_LPARAM(lp)) / g_scale;
-            if (MixerIconHitTest(x, y) == pressed)
-                ToggleMixerMute(pressed);
-            return 0;
-        }
-        if (g_mixerDrag) {
-            HandleMixerDrag(lp);
-            g_mixerDrag = false;
-            g_mixerDragIndex = -1;
-            ReleaseCapture();
-        }
-        ResetHideTimerFor(DurationKind::Interactive);
-        return 0;
-    }
-    if (msg == WM_MOUSEWHEEL && hwnd == g_panelWnd &&
-        g_panelMode == PanelMode::Details) {
-        const int d = GET_WHEEL_DELTA_WPARAM(wp);
-        const int maxScroll = std::max<int>(0, static_cast<int>(g_noticeDetails.size()) - NoticeVisibleRows());
-        g_noticeScroll = std::clamp(g_noticeScroll + (d > 0 ? -1 : 1), 0, maxScroll);
-        RenderPanel();
-        ResetHideTimerFor(DurationKind::Interactive);
-        return 0;
-    }
-    if (msg == WM_MOUSEWHEEL && hwnd == g_panelWnd &&
-        g_panelMode == PanelMode::Mixer) {
-        if (g_mixerOutputExpanded) {
-            const int rows = MixerOutputRows();
-            const int maxScroll = std::max(0,
-                static_cast<int>(g_mixerOutputOptions.size()) - rows);
-            if (maxScroll && GET_WHEEL_DELTA_WPARAM(wp)) {
-                g_mixerOutputScroll = std::clamp(g_mixerOutputScroll +
-                    (GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -1 : 1), 0, maxScroll);
-                POINT cursor{};
-                if (g_scale > 0.0f && GetCursorPos(&cursor) &&
-                    ScreenToClient(hwnd, &cursor))
-                    UpdateMixerOutputHover(cursor.x / g_scale,
-                                           cursor.y / g_scale);
-                else
-                    g_mixerOutputHoveredRow = -1;
-                RenderPanel();
-            }
-            ResetHideTimerFor(DurationKind::Interactive);
-            return 0;
-        }
-        POINT cursor{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        if (ScreenToClient(hwnd, &cursor) && g_scale > 0.0f) {
-            const int index = MixerTrackHitTest(cursor.x / g_scale,
-                                                 cursor.y / g_scale);
-            if (index >= 0 && !g_mixerDrag) {
-                if (index != g_mixerWheelIndex) {
-                    g_mixerWheelIndex = index;
-                    g_mixerWheelRemainder = 0;
-                }
-                g_mixerWheelRemainder += GET_WHEEL_DELTA_WPARAM(wp);
-                const int steps = g_mixerWheelRemainder / WHEEL_DELTA;
-                g_mixerWheelRemainder %= WHEEL_DELTA;
-                AdjustMixerVolumeWheel(index, steps);
-                return 0;
-            }
-        }
-        g_mixerWheelIndex = -1;
-        g_mixerWheelRemainder = 0;
-        const int delta = GET_WHEEL_DELTA_WPARAM(wp);
-        if (delta) {
-            const int maxScroll = MixerMaximumScroll();
-            g_mixerScroll = std::clamp(g_mixerScroll + (delta > 0 ? -1 : 1),
-                                       0, maxScroll);
-            RenderPanel();
-            ResetHideTimerFor(DurationKind::Interactive);
-        }
-        return 0;
-    }
     if (msg == WM_ERASEBKGND) return TRUE;
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 DWORD WINAPI UiThreadProc(void*) {
-    // A dedicated message loop avoids performing UI work on Explorer's shell
-    // thread. It performs no DDC/CI calls and no periodic brightness reads.
-    // Keep the GDI+ helper window on this dedicated, pumping UI thread.
-    // The default GDI+ background thread may own a helper window whose
-    // unresponsive shutdown message is reported as "GDI+ Window".
-    Gdiplus::GdiplusStartupInput gdiplusInput;
-    gdiplusInput.SuppressBackgroundThread = TRUE;
-    Gdiplus::GdiplusStartupOutput gdiplusOutput{};
-    if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput,
-                                &gdiplusOutput) != Gdiplus::Ok) {
-        Wh_Log(L"GDI+ startup failed");
-        if (g_uiReady) SetEvent(g_uiReady);
-        return 0;
-    }
-    const HRESULT coInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const bool coInitialized = SUCCEEDED(coInit);
+    // Message-only controller and event dispatcher. Every visible card is
+    // owned by the native XAML STA, never by this worker thread.
+    const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool initialized = SUCCEEDED(apartment);
     InitWindowsAccentProvider();
-    ULONG_PTR gdiplusHookToken = 0;
-    const bool gdiplusHooked = gdiplusOutput.NotificationHook &&
-        gdiplusOutput.NotificationUnhook &&
-        gdiplusOutput.NotificationHook(&gdiplusHookToken) == Gdiplus::Ok;
-    if (!gdiplusHooked) {
-        Wh_Log(L"GDI+ notification hook failed; not creating OSD windows");
-        ReleaseWindowsAccentProvider();
-        if (coInitialized) CoUninitialize();
-        Gdiplus::GdiplusShutdown(g_gdiplusToken);
-        g_gdiplusToken = 0;
-        if (g_uiReady) SetEvent(g_uiReady);
-        return 0;
-    }
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = UiWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = kWindowClass;
-    // Ensure the queue exists before the unload callback posts WM_QUIT.
-    MSG dummy{};
-    PeekMessageW(&dummy, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    MSG msg{};
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
     if (!RegisterClassExW(&wc)) {
-        Wh_Log(L"OSD window class registration failed: %lu", GetLastError());
+        Wh_Log(L"OSD message receiver registration failed (%lu)",
+               GetLastError());
         if (g_uiReady) SetEvent(g_uiReady);
-        // The notification hook must be removed on the same UI thread.
-        gdiplusOutput.NotificationUnhook(gdiplusHookToken);
-        Gdiplus::GdiplusShutdown(g_gdiplusToken);
-        g_gdiplusToken = 0;
         ReleaseWindowsAccentProvider();
-        if (coInitialized) CoUninitialize();
+        if (initialized) CoUninitialize();
         return 0;
     }
     g_receiveWnd = CreateWindowExW(0, kWindowClass, L"", 0,
-                                    0, 0, 0, 0, HWND_MESSAGE, nullptr,
-                                    wc.hInstance, nullptr);
+        0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
     if (g_receiveWnd) {
         g_networkReceiver.store(g_receiveWnd);
-        g_clipboardListener = AddClipboardFormatListener(g_receiveWnd) != FALSE;
+        g_clipboardListener =
+            AddClipboardFormatListener(g_receiveWnd) != FALSE;
         InitDeviceEvents();
         InitNetworkEvents();
+    } else {
+        Wh_Log(L"OSD message receiver creation failed (%lu)", GetLastError());
     }
-    g_popupWnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-            WS_EX_LAYERED | WS_EX_TRANSPARENT,
-        kWindowClass, L"", WS_POPUP, 0, 0, g_width, g_height,
-        nullptr, nullptr, wc.hInstance, nullptr);
-    g_panelWnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-        kWindowClass, L"", WS_POPUP, 0, 0, 340, 144,
-        nullptr, nullptr, wc.hInstance, nullptr);
-    g_arrowWnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-        kWindowClass, L"", WS_POPUP, 0, 0, 26, 26,
-        nullptr, nullptr, wc.hInstance, nullptr);
-    if (g_arrowWnd)
-        SetLayeredWindowAttributes(g_arrowWnd, 0, 1, LWA_ALPHA);
-    g_speakerHitWnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-        kWindowClass, L"", WS_POPUP, 0, 0, 32, 32,
-        nullptr, nullptr, wc.hInstance, nullptr);
-    if (g_speakerHitWnd)
-        SetLayeredWindowAttributes(g_speakerHitWnd, 0, 1, LWA_ALPHA);
-    g_barWheelWnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-        kWindowClass, L"", WS_POPUP, 0, 0, 32, 32,
-        nullptr, nullptr, wc.hInstance, nullptr);
-    if (g_barWheelWnd)
-        SetLayeredWindowAttributes(g_barWheelWnd, 0, 1, LWA_ALPHA);
     for (int i = 0; i < 4; ++i)
         g_lockToggle[i] = (GetKeyState(kLockVk[i]) & 1) != 0;
-    HMODULE mod = nullptr;
+    HMODULE module = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<PCWSTR>(reinterpret_cast<void*>(LockKeyProc)),
-                       &mod);
-    g_lockHook = SetWindowsHookExW(WH_KEYBOARD_LL, LockKeyProc, mod, 0);
-    if (!g_lockHook) Wh_Log(L"Lock-key keyboard hook unavailable: %lu", GetLastError());
-    if (!g_receiveWnd || !g_popupWnd)
-        Wh_Log(L"OSD window creation failed: %lu", GetLastError());
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<PCWSTR>(reinterpret_cast<void*>(LockKeyProc)),
+        &module);
+    g_lockHook = SetWindowsHookExW(WH_KEYBOARD_LL, LockKeyProc, module, 0);
+    if (!g_lockHook)
+        Wh_Log(L"Lock-key keyboard hook unavailable (%lu)", GetLastError());
     if (g_uiReady) SetEvent(g_uiReady);
-    MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
     g_closing.store(true);
     g_networkReceiver.store(nullptr);
-    if (g_clipboardListener) RemoveClipboardFormatListener(g_receiveWnd);
+    if (g_lockHook) { UnhookWindowsHookEx(g_lockHook); g_lockHook = nullptr; }
+    if (g_clipboardListener && g_receiveWnd)
+        RemoveClipboardFormatListener(g_receiveWnd);
     g_clipboardListener = false;
     if (g_receiveWnd) {
         KillTimer(g_receiveWnd, kEventBatchTimer);
         KillTimer(g_receiveWnd, kDdcBatchTimer);
+        KillTimer(g_receiveWnd, kMediaAnimationTimer);
     }
     g_ddcBatchPending = false;
     g_ddcBatchEvents.clear();
@@ -11708,35 +11006,17 @@ DWORD WINAPI UiThreadProc(void*) {
     g_networkInterfaces.clear();
     StopDeviceEvents();
     ClearClipboardThumbnail();
-    if (g_popupWnd) {
-        KillTimer(g_popupWnd, kHideTimer);
-        KillTimer(g_popupWnd, kFadeTimer);
-        KillTimer(g_popupWnd, kMediaAnimationTimer);
-    }
-    if (g_lockHook) { UnhookWindowsHookEx(g_lockHook); g_lockHook = nullptr; }
-    ClosePanel();
-    ClearMediaArtworkCache();  // Must precede GDI+ shutdown.
-    DestroyMirroredWindows();
-    if (g_speakerHitWnd) DestroyWindow(g_speakerHitWnd);
-    if (g_barWheelWnd) DestroyWindow(g_barWheelWnd);
-    if (g_arrowWnd) DestroyWindow(g_arrowWnd);
-    if (g_panelWnd) DestroyWindow(g_panelWnd);
-    if (g_popupWnd) DestroyWindow(g_popupWnd);
+    StopMixerOutputNotifications();
+    CleanupMixerIcons();
+    g_mixerEntries.clear();
+    g_mixerMaster.Reset();
+    g_mixerOutputOptions.clear();
+    g_mixerOutputId.clear();
     if (g_receiveWnd) DestroyWindow(g_receiveWnd);
-    g_speakerHitWnd = nullptr;
-    g_speakerPressed = false;
-    g_barWheelWnd = nullptr;
-    g_arrowWnd = nullptr;
-    g_panelWnd = nullptr;
-    g_popupWnd = nullptr;
     g_receiveWnd = nullptr;
     UnregisterClassW(kWindowClass, wc.hInstance);
-    // Unhook only after the message loop exits and all UI artwork is freed.
-    gdiplusOutput.NotificationUnhook(gdiplusHookToken);
-    Gdiplus::GdiplusShutdown(g_gdiplusToken);
-    g_gdiplusToken = 0;
     ReleaseWindowsAccentProvider();
-    if (coInitialized) CoUninitialize();
+    if (initialized) CoUninitialize();
     return 0;
 }
 
@@ -11756,7 +11036,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.27 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.28 (XAML-only) initialized (%s)", name);
     return TRUE;
 }
 
@@ -11797,18 +11077,12 @@ void Wh_ModAfterInit() {
             g_mediaWake = nullptr;
         }
     }
-    if (g_xamlForMigrated.load())
-        xaml_osd::Start();
+    xaml_osd::Start();
 }
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
-    if (g_isExplorer && !g_closing.load()) {
-        if (g_xamlForMigrated.load())
-            xaml_osd::Start();
-        else
-            xaml_osd::Hide();
-    }
+    if (g_isExplorer && !g_closing.load()) xaml_osd::Start();
     // Windhawk's settings callback is not the OSD UI thread.
     HWND target = g_networkReceiver.load(std::memory_order_acquire);
     if (g_isExplorer && target && !g_closing.load())
