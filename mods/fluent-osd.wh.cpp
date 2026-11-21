@@ -2180,9 +2180,14 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         slider.AddHandler(
             wx::UIElement::PointerWheelChangedEvent(),
             winrt::box_value(xinput::PointerEventHandler(
-                [&state, index, slider](
-                        auto const&, xinput::PointerRoutedEventArgs const& args) {
-                    if (state.mixerPopulating ||
+                [&state, index](
+                        winrt::Windows::Foundation::IInspectable const& sender,
+                        xinput::PointerRoutedEventArgs const& args) {
+                    // Resolve the owning control from this event's sender:
+                    // capturing slider in its own handler leaks the visual
+                    // tree by forming a strong reference cycle.
+                    auto slider = sender.try_as<controls::Slider>();
+                    if (!slider || state.mixerPopulating ||
                         state.current.kind != LevelKind::Mixer ||
                         index >= static_cast<int>(state.current.mixer.rows.size()) ||
                         !slider.IsEnabled()) return;
