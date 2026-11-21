@@ -38,8 +38,8 @@ workers. DDC targets have independent XAML hosts and their original
 monitor identity. Caps/Num/Scroll/Insert now use a shared XAML status card.
 Both single-item and aggregated USB/Bluetooth/network notices now use native
 XAML with click-to-expand details and ScrollViewer. Normalized volume and
-brightness bars use native XAML Sliders (including DDC); hidden-thumb or
-unknown raw ranges retain the original manual bar. All-monitor mode projects
+brightness bars use native XAML Sliders (including DDC). Unknown raw
+brightness ranges retain a plain fallback track. All-monitor mode projects
 read-only XAML Islands at each monitor's DPI and placement; independent DDC
 target values are never mirrored. Keyboard backlight,
 airplane mode, camera/access, microphone, virtual desktop and system text
@@ -393,18 +393,6 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
           #! $showIf: {controlButtonShape: square}
           #! $min: 0
           #! $max: 16
-          #! $format: slider
-        - ddcBarThickness: 8
-          $name: Bar thickness (logical px)
-          $name:zh-TW: 進度條厚度（邏輯像素）
-          #! $min: 2
-          #! $max: 18
-          #! $format: slider
-        - ddcThumbDiameter: 11
-          $name: Thumb diameter (0 = hidden)
-          $name:zh-TW: 滑塊直徑（0 = 隱藏）
-          #! $min: 0
-          #! $max: 20
           #! $format: slider
         - ddcFontSize: 15
           $name: Value font size (logical px)
@@ -860,7 +848,7 @@ struct Snapshot {
     bool vertical = false;
     bool showValue = true;
     int innerPadding = 14;
-    int iconSize = 16, fontSize = 15, barThickness = 8, thumbDiameter = 11;
+    int iconSize = 16, fontSize = 15;
     DWORD background = 0x232327, text = 0xf8f8fc;
     DWORD accent = 0x67acff, track = 0x56565c;
 };
@@ -1359,40 +1347,6 @@ Surface SurfaceGeometry(const osd_model::Snapshot& value,
 }
 } // namespace osd_layout
 
-// Value-only visual tokens: do not mix presentation styling with hardware
-// commands. The native Mixer and Media Sliders keep their system template.
-namespace osd_style {
-struct Thumb {
-    double diameter = 0, coreRatio = .52;
-    DWORD rim = 0, center = 0;
-};
-DWORD MixRgb(DWORD a, DWORD b, double ratio) {
-    const auto channel = [&](unsigned shift) -> DWORD {
-        const double x = static_cast<double>((a >> shift) & 255);
-        const double y = static_cast<double>((b >> shift) & 255);
-        return static_cast<DWORD>(std::lround(
-            std::clamp(x + (y - x) * ratio, 0.0, 255.0)));
-    };
-    return (channel(16) << 16) | (channel(8) << 8) | channel(0);
-}
-Thumb LevelThumb(const osd_model::Snapshot& data) {
-    Thumb out;
-    // 0 still hides the thumb. The native Slider has a larger visual
-    // footprint than the former 11px handmade circle.
-    if (data.thumbDiameter > 0)
-        out.diameter = std::min(20.0, data.thumbDiameter * 1.55);
-    const DWORD bg = data.background;
-    const DWORD fg = data.text;
-    const double brightness =
-        ((bg >> 16) & 255) * .2126 +
-        ((bg >> 8) & 255) * .7152 + (bg & 255) * .0722;
-    out.rim = brightness > 150 ? MixRgb(bg, fg, .22)
-                              : MixRgb(bg, 0x000000, .14);
-    out.center = MixRgb(bg, fg, .53);
-    return out;
-}
-} // namespace osd_style
-
 // Compile-time structural contracts: owned cross-thread view descriptions,
 // plain-value control commands, and no WinRT types at either boundary.
 static_assert(std::is_copy_constructible_v<osd_model::Snapshot>,
@@ -1442,6 +1396,8 @@ constexpr UINT_PTR kMediaProgressTimer = 686;
 constexpr double kOffLineRatio = .35;
 constexpr DWORD kStatusLineAnimationMs = 220;
 constexpr int kWidth = 354, kHeight = 49; // Default horizontal card pixels.
+constexpr double kFallbackTrackThickness = 8.0;
+constexpr double kNativeSliderLayoutClearance = 20.0;
 
 std::atomic<HWND> g_ready{nullptr};
 std::atomic<DWORD> g_threadId{0};
@@ -1480,7 +1436,6 @@ struct State {
     shapes::Rectangle track{nullptr};
     shapes::Rectangle fill{nullptr};
     media::RectangleGeometry fillClip{nullptr};
-    shapes::Ellipse thumb{nullptr}, thumbCore{nullptr};
     // Shared status-card visual tree for Caps/Num/Scroll/Insert.
     controls::Border statusTile{nullptr};
     controls::TextBlock statusGlyph{nullptr}, statusTitle{nullptr},
@@ -1734,8 +1689,7 @@ void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
         args.Handled(true);
         return;
     }
-    const double halo = std::max(6.0,
-        static_cast<double>(state.current.thumbDiameter) / 2.0 + 3.0);
+    const double halo = 8.0; // Fixed input halo for icon/fallback track.
     const bool icon = state.current.kind == LevelKind::Volume &&
         state.current.showIcon &&
         InHitRegion(pos.X, pos.Y, state.iconX, state.iconY,
@@ -2119,8 +2073,6 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.value.Visibility(wx::Visibility::Collapsed);
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
-    state.thumb.Visibility(wx::Visibility::Collapsed);
-    state.thumbCore.Visibility(wx::Visibility::Collapsed);
 
     state.mixerChevron.Visibility(wx::Visibility::Collapsed);
     state.mixerSurface.Visibility(wx::Visibility::Collapsed);
@@ -2223,8 +2175,6 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
     state.value.Visibility(wx::Visibility::Collapsed);
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
-    state.thumb.Visibility(wx::Visibility::Collapsed);
-    state.thumbCore.Visibility(wx::Visibility::Collapsed);
     state.statusTile.Visibility(wx::Visibility::Collapsed);
     state.statusTitle.Visibility(wx::Visibility::Collapsed);
     state.statusDetail.Visibility(wx::Visibility::Collapsed);
@@ -2444,8 +2394,6 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
     state.value.Visibility(wx::Visibility::Collapsed);
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
-    state.thumb.Visibility(wx::Visibility::Collapsed);
-    state.thumbCore.Visibility(wx::Visibility::Collapsed);
     state.mixerChevron.Visibility(wx::Visibility::Collapsed);
     state.mixerSurface.Visibility(wx::Visibility::Collapsed);
     state.statusTile.Visibility(wx::Visibility::Collapsed);
@@ -2651,8 +2599,6 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     state.value.Visibility(wx::Visibility::Collapsed);
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
-    state.thumb.Visibility(wx::Visibility::Collapsed);
-    state.thumbCore.Visibility(wx::Visibility::Collapsed);
     state.mixerChevron.Visibility(wx::Visibility::Collapsed);
     state.statusTile.Visibility(wx::Visibility::Collapsed);
     state.statusTitle.Visibility(wx::Visibility::Collapsed);
@@ -2920,8 +2866,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     }
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
-        !state.fillClip || !state.thumb || !state.thumbCore ||
-        !state.levelSlider || !state.statusTile) return;
+        !state.fillClip || !state.levelSlider || !state.statusTile) return;
     if (state.current.kind != value.kind) state.wheelRemainder = 0;
     state.current = value;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
@@ -2962,17 +2907,10 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     state.value.Foreground(Brush(value.text));
     state.track.Fill(Brush(value.track));
     state.fill.Fill(Brush(value.accent));
-    // Native Slider motif: dark outer ring and pale center, theme-relative.
-    // The bar's existing input controller and percent math are unchanged.
-    const auto thumbVisual = osd_style::LevelThumb(value);
-    state.thumb.Fill(Brush(thumbVisual.rim));
-    state.thumb.StrokeThickness(0.0);
-    state.thumbCore.Fill(Brush(thumbVisual.center));
-
+    // Known 0-100% values always use the native Windows Slider's own track
+    // and Thumb. Unknown raw brightness only shows the neutral fallback bar.
     const int percent = std::clamp(value.percent, 0, 100);
-    // Native Slider owns normalized drag and Thumb. Unknown raw brightness
-    // and explicitly hidden-thumb variants retain their old track.
-    const bool nativeLevel = value.valueKnown && value.thumbDiameter > 0;
+    const bool nativeLevel = value.valueKnown;
     state.levelSlider.Visibility(nativeLevel
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
     state.levelSlider.IsEnabled(nativeLevel);
@@ -2991,9 +2929,6 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     themeBrush(L"SliderTrackFill", value.track);
     themeBrush(L"SliderTrackFillPointerOver", value.track);
     themeBrush(L"SliderTrackFillPressed", value.track);
-    resources.Insert(winrt::box_value(winrt::hstring(
-        L"SliderTrackThemeHeight")),
-        winrt::box_value(double(std::clamp(value.barThickness, 2, 18))));
     state.levelPopulating = true;
     state.levelSlider.Value(percent);
     state.levelPopulating = false;
@@ -3015,10 +2950,10 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     state.icon.Visibility(wx::Visibility::Visible);
     state.value.Visibility(wx::Visibility::Visible);
 
-    const double trackThickness =
-        static_cast<double>(std::clamp(value.barThickness, 2, 18));
+    // Fixed clearance for layout, not a native Slider appearance override.
+    const double trackThickness = kFallbackTrackThickness;
     const int fillPercent = value.valueKnown ? percent : 0;
-    const double wantedThumb = thumbVisual.diameter;
+    const double wantedThumb = kNativeSliderLayoutClearance;
 
     // Measure the intrinsic maximum among possible glyphs and labels.
     // Do not base the available track width on the *current* percentage.
@@ -3064,8 +2999,6 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         const double length = trackBottom - trackTop;
         const double filled = length * fillPercent / 100.0;
         const double centerX = bodyW / 2.0;
-        const double thumbSize = std::min(wantedThumb, length);
-
         state.track.Width(trackThickness);
         state.track.Height(length);
         state.track.RadiusX(trackThickness / 2.0);
@@ -3084,23 +3017,6 @@ void DrawSnapshot(State& state, const Snapshot& value) {
             0.0f, static_cast<float>(length - filled),
             static_cast<float>(trackThickness), static_cast<float>(filled)});
 
-        state.thumb.Width(thumbSize);
-        state.thumb.Height(thumbSize);
-        state.thumb.Visibility(!nativeLevel && thumbSize > 0.0 && value.valueKnown
-            ? wx::Visibility::Visible : wx::Visibility::Collapsed);
-        const double thumbHalf = thumbSize / 2.0;
-        const double thumbY = std::clamp(trackBottom - filled,
-            trackTop + thumbHalf,
-            std::max(trackTop + thumbHalf, trackBottom - thumbHalf));
-        controls::Canvas::SetLeft(state.thumb, centerX - thumbHalf);
-        controls::Canvas::SetTop(state.thumb, thumbY - thumbHalf);
-        const double core = thumbSize * thumbVisual.coreRatio;
-        state.thumbCore.Width(core);
-        state.thumbCore.Height(core);
-        state.thumbCore.Visibility(!nativeLevel && thumbSize > 0.0 && value.valueKnown
-            ? wx::Visibility::Visible : wx::Visibility::Collapsed);
-        controls::Canvas::SetLeft(state.thumbCore, centerX - core / 2.0);
-        controls::Canvas::SetTop(state.thumbCore, thumbY - core / 2.0);
         controls::Canvas::SetLeft(state.icon,
             std::max(0.0, (bodyW - iconW) / 2.0));
         controls::Canvas::SetTop(state.icon, iconTop);
@@ -3149,8 +3065,6 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         const double trackW = std::max(0.0, trackRight - trackX);
         const double filled = trackW * fillPercent / 100.0;
         const double midY = bodyH / 2.0;
-        const double thumbSize = std::min(wantedThumb, trackW);
-
         state.track.Width(trackW);
         state.track.Height(trackThickness);
         state.track.RadiusX(trackThickness / 2.0);
@@ -3169,23 +3083,6 @@ void DrawSnapshot(State& state, const Snapshot& value) {
             0.0f, 0.0f,
             static_cast<float>(filled), static_cast<float>(trackThickness)});
 
-        state.thumb.Width(thumbSize);
-        state.thumb.Height(thumbSize);
-        state.thumb.Visibility(!nativeLevel && thumbSize > 0.0 && value.valueKnown
-            ? wx::Visibility::Visible : wx::Visibility::Collapsed);
-        const double thumbHalf = thumbSize / 2.0;
-        const double thumbX = std::clamp(filled, thumbHalf,
-            std::max(thumbHalf, trackW - thumbHalf));
-        controls::Canvas::SetLeft(state.thumb, trackX + thumbX - thumbHalf);
-        controls::Canvas::SetTop(state.thumb, midY - thumbHalf);
-        const double core = thumbSize * thumbVisual.coreRatio;
-        state.thumbCore.Width(core);
-        state.thumbCore.Height(core);
-        state.thumbCore.Visibility(!nativeLevel && thumbSize > 0.0 && value.valueKnown
-            ? wx::Visibility::Visible : wx::Visibility::Collapsed);
-        controls::Canvas::SetLeft(state.thumbCore,
-            trackX + thumbX - core / 2.0);
-        controls::Canvas::SetTop(state.thumbCore, midY - core / 2.0);
         controls::Canvas::SetLeft(state.icon, iconX);
         controls::Canvas::SetTop(state.icon,
             std::max(0.0, (bodyH - iconH) / 2.0));
@@ -3359,17 +3256,6 @@ void CreateContent(State& state) {
     media::RectangleGeometry fillClip;
     fill.Clip(fillClip);
     canvas.Children().Append(fill);
-    shapes::Ellipse thumb;
-    thumb.Width(11.0);
-    thumb.Height(11.0);
-    thumb.Fill(Brush(0x303034));
-    thumb.StrokeThickness(0.0);
-    canvas.Children().Append(thumb);
-    shapes::Ellipse thumbCore;
-    thumbCore.Width(7.0);
-    thumbCore.Height(7.0);
-    thumbCore.Fill(Brush(0xa6a6a6));
-    canvas.Children().Append(thumbCore);
 
     controls::Slider levelSlider;
     levelSlider.Visibility(wx::Visibility::Collapsed);
@@ -3508,8 +3394,6 @@ void CreateContent(State& state) {
     state.track = track;
     state.fill = fill;
     state.fillClip = fillClip;
-    state.thumb = thumb;
-    state.thumbCore = thumbCore;
     state.levelSlider = levelSlider;
     state.value = value;
     state.statusTile = statusTile;
@@ -3629,8 +3513,6 @@ void CloseSurface(State& state) {
     state.statusGlyph = nullptr;
     state.statusTile = nullptr;
     state.levelSlider = nullptr;
-    state.thumbCore = nullptr;
-    state.thumb = nullptr;
     state.fillClip = nullptr;
     state.fill = nullptr;
     state.track = nullptr;
@@ -4250,8 +4132,9 @@ std::atomic<DWORD> g_customTrack{0};
 std::atomic<bool> g_validCustomTrack{false};
 std::atomic<int> g_backgroundOpacity{96};
 std::atomic<int> g_cornerRadius{17};
-std::atomic<int> g_barThickness{8};
-std::atomic<int> g_thumbDiameter{11};
+// The optional legacy GDI+ backend retains the prior fixed appearance.
+constexpr float kLegacyTrackThickness = 8.0f;
+constexpr float kLegacyThumbDiameter = 11.0f;
 std::atomic<int> g_fontSize{15};
 std::atomic<int> g_iconSize{16};
 std::atomic<int> g_iconStrokeWidth{2};
@@ -4928,8 +4811,6 @@ void LoadSettings() {
     LoadHexSetting(L"CustomOSD.Appearance.ddcCustomTrack", g_customTrack, g_validCustomTrack);
     g_backgroundOpacity.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBackgroundOpacity"), 0, 100));
     g_cornerRadius.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcCornerRadius"), 0, 34));
-    g_barThickness.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBarThickness"), 2, 18));
-    g_thumbDiameter.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcThumbDiameter"), 0, 20));
     g_fontSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcFontSize"), 10, 24));
     g_iconSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcIconSize"), 10, 24));
     g_iconStrokeWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcIconStrokeWidth"), 1, 3));
@@ -5480,7 +5361,7 @@ void AddRoundedRect(Gdiplus::GraphicsPath& path, float x, float y,
 
 void DrawTrackThumb(Gdiplus::Graphics& gfx, float x, float centerY,
                     Gdiplus::Color accent, bool light) {
-    const float diameter = static_cast<float>(g_thumbDiameter.load());
+    const float diameter = kLegacyThumbDiameter;
     if (diameter <= 0.0f) return;
     const float radius = diameter / 2.0f;
     Gdiplus::SolidBrush fill(light
@@ -5789,14 +5670,14 @@ void DrawVerticalPopup(Gdiplus::Graphics& gfx, const BrightnessEvent& brightness
             &format, &textBrush);
     }
 
-    const float thick = static_cast<float>(g_barThickness.load());
+    const float thick = kLegacyTrackThickness;
     const float y = showValue ? 34.0f + edge : 9.0f + edge;
     const bool hasChevron =
         g_popupKind == PopupKind::NativeVolume && g_showMixerArrow.load();
     // Preserve the gap above the expand button at any custom main height.
     const float iconBottom = hasChevron ? logicalH - 42.0f : logicalH - 27.0f;
     const float glyphSize = static_cast<float>(g_iconSize.load());
-    const float thumbRadius = static_cast<float>(g_thumbDiameter.load()) / 2.0f;
+    const float thumbRadius = kLegacyThumbDiameter / 2.0f;
     const float bottom = hasChevron
         ? std::min(logicalH - 57.0f, iconBottom - glyphSize -
                            std::max(8.0f, thumbRadius + 4.0f))
@@ -5818,8 +5699,7 @@ void DrawVerticalPopup(Gdiplus::Graphics& gfx, const BrightnessEvent& brightness
         gfx.FillPath(&accentBrush, &fill);
         gfx.Restore(previousClip);
     }
-    // Preserve the user-selected thumb diameter. Users who prefer a clean,
-    // Fluent-style progress track can still set it to 0 in Windhawk settings.
+    // Legacy GDI+ preserves its fixed original Thumb size.
     if (known)
         DrawTrackThumb(gfx, centerX,
                        bottom - height * percent / 100.0f, accent, light);
@@ -6162,11 +6042,11 @@ bool MainBarTrackGeometry(MainBarRect& bar) {
         g_visible.maximum <= g_visible.minimum) return false;
     if (g_popupKind != PopupKind::DdcBrightness &&
         !g_nativePercentKnown) return false;
-    const float thick = static_cast<float>(g_barThickness.load());
+    const float thick = kLegacyTrackThickness;
     if (g_verticalVolumeBrightness.load()) {
         const float edge = static_cast<float>(g_innerPadding.load());
         const float glyph = static_cast<float>(g_iconSize.load());
-        const float thumb = static_cast<float>(g_thumbDiameter.load()) / 2.0f;
+        const float thumb = kLegacyThumbDiameter / 2.0f;
         const bool showIcon = g_popupKind == PopupKind::NativeVolume ||
                               g_showSun.load();
         const bool chevron = g_popupKind == PopupKind::NativeVolume &&
@@ -6183,7 +6063,7 @@ bool MainBarTrackGeometry(MainBarRect& bar) {
     } else if (g_popupKind == PopupKind::NativeVolume) {
         const float width = MainLogicalWidth() -
             (g_showMixerArrow.load() ? 191.0f : 169.0f);
-        // Horizontal volume uses a fixed 8px track, not barThickness.
+        // Horizontal volume preserves its original fixed 8px track.
         bar = {76.0f, MainCenterY() - 4.0f, width, 8.0f};
     } else {
         const float left = g_showSun.load() ? 80.0f : 38.0f;
@@ -6998,7 +6878,7 @@ bool RenderPopupFrame(const PopupFrame& frame, bool publishMirrors) {
             const float barX = g_showSun.load() ? 80.0f : 38.0f;
             const float barRight = logicalW - (showValue ? 79.0f : 30.0f);
             const float barW = barRight - barX;
-            const float barH = static_cast<float>(g_barThickness.load());
+            const float barH = kLegacyTrackThickness;
             const float barMid = centerY;
             const float barY = barMid - barH / 2.0f;
             Gdiplus::GraphicsPath track;
@@ -7508,8 +7388,6 @@ xaml_osd::Snapshot MakeXamlSnapshot(
     data.innerPadding = g_innerPadding.load();
     data.iconSize = g_iconSize.load();
     data.fontSize = g_fontSize.load();
-    data.barThickness = g_barThickness.load();
-    data.thumbDiameter = g_thumbDiameter.load();
     const bool light = IsLightTheme();
     data.background = OsdBackgroundRgb(light);
     data.backgroundAlpha = OsdBackgroundAlpha();
