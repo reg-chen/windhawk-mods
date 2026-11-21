@@ -700,6 +700,7 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.Media.Imaging.h>
 #include <winrt/Windows.UI.Xaml.Shapes.h>
 #include <winrt/Windows.Media.h>
 #include <winrt/Windows.Media.Control.h>
@@ -753,6 +754,7 @@ namespace wx = winrt::Windows::UI::Xaml;
 namespace controls = winrt::Windows::UI::Xaml::Controls;
 namespace xinput = winrt::Windows::UI::Xaml::Input;
 namespace media = winrt::Windows::UI::Xaml::Media;
+namespace imaging = winrt::Windows::UI::Xaml::Media::Imaging;
 namespace shapes = winrt::Windows::UI::Xaml::Shapes;
 namespace hosting = winrt::Windows::UI::Xaml::Hosting;
 using Microsoft::WRL::ComPtr;
@@ -761,6 +763,12 @@ struct IDesktopWindowXamlSourceNative : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE AttachToWindow(HWND) = 0;
     virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND*) = 0;
 };
+// WinRT PixelBuffer exposes IBufferByteAccess for bounded BGRA writes.
+struct IBufferByteAccess : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE Buffer(BYTE**) = 0;
+};
+constexpr GUID kBufferByteAccessIID = {0x905a0fef, 0xbc53, 0x11df,
+    {0x8c, 0x49, 0x00, 0x1e, 0x4f, 0xc6, 0x86, 0xda}};
 constexpr GUID kInteropIID = {
     0x3cbcf1bf, 0x2f76, 0x4e9c,
     {0x96, 0xab, 0xe8, 0x4b, 0x37, 0x97, 0x25, 0x54}};
@@ -791,7 +799,7 @@ std::mutex g_startLock;
 SRWLOCK g_snapshotLock = SRWLOCK_INIT;
 HANDLE g_thread = nullptr;
 
-enum class LevelKind { Volume, NativeBrightness, DdcBrightness, LockStatus, NoticeStatus, NativeEvent };
+enum class LevelKind { Volume, NativeBrightness, DdcBrightness, LockStatus, NoticeStatus, NativeEvent, ClipboardImage };
 struct Snapshot {
     LevelKind kind = LevelKind::Volume;
     std::wstring key;       // Nonempty for a physical DDC display/window.
@@ -808,6 +816,8 @@ struct Snapshot {
     std::wstring noticeDetailsHeading;
     std::vector<std::wstring> noticeDetails;
     DWORD noticeInteractiveDurationMs = 8000;
+    uint32_t clipboardWidth = 0, clipboardHeight = 0;
+    std::vector<uint8_t> clipboardPixels; // Bounded 32-bit BGRA, no HBITMAP on STA.
     bool brightness = false;
     bool showIcon = true;
     BYTE backgroundAlpha = 255;
@@ -876,6 +886,9 @@ struct State {
     controls::TextBlock noticeChevron{nullptr}, noticeHeading{nullptr};
     controls::ScrollViewer noticeScroll{nullptr};
     controls::StackPanel noticeRows{nullptr};
+    controls::Border clipboardFrame{nullptr};
+    controls::Image clipboardImage{nullptr};
+    controls::TextBlock clipboardCaption{nullptr};
     bool noticeExpanded = false;
     double noticeHeaderH = 0;
     DWORD noticeNormalDurationMs = 3000;
@@ -904,6 +917,7 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
 
 void DrawSnapshot(State&, const Snapshot&);
 void DrawStatusSnapshot(State&, const Snapshot&);
+void DrawClipboardImageSnapshot(State&, const Snapshot&);
 void ToggleNoticeDetails(State&);
 
 // All audio/WMI/DDC writes stay on the original Explorer OSD UI thread.
@@ -935,6 +949,9 @@ void HideSurface(State& state) {
     }
     state.statusLineAnimating = false;
     state.noticeExpanded = false;
+    // Clipboard image bytes must not persist after the flyout disappears.
+    if (state.clipboardImage) state.clipboardImage.Source(nullptr);
+    state.current.clipboardPixels.clear();
     if (state.canvas) state.canvas.ReleasePointerCaptures();
     // CaptureLost may invoke the shared interaction callback and restart
     // the inactivity timer. Cancel once more before hiding the HWND.
@@ -1514,7 +1531,113 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
                           bodyW, totalBodyH);
 }
 
+
+void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
+    if (!state.host || !state.card || !state.canvas ||
+        !state.clipboardFrame || !state.clipboardImage ||
+        !state.clipboardCaption) return;
+    state.scale = std::clamp(static_cast<double>(data.scale), 0.5, 6.0);
+    const double logicalW = std::max(32.0,
+        static_cast<double>(data.anchor.right - data.anchor.left) / state.scale);
+    const double logicalH = std::max(32.0,
+        static_cast<double>(data.anchor.bottom - data.anchor.top) / state.scale);
+    const double insetX = std::min(logicalW * (8.0 / 264.0), logicalW / 8.0);
+    const double insetY = std::min(logicalH * (7.0 / 224.0), logicalH / 8.0);
+    const double bodyW = std::max(28.0, logicalW - 2.0 * insetX);
+    const double bodyH = std::max(28.0, logicalH - 2.0 * insetY);
+    const double inset = std::clamp(
+        static_cast<double>(data.innerPadding), 6.0, 22.0) * .68;
+    const double captionFont = std::clamp(data.fontSize - 2, 10, 18);
+    const double captionHeight = captionFont * 1.5;
+    const double frameW = std::max(1.0, bodyW - 2.0 * inset);
+    const double frameH = std::max(1.0,
+        bodyH - 3.0 * inset - captionHeight);
+    const double radius = static_cast<double>(
+        std::clamp(data.cornerRadius, 0, 34));
+    state.canvas.IsHitTestVisible(false);
+    state.canvas.Width(bodyW);
+    state.canvas.Height(bodyH);
+    state.card.Background(Brush(data.background, data.backgroundAlpha));
+    state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
+    state.card.BorderBrush(Brush(data.track));
+    const double border = data.borderless ? 0.0 : 1.0;
+    state.card.BorderThickness(wx::Thickness{border, border, border, border});
+    state.icon.Visibility(wx::Visibility::Collapsed);
+    state.value.Visibility(wx::Visibility::Collapsed);
+    state.track.Visibility(wx::Visibility::Collapsed);
+    state.fill.Visibility(wx::Visibility::Collapsed);
+    state.thumb.Visibility(wx::Visibility::Collapsed);
+    state.statusTile.Visibility(wx::Visibility::Collapsed);
+    state.statusTitle.Visibility(wx::Visibility::Collapsed);
+    state.statusDetail.Visibility(wx::Visibility::Collapsed);
+    state.statusUnderline.Visibility(wx::Visibility::Collapsed);
+    state.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.noticeHeading.Visibility(wx::Visibility::Collapsed);
+    state.noticeScroll.Visibility(wx::Visibility::Collapsed);
+    if (state.statusLineAnimating) KillTimer(state.host, kStatusLineTimer);
+    state.statusLineAnimating = false;
+    state.noticeExpanded = false;
+
+    state.clipboardFrame.Visibility(wx::Visibility::Visible);
+    state.clipboardCaption.Visibility(wx::Visibility::Visible);
+    state.clipboardFrame.Background(Brush(data.track, 72));
+    const double previewRadius = std::min(radius, frameH * .14);
+    state.clipboardFrame.CornerRadius(wx::CornerRadius{
+        previewRadius, previewRadius, previewRadius, previewRadius});
+    state.clipboardFrame.Width(frameW);
+    state.clipboardFrame.Height(frameH);
+    controls::Canvas::SetLeft(state.clipboardFrame, inset);
+    controls::Canvas::SetTop(state.clipboardFrame, inset);
+    state.clipboardImage.Width(frameW);
+    state.clipboardImage.Height(frameH);
+    state.clipboardCaption.Text(winrt::hstring(data.statusTitle));
+    state.clipboardCaption.Width(frameW);
+    state.clipboardCaption.FontSize(captionFont);
+    state.clipboardCaption.Foreground(Brush(data.text));
+    state.clipboardCaption.TextTrimming(wx::TextTrimming::CharacterEllipsis);
+    controls::Canvas::SetLeft(state.clipboardCaption, inset);
+    controls::Canvas::SetTop(state.clipboardCaption,
+        inset * 2.0 + frameH);
+
+    // Construct WriteableBitmap only on the Island's STA. The original
+    // Explorer UI thread transferred copied bytes, never an HBITMAP/HDC.
+    const size_t bytes = static_cast<size_t>(data.clipboardWidth) *
+        data.clipboardHeight * 4;
+    if (data.clipboardWidth && data.clipboardHeight &&
+        data.clipboardWidth <= 224 && data.clipboardHeight <= 164 &&
+        bytes == data.clipboardPixels.size()) {
+        imaging::WriteableBitmap bitmap{
+            static_cast<int32_t>(data.clipboardWidth),
+            static_cast<int32_t>(data.clipboardHeight)};
+        const auto buffer = bitmap.PixelBuffer();
+        if (buffer.Length() >= bytes) {
+            ComPtr<IBufferByteAccess> access;
+            winrt::check_hresult(winrt::get_unknown(buffer)->QueryInterface(
+                kBufferByteAccessIID,
+                reinterpret_cast<void**>(access.GetAddressOf())));
+            BYTE* output = nullptr;
+            winrt::check_hresult(access->Buffer(&output));
+            if (output) {
+                memcpy(output, data.clipboardPixels.data(), bytes);
+                bitmap.Invalidate();
+                state.clipboardImage.Source(bitmap);
+            }
+        }
+    }
+    state.current = data;
+    ShowPositionedSurface(state, data, insetX, insetY, bodyW, bodyH);
+}
+
 void DrawSnapshot(State& state, const Snapshot& value) {
+    if (value.kind == LevelKind::ClipboardImage) {
+        DrawClipboardImageSnapshot(state, value);
+        return;
+    }
+    if (state.clipboardImage) state.clipboardImage.Source(nullptr);
+    if (state.clipboardFrame)
+        state.clipboardFrame.Visibility(wx::Visibility::Collapsed);
+    if (state.clipboardCaption)
+        state.clipboardCaption.Visibility(wx::Visibility::Collapsed);
     if (value.kind == LevelKind::LockStatus ||
         value.kind == LevelKind::NoticeStatus ||
         value.kind == LevelKind::NativeEvent) {
@@ -1921,6 +2044,17 @@ void CreateContent(State& state) {
     noticeScroll.Content(noticeRows);
     canvas.Children().Append(noticeScroll);
 
+
+    controls::Border clipboardFrame;
+    clipboardFrame.Visibility(wx::Visibility::Collapsed);
+    controls::Image clipboardImage;
+    clipboardImage.Stretch(media::Stretch::Uniform);
+    clipboardFrame.Child(clipboardImage);
+    canvas.Children().Append(clipboardFrame);
+    controls::TextBlock clipboardCaption;
+    clipboardCaption.Visibility(wx::Visibility::Collapsed);
+    canvas.Children().Append(clipboardCaption);
+
     controls::Viewbox viewbox;
     viewbox.Stretch(media::Stretch::Fill);
     viewbox.Child(canvas);
@@ -1944,6 +2078,9 @@ void CreateContent(State& state) {
     state.noticeHeading = noticeHeading;
     state.noticeRows = noticeRows;
     state.noticeScroll = noticeScroll;
+    state.clipboardFrame = clipboardFrame;
+    state.clipboardImage = clipboardImage;
+    state.clipboardCaption = clipboardCaption;
     canvas.PointerPressed([&state](auto const&, const xinput::PointerRoutedEventArgs& e) {
         PointerPressed(state, e);
     });
@@ -2010,6 +2147,9 @@ void CreateSurface(State& state, HINSTANCE instance) {
 
 void CloseSurface(State& state) {
     HideSurface(state);
+    state.clipboardCaption = nullptr;
+    state.clipboardImage = nullptr;
+    state.clipboardFrame = nullptr;
     state.noticeScroll = nullptr;
     state.noticeRows = nullptr;
     state.noticeHeading = nullptr;
