@@ -739,7 +739,7 @@ DWORD PercentToRaw(DWORD minimum, DWORD maximum, int percent) {
 
 // Optional native XAML volume renderer. WinRT and HWND ownership stay entirely
 // on a dedicated STA. The existing Hook/UI threads exchange only value data.
-namespace xaml_volume {
+namespace xaml_osd {
 namespace wx = winrt::Windows::UI::Xaml;
 namespace controls = winrt::Windows::UI::Xaml::Controls;
 namespace media = winrt::Windows::UI::Xaml::Media;
@@ -1721,7 +1721,7 @@ void Stop() {
         g_thread = nullptr;
     }
 }
-} // namespace xaml_volume
+} // namespace xaml_osd
 
 constexpr WCHAR kWindowClass[] = L"WH.FluentOSD.XamlTest.01E7AFB2";
 constexpr ULONG_PTR kCopyDataTag = 0x1E7AFB3;
@@ -4071,7 +4071,7 @@ void UpdateBarWheelWindow() {
 
 void ShowPopupAnimated() {
     // Never leave a previous XAML volume popup over a GDI+ event.
-    xaml_volume::Hide();
+    xaml_osd::Hide();
     if (!g_popupWnd) return;
     const bool wasVisible = IsWindowVisible(g_popupWnd) != FALSE;
     const bool reversingFade = g_fadeActive && g_fadeOut;
@@ -5279,14 +5279,14 @@ void RenderMirroredFrame(HDC screen, void* pixels, int sourceWidth,
 
 // Shared properties of all migrated XAML level indicators; the source
 // value, event identity and monitor placement remain category-specific.
-xaml_volume::Snapshot MakeXamlSnapshot(
+xaml_osd::Snapshot MakeXamlSnapshot(
         PopupKind kind, const RECT& anchor, float scale) {
-    xaml_volume::Snapshot data;
+    xaml_osd::Snapshot data;
     data.kind = kind == PopupKind::NativeVolume
-        ? xaml_volume::LevelKind::Volume
+        ? xaml_osd::LevelKind::Volume
         : kind == PopupKind::DdcBrightness
-        ? xaml_volume::LevelKind::DdcBrightness
-        : xaml_volume::LevelKind::NativeBrightness;
+        ? xaml_osd::LevelKind::DdcBrightness
+        : xaml_osd::LevelKind::NativeBrightness;
     data.brightness = kind != PopupKind::NativeVolume;
     data.receiver = g_receiveWnd;
     data.showIcon = !data.brightness || g_showSun.load();
@@ -5335,7 +5335,7 @@ void HideGdiLevelForXaml() {
 // Fixed-output modes preserve the previous single-output behavior instead.
 bool ShowXamlDdcTargets(const BrightnessEvent& master) {
     const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
-    std::vector<xaml_volume::Snapshot> batch;
+    std::vector<xaml_osd::Snapshot> batch;
     const ULONGLONG now = GetTickCount64();
     auto push = [&](const BrightnessEvent& ev,
                     const RECT& anchor, float scale) {
@@ -5373,10 +5373,10 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
     }
     if (batch.empty()) {
         Wh_Log(L"XAML v1.0.18: no resolvable DDC snapshots");
-        xaml_volume::Hide();
+        xaml_osd::Hide();
         return false;
     }
-    const bool ok = xaml_volume::ShowBatch(batch);
+    const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
         Wh_Log(L"XAML v1.0.18: DDC batch not delivered; NO GDI+ fallback");
     return ok;
@@ -7762,7 +7762,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     static bool routeLogged[2]{};
     static bool unavailableLogged[2]{};
     const int index = brightness ? 1 : 0;
-    if (xaml_volume::Show(snapshot)) {
+    if (xaml_osd::Show(snapshot)) {
         if (!routeLogged[index]) {
             Wh_Log(L"Fluent OSD v1.0.18: native %s -> XAML only",
                    brightness ? L"brightness" : L"volume");
@@ -7828,15 +7828,15 @@ DWORD g_xamlPendingDdcGeneration = 0;
 DWORD g_xamlPendingDdcPrevious = 0;
 
 void ProcessXamlInputs() {
-    auto inputs = xaml_volume::TakeInputs();
+    auto inputs = xaml_osd::TakeInputs();
     if (g_closing.load() || !g_xamlForMigrated.load()) return;
     for (const auto& cmd : inputs) {
-        if (cmd.kind == xaml_volume::LevelKind::Volume) {
+        if (cmd.kind == xaml_osd::LevelKind::Volume) {
             if (g_popupKind != PopupKind::NativeVolume) continue;
             bool ok = false;
-            if (cmd.action == xaml_volume::InputAction::ToggleMute)
+            if (cmd.action == xaml_osd::InputAction::ToggleMute)
                 ok = ToggleDefaultAudioMute();
-            else if (cmd.action == xaml_volume::InputAction::Wheel) {
+            else if (cmd.action == xaml_osd::InputAction::Wheel) {
                 const int steps = cmd.value / WHEEL_DELTA;
                 ok = steps != 0 && AdjustDefaultAudioWheel(steps);
             } else ok = SetDefaultAudioBarPercent(cmd.value);
@@ -7845,11 +7845,11 @@ void ProcessXamlInputs() {
         }
         if (!g_wheelWriteWake) continue;
 
-        if (cmd.kind == xaml_volume::LevelKind::NativeBrightness) {
+        if (cmd.kind == xaml_osd::LevelKind::NativeBrightness) {
             if (g_popupKind != PopupKind::NativeBrightness ||
                 !g_nativePercentKnown) continue;
-            if (cmd.action == xaml_volume::InputAction::ToggleMute) continue;
-            const int requested = cmd.action == xaml_volume::InputAction::Wheel
+            if (cmd.action == xaml_osd::InputAction::ToggleMute) continue;
+            const int requested = cmd.action == xaml_osd::InputAction::Wheel
                 ? g_nativePercent + (cmd.value / WHEEL_DELTA) * kWheelStepPercent
                 : cmd.value;
             const int percent = std::clamp(requested, 0, 100);
@@ -7866,9 +7866,9 @@ void ProcessXamlInputs() {
             continue;
         }
 
-        if (cmd.kind != xaml_volume::LevelKind::DdcBrightness ||
+        if (cmd.kind != xaml_osd::LevelKind::DdcBrightness ||
             g_popupKind != PopupKind::DdcBrightness ||
-            cmd.action == xaml_volume::InputAction::ToggleMute) continue;
+            cmd.action == xaml_osd::InputAction::ToggleMute) continue;
         const auto selected = std::find_if(
             g_ddcTargets.begin(), g_ddcTargets.end(),
             [&](const DdcTargetState& target) {
@@ -7883,7 +7883,7 @@ void ProcessXamlInputs() {
             OsdDuration(DurationKind::DdcBrightness);
         const DWORD range = event.maximum - event.minimum;
         int percent = 0;
-        if (cmd.action == xaml_volume::InputAction::Wheel) {
+        if (cmd.action == xaml_osd::InputAction::Wheel) {
             bool known = false;
             percent = BrightnessPercent(event, &known) +
                 (cmd.value / WHEEL_DELTA) * kWheelStepPercent;
@@ -7910,7 +7910,7 @@ void ProcessXamlInputs() {
 }
 
 LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (hwnd == g_receiveWnd && msg == xaml_volume::kInputMessage) {
+    if (hwnd == g_receiveWnd && msg == xaml_osd::kInputMessage) {
         ProcessXamlInputs();
         return 0;
     }
@@ -8896,16 +8896,16 @@ void Wh_ModAfterInit() {
         }
     }
     if (g_xamlForMigrated.load())
-        xaml_volume::Start();
+        xaml_osd::Start();
 }
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
     if (g_isExplorer && !g_closing.load()) {
         if (g_xamlForMigrated.load())
-            xaml_volume::Start();
+            xaml_osd::Start();
         else
-            xaml_volume::Hide();
+            xaml_osd::Hide();
     }
     // Windhawk's settings callback is not the OSD UI thread.
     HWND target = g_networkReceiver.load(std::memory_order_acquire);
@@ -8920,7 +8920,7 @@ void Wh_ModBeforeUninit() {
     g_closing.store(true);
     g_networkReceiver.store(nullptr);
     // WinRT/XAML is STA-owned and must exit before the module unloads.
-    xaml_volume::Stop();
+    xaml_osd::Stop();
     // Stop all worker threads before the UI windows or DLL can be unloaded.
     g_wheelWriteStop.store(true);
     if (g_wheelWriteWake) SetEvent(g_wheelWriteWake);
