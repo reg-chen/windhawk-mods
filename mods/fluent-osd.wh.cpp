@@ -7733,7 +7733,97 @@ void HandleMixerDrag(LPARAM lp) {
     ResetHideTimerFor(DurationKind::Interactive);
 }
 
+// XAML interaction commands reach this original UI thread without
+// cross-apartment WinRT calls. Physical DDC identity is carried on each
+// command, not inferred from whichever monitor happened to be last active.
+BrightnessEvent g_xamlPendingDdcWrite{};
+DWORD g_xamlPendingDdcGeneration = 0;
+DWORD g_xamlPendingDdcPrevious = 0;
+
+void ProcessXamlInputs() {
+    auto inputs = xaml_volume::TakeInputs();
+    if (g_closing.load() || !g_xamlForMigrated.load()) return;
+    for (const auto& cmd : inputs) {
+        if (cmd.kind == xaml_volume::LevelKind::Volume) {
+            if (g_popupKind != PopupKind::NativeVolume) continue;
+            bool ok = false;
+            if (cmd.action == xaml_volume::InputAction::ToggleMute)
+                ok = ToggleDefaultAudioMute();
+            else if (cmd.action == xaml_volume::InputAction::Wheel) {
+                const int steps = cmd.value / WHEEL_DELTA;
+                ok = steps != 0 && AdjustDefaultAudioWheel(steps);
+            } else ok = SetDefaultAudioBarPercent(cmd.value);
+            if (ok) ShowMigratedXamlLevel(PopupKind::NativeVolume);
+            continue;
+        }
+        if (!g_wheelWriteWake) continue;
+
+        if (cmd.kind == xaml_volume::LevelKind::NativeBrightness) {
+            if (g_popupKind != PopupKind::NativeBrightness ||
+                !g_nativePercentKnown) continue;
+            if (cmd.action == xaml_volume::InputAction::ToggleMute) continue;
+            const int requested = cmd.action == xaml_volume::InputAction::Wheel
+                ? g_nativePercent + (cmd.value / WHEEL_DELTA) * kWheelStepPercent
+                : cmd.value;
+            const int percent = std::clamp(requested, 0, 100);
+            if (percent == g_nativePercent) continue;
+            BrightnessWheelTask task{};
+            task.native = true;
+            task.value = percent;
+            task.generation = ++g_wheelWriteGeneration;
+            if (g_lastConfirmedNativeBrightness < 0)
+                g_lastConfirmedNativeBrightness = g_nativePercent;
+            g_nativePercent = percent;
+            QueueBrightnessWheelTask(task);
+            ShowMigratedXamlLevel(PopupKind::NativeBrightness);
+            continue;
+        }
+
+        if (cmd.kind != xaml_volume::LevelKind::DdcBrightness ||
+            g_popupKind != PopupKind::DdcBrightness ||
+            cmd.action == xaml_volume::InputAction::ToggleMute) continue;
+        const auto selected = std::find_if(
+            g_ddcTargets.begin(), g_ddcTargets.end(),
+            [&](const DdcTargetState& target) {
+                return target.event.physicalIndex == cmd.physicalIndex &&
+                    _wcsicmp(target.event.device, cmd.device) == 0;
+            });
+        if (selected == g_ddcTargets.end()) continue;
+        auto& event = selected->event;
+        if (event.maximum <= event.minimum) continue; // Unknown range.
+        const DWORD range = event.maximum - event.minimum;
+        int percent = 0;
+        if (cmd.action == xaml_volume::InputAction::Wheel) {
+            bool known = false;
+            percent = BrightnessPercent(event, &known) +
+                (cmd.value / WHEEL_DELTA) * kWheelStepPercent;
+        } else percent = cmd.value;
+        percent = std::clamp(percent, 0, 100);
+        const DWORD raw = event.minimum + static_cast<DWORD>(
+            std::lround(static_cast<double>(range) * percent / 100.0));
+        if (raw == event.value) continue;
+
+        BrightnessWheelTask task{};
+        task.monitor = event;  // Exact display + physical index.
+        task.value = static_cast<int>(raw);
+        task.generation = ++g_wheelWriteGeneration;
+        g_xamlPendingDdcWrite = event;
+        g_xamlPendingDdcPrevious = event.value;
+        g_xamlPendingDdcGeneration = task.generation;
+        event.value = raw;
+        if (g_visible.physicalIndex == event.physicalIndex &&
+            _wcsicmp(g_visible.device, event.device) == 0)
+            g_visible.value = raw;
+        QueueBrightnessWheelTask(task);
+        (void)ShowXamlDdcTargets(g_visible);
+    }
+}
+
 LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (hwnd == g_receiveWnd && msg == xaml_volume::kInputMessage) {
+        ProcessXamlInputs();
+        return 0;
+    }
     if (hwnd == g_receiveWnd && msg == WM_TIMER && wp == kEventBatchTimer) {
         FlushNoticeBatch();
         return 0;
