@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.30
+// @version         1.0.31
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML-only renderer (v1.0.30)
+## XAML-only renderer (v1.0.31)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -33,8 +33,9 @@ Branch-only native XAML Island renderer for migrated categories:
 **system volume, native brightness, per-target DDC/CI brightness, lock-key status, USB/Bluetooth/network details, native system status, clipboard text/file/image notices, and interactive Mixer (per-app sliders, mute and output selection)**.
 Every supported OSD category renders through XAML; there is no renderer toggle.
 The default background preserves the existing background opacity. An optional
-custom brush supports SolidColorBrush, AcrylicBrush and LinearGradientBrush
-with a bounded allowlist of properties and GradientStop values.
+custom brush supports SolidColorBrush, AcrylicBrush, LinearGradientBrush
+and ImageBrush with a bounded allowlist of properties and GradientStop
+values. ImageBrush loads bounded local images through WIC.
 Native XAML pointer gestures
 relay clicks/drags/wheels to the existing audio and brightness
 workers. DDC targets have independent XAML hosts and their original
@@ -79,7 +80,10 @@ Acrylic example (single line in Windhawk settings):
 Linear gradient example (also entered as one line):
 `<LinearGradientBrush StartPoint="0,0" EndPoint="1,1"><GradientStop Color="$mainColor" Offset="0" /><GradientStop Color="#80000000" Offset="1" /></LinearGradientBrush>`
 
-Also supported: `<SolidColorBrush Color="$mainColor" Opacity="0.7" />`.
+Also supported: `<SolidColorBrush Color="$mainColor" Opacity="0.7" />`,
+and `<ImageBrush ImageSource="C:\\Pictures\\osd.png" Stretch="UniformToFill" Opacity="0.8" />`.
+ImageBrush only accepts absolute local drive paths, not URLs, and bounds
+source files to 16 MiB and decoded images to 1024 pixels per side.
 Colors accept `#RRGGBB`, `#AARRGGBB`, `$mainColor`, `$accentColor`,
 `$textColor` and `$trackColor`. Gradient brushes accept 2–12 stop elements,
 StartPoint, EndPoint, SpreadMethod (Pad/Reflect/Repeat) and Opacity. Numeric
@@ -397,8 +401,8 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
         - ddcCustomBrush: '<AcrylicBrush BackgroundSource="HostBackdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />'
           $name: Custom background brush (single-line)
           $name:zh-TW: 自訂背景筆刷（單行）
-          $description: Supports AcrylicBrush, SolidColorBrush and LinearGradientBrush (with GradientStop children). Invalid definitions fall back to solid.
-          $description:zh-TW: 支援 AcrylicBrush、SolidColorBrush 及含 GradientStop 的 LinearGradientBrush。設定無效時回退純色。
+          $description: Supports AcrylicBrush, SolidColorBrush, LinearGradientBrush, ImageBrush (local paths). Invalid definitions fall back to solid.
+          $description:zh-TW: 支援 AcrylicBrush、SolidColorBrush、LinearGradientBrush、ImageBrush（本機圖片）。無效時回退純色。
           #! $showIf: {ddcBackgroundEffect: custom}
         - ddcBackgroundOpacity: 96
           $name: Background opacity (%)
@@ -1711,6 +1715,7 @@ bool ParseBrushColor(const Snapshot& state, const std::wstring& text,
              static_cast<BYTE>(rgb >> 8), static_cast<BYTE>(rgb)};
     return true;
 }
+imaging::WriteableBitmap LoadLocalBackgroundImage(const std::wstring& path);
 bool TryBuildBackgroundBrush(const Snapshot& state, media::Brush& output) {
     const std::wstring& input = state.backgroundMarkup;
     if (input.empty() || input.size() > 4096) return false;
@@ -1792,6 +1797,40 @@ bool TryBuildBackgroundBrush(const Snapshot& state, media::Brush& output) {
                 luminosityOpacity).as<
                 winrt::Windows::Foundation::IReference<double>>());
         brush.AlwaysUseFallback(forceFallback);
+        brush.Opacity(opacity);
+        output = brush;
+        return true;
+    }
+    if (root.name == L"ImageBrush") {
+        if (!root.selfClosing) return false;
+        SkipBrushSpaces(input, pos);
+        if (pos != input.size()) return false;
+        std::wstring path;
+        double opacity = 1.0;
+        auto stretch = media::Stretch::UniformToFill;
+        for (const auto& attr : root.attrs) {
+            if (attr.first == L"ImageSource") {
+                path = attr.second;
+            } else if (attr.first == L"Opacity") {
+                if (!ParseBrushFraction(attr.second, opacity)) return false;
+            } else if (attr.first == L"Stretch") {
+                if (attr.second == L"UniformToFill")
+                    stretch = media::Stretch::UniformToFill;
+                else if (attr.second == L"Uniform")
+                    stretch = media::Stretch::Uniform;
+                else if (attr.second == L"Fill")
+                    stretch = media::Stretch::Fill;
+                else if (attr.second == L"None")
+                    stretch = media::Stretch::None;
+                else return false;
+            } else return false;
+        }
+        if (path.empty()) return false;
+        auto pixels = LoadLocalBackgroundImage(path);
+        if (!pixels) return false;
+        auto brush = media::ImageBrush();
+        brush.ImageSource(pixels);
+        brush.Stretch(stretch);
         brush.Opacity(opacity);
         output = brush;
         return true;
@@ -1900,7 +1939,7 @@ void DrawSnapshot(State&, const Snapshot&);
 void DrawStatusSnapshot(State&, const Snapshot&);
 void DrawClipboardImageSnapshot(State&, const Snapshot&);
 imaging::WriteableBitmap BitmapFromPixels(
-    uint32_t, uint32_t, const std::vector<uint8_t>&);
+    uint32_t, uint32_t, const std::vector<uint8_t>&, uint32_t maxSide = 320);
 void DrawMixerSnapshot(State&, const Snapshot&);
 void ToggleNoticeDetails(State&);
 bool PointerInsideHost(const State&);
@@ -2271,7 +2310,7 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
     if (!SetWindowPos(state.host, HWND_TOPMOST,
                        placed.x, placed.y, placed.width, placed.height,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.30: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.31: show failed (%lu)", GetLastError());
         return;
     }
     if (!wasVisible) {
@@ -2635,9 +2674,9 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
 constexpr uint32_t kMaxXamlBitmapSide = 320;
 imaging::WriteableBitmap BitmapFromPixels(
         uint32_t width, uint32_t height,
-        const std::vector<uint8_t>& pixels) {
-    if (!width || !height || width > kMaxXamlBitmapSide ||
-        height > kMaxXamlBitmapSide)
+        const std::vector<uint8_t>& pixels, uint32_t maxSide) {
+    if (!width || !height || width > maxSide ||
+        height > maxSide)
         return imaging::WriteableBitmap{nullptr};
     const size_t bytes = static_cast<size_t>(width) * height * 4;
     if (bytes != pixels.size()) return imaging::WriteableBitmap{nullptr};
@@ -2722,6 +2761,71 @@ imaging::WriteableBitmap Decode(const std::vector<uint8_t>& bytes) {
     try { return BitmapFromPixels(w,h,pixels); }
     catch (...) { return imaging::WriteableBitmap{nullptr}; }
 }
+}
+
+// Background-image adapter: local file only, decoded on the XAML STA and
+// cached by ApplyBackground. Image data never crosses the HWND command ABI.
+imaging::WriteableBitmap LoadLocalBackgroundImage(const std::wstring& path) {
+    if (path.size() < 4 || path.size() > 1024 ||
+        !((path[0] >= L'A' && path[0] <= L'Z') ||
+          (path[0] >= L'a' && path[0] <= L'z')) ||
+        path[1] != L':' || path[2] != L'\\' ||
+        path.find(L"..") != std::wstring::npos)
+        return imaging::WriteableBitmap{nullptr};
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard,
+                              &attributes) ||
+        (attributes.dwFileAttributes &
+            (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)))
+        return imaging::WriteableBitmap{nullptr};
+    const uint64_t bytes =
+        (uint64_t(attributes.nFileSizeHigh) << 32) |
+         attributes.nFileSizeLow;
+    if (!bytes || bytes > 16ULL * 1024 * 1024)
+        return imaging::WriteableBitmap{nullptr};
+    ComPtr<IWICImagingFactory> factory;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+          CLSCTX_INPROC_SERVER, IID_PPV_ARGS(factory.GetAddressOf()))))
+        return imaging::WriteableBitmap{nullptr};
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(factory->CreateDecoderFromFilename(path.c_str(), nullptr,
+          GENERIC_READ, WICDecodeMetadataCacheOnDemand,
+          decoder.GetAddressOf())))
+        return imaging::WriteableBitmap{nullptr};
+    ComPtr<IWICBitmapFrameDecode> frame;
+    if (FAILED(decoder->GetFrame(0, frame.GetAddressOf())))
+        return imaging::WriteableBitmap{nullptr};
+    UINT w = 0, h = 0;
+    if (FAILED(frame->GetSize(&w, &h)) || !w || !h ||
+        w > 8192 || h > 8192 || uint64_t(w) * h > 33554432ULL)
+        return imaging::WriteableBitmap{nullptr};
+    constexpr UINT kMaxBackgroundSide = 1024;
+    const double ratio = std::min(1.0,
+        double(kMaxBackgroundSide) / double(std::max(w, h)));
+    const UINT tw = std::max<UINT>(1,
+        static_cast<UINT>(std::lround(w * ratio)));
+    const UINT th = std::max<UINT>(1,
+        static_cast<UINT>(std::lround(h * ratio)));
+    ComPtr<IWICBitmapScaler> scaler;
+    IWICBitmapSource* source = frame.Get();
+    if (tw != w || th != h) {
+        if (FAILED(factory->CreateBitmapScaler(scaler.GetAddressOf())) ||
+            FAILED(scaler->Initialize(frame.Get(), tw, th,
+                    WICBitmapInterpolationModeFant)))
+            return imaging::WriteableBitmap{nullptr};
+        source = scaler.Get();
+    }
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(factory->CreateFormatConverter(converter.GetAddressOf())) ||
+        FAILED(converter->Initialize(source, GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone, nullptr, 0.0,
+            WICBitmapPaletteTypeCustom)))
+        return imaging::WriteableBitmap{nullptr};
+    std::vector<uint8_t> pixels(static_cast<size_t>(tw) * th * 4);
+    if (FAILED(converter->CopyPixels(nullptr, tw * 4,
+        static_cast<UINT>(pixels.size()), pixels.data())))
+        return imaging::WriteableBitmap{nullptr};
+    return BitmapFromPixels(tw, th, pixels, kMaxBackgroundSide);
 }
 void AdvanceMediaTimeline(State& state) {
     if (state.current.kind!=LevelKind::Media||
@@ -3533,13 +3637,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.30: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.31: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.30: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.31: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
@@ -3861,7 +3965,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     // Island; the XAML Border provides the only visible card background.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
-    Wh_Log(L"XAML v1.0.30: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+    Wh_Log(L"XAML v1.0.31: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
         static_cast<unsigned long>(rounded),
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
@@ -3922,7 +4026,7 @@ void CloseSurface(State& state) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.30: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.31: island close failed"); }
         state.source = nullptr;
     }
     state.island = nullptr;
@@ -3970,7 +4074,7 @@ void DeliverPending(State& root) {
             peer->viewOnly = readOnly;
             try { CreateSurface(*peer, GetModuleHandleW(nullptr)); }
             catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.30: peer create failed 0x%08lX",
+                Wh_Log(L"XAML v1.0.31: peer create failed 0x%08lX",
                     static_cast<unsigned long>(ex.code()));
                 CloseSurface(*peer);
                 return nullptr;
@@ -4017,7 +4121,7 @@ void TryEnableIslandTransparency() {
     try {
         auto currentWindow = wx::Window::Current();
         if (!currentWindow) {
-            Wh_Log(L"XAML v1.0.30: Window.Current unavailable for transparency");
+            Wh_Log(L"XAML v1.0.31: Window.Current unavailable for transparency");
             return;
         }
         ComPtr<IXamlSourceTransparency> transparency;
@@ -4026,10 +4130,10 @@ void TryEnableIslandTransparency() {
             reinterpret_cast<void**>(transparency.GetAddressOf()));
         if (SUCCEEDED(hr) && transparency)
             hr = transparency->put_IsBackgroundTransparent(1);
-        Wh_Log(L"XAML v1.0.30: Island transparency HRESULT=0x%08lX",
+        Wh_Log(L"XAML v1.0.31: Island transparency HRESULT=0x%08lX",
             static_cast<unsigned long>(hr));
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.30: transparency initialization exception 0x%08lX",
+        Wh_Log(L"XAML v1.0.31: transparency initialization exception 0x%08lX",
             static_cast<unsigned long>(ex.code()));
     }
 }
@@ -4062,7 +4166,7 @@ DWORD WINAPI ThreadProc(void*) {
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.30: renderer ready (per-display DDC)");
+                Wh_Log(L"XAML v1.0.31: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -4071,11 +4175,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.30: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.31: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.30: unexpected startup exception");
+        Wh_Log(L"XAML v1.0.31: unexpected startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -4091,7 +4195,7 @@ DWORD WINAPI ThreadProc(void*) {
     CloseSurface(root);
     if (root.manager) {
         try { root.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.30: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.31: manager close failed"); }
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
@@ -4105,7 +4209,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.30: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.31: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -6620,7 +6724,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
                 FindMonitorByDeviceName(target.event.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
-                Wh_Log(L"XAML v1.0.30: unresolved DDC display '%s'",
+                Wh_Log(L"XAML v1.0.31: unresolved DDC display '%s'",
                        target.event.device);
                 continue;
             }
@@ -6633,13 +6737,13 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
             push(master, anchor, g_scale);
     }
     if (batch.empty()) {
-        Wh_Log(L"XAML v1.0.30: no resolvable DDC snapshots");
+        Wh_Log(L"XAML v1.0.31: no resolvable DDC snapshots");
         xaml_osd::Hide();
         return false;
     }
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.30: DDC batch not delivered");
+        Wh_Log(L"XAML v1.0.31: DDC batch not delivered");
     return ok;
 }
 
@@ -7680,7 +7784,7 @@ void ShowMigratedXamlLockStatus() {
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.30: lock status missing placement anchor");
+        Wh_Log(L"XAML v1.0.31: lock status missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -7691,7 +7795,7 @@ void ShowMigratedXamlLockStatus() {
         ? Tr(OsdText::On) : Tr(OsdText::Off);
     snapshot.statusActive = g_lastLockValue;
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.30: lock status unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.31: lock status unavailable; NO GDI+ fallback");
 }
 
 // Entire USB/Bluetooth/network category: single-item notifications and
@@ -7702,7 +7806,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.30: device notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.31: device notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -7720,7 +7824,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
         default: return;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.30: device notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.31: device notice unavailable; NO GDI+ fallback");
 }
 
 // A native system event already has one immutable display payload; use
@@ -7730,7 +7834,7 @@ void ShowMigratedXamlNativeEvent() {
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.30: native event missing placement anchor");
+        Wh_Log(L"XAML v1.0.31: native event missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -7788,7 +7892,7 @@ void ShowMigratedXamlNativeEvent() {
             return;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.30: native event unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.31: native event unavailable; NO GDI+ fallback");
 }
 
 // Convert the already-downscaled clipboard HBITMAP into a private, bounded
@@ -7836,7 +7940,7 @@ void ShowMigratedXamlClipboardNotice() {
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         ClearClipboardThumbnail();
-        Wh_Log(L"XAML v1.0.30: clipboard notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.31: clipboard notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -7861,7 +7965,7 @@ void ShowMigratedXamlClipboardNotice() {
         snapshot.scale = g_scale;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.30: clipboard notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.31: clipboard notice unavailable; NO GDI+ fallback");
 }
 
 
@@ -8474,7 +8578,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (target != g_ddcTargets.end())
                     target->event.value = write.previousValue;
                 if (master) g_visible.value = write.previousValue;
-                Wh_Log(L"XAML v1.0.30: DDC write failed for '%s' index %lu",
+                Wh_Log(L"XAML v1.0.31: DDC write failed for '%s' index %lu",
                     write.event.device, write.event.physicalIndex);
                 if (g_popupKind == PopupKind::DdcBrightness)
                     (void)ShowXamlDdcTargets(g_visible);
