@@ -764,6 +764,40 @@ enum class Kind {
     NativeEvent, ClipboardImage, Mixer
 };
 enum class ChevronDirection { Left, Right, Up, Down };
+// Plain-value SMTC view state. The worker remains the sole GSMTC accessor.
+struct MediaModel {
+    std::wstring sourceId, title, artist;
+    std::vector<uint8_t> encodedArtwork;
+    uint32_t sessionCount = 0, selectionSerial = 0;
+    bool playing = false, canPrevious = false, canToggle = false, canNext = false;
+    bool canShuffle = false, shuffleKnown = false, shuffleActive = false;
+    bool canRepeat = false, hasTimeline = false, canSeek = false;
+    int repeatMode = -1, controlSizePercent = 100;
+    int64_t start = 0, end = 0, position = 0;
+    uint64_t observedTick = 0;
+};
+// Pure presentation calculations: no clock reads, XAML or GSMTC calls.
+int64_t MediaPosition(const MediaModel& m, uint64_t now) {
+    if (!m.hasTimeline || m.end <= m.start) return 0;
+    int64_t p = std::clamp(m.position, m.start, m.end);
+    if (m.playing && now >= m.observedTick) {
+        const uint64_t elapsed = std::min<uint64_t>(
+            now - m.observedTick, static_cast<uint64_t>((m.end - p) / 10000));
+        p += static_cast<int64_t>(elapsed * 10000);
+    }
+    return std::clamp(p, m.start, m.end);
+}
+std::wstring MediaTime(int64_t ticks100ns) {
+    const uint64_t t = static_cast<uint64_t>(
+        std::max<int64_t>(0, ticks100ns)) / 10000000ULL;
+    const auto two = [](uint64_t n) -> std::wstring {
+        return (n < 10 ? L"0" : L"") + std::to_wstring(n);
+    };
+    if (t >= 3600)
+        return std::to_wstring(t / 3600) + L":" +
+               two((t / 60) % 60) + L":" + two(t % 60);
+    return std::to_wstring(t / 60) + L":" + two(t % 60);
+}
 struct MixerRow {
     std::wstring title;
     int percent = 0;
@@ -801,6 +835,7 @@ struct Snapshot {
     uint32_t clipboardWidth = 0, clipboardHeight = 0;
     std::vector<uint8_t> clipboardPixels; // Bounded 32-bit BGRA, no HBITMAP on STA.
     MixerModel mixer;
+    MediaModel media;
     bool mixerChevron = false;
     ChevronDirection mixerDirection = ChevronDirection::Down;
     bool brightness = false;
@@ -873,14 +908,16 @@ namespace osd_control {
 enum class Action {
     SetPercent, Wheel, ToggleMute,
     OpenMixer, CloseMixer, MixerSetPercent, MixerToggleMute,
-    MixerSelectOutput, MixerToggleOutput
+    MixerSelectOutput, MixerToggleOutput,
+    MediaAction, MediaSeek, CloseMedia
 };
-enum class Target { None, Volume, NativeBrightness, DdcBrightness, Mixer };
+enum class Target { None, Volume, NativeBrightness, DdcBrightness, Mixer, Media };
 struct Command {
     Target target = Target::None;
     Action action = Action::SetPercent;
     int value = 0;
     int index = -1; // 0=master, positive=audio session, or output index.
+    int64_t mediaPosition = 0; // 100 ns; no WinRT or playback object.
     uint32_t generation = 0;
     WCHAR device[CCHDEVICENAME]{};
     DWORD physicalIndex = 0, minimum = 0, maximum = 0;
@@ -916,6 +953,14 @@ Command BuildMixer(const osd_model::Snapshot& source,
     Command cmd = Build(source, action, value);
     cmd.target = Target::Mixer;
     cmd.index = row;
+    return cmd;
+}
+Command BuildMedia(const osd_model::Snapshot& source, Action action,
+                   int actionCode = 0, int64_t position = 0) {
+    Command cmd = Build(source, action, actionCode);
+    cmd.target = Target::Media;
+    cmd.mediaPosition = position;
+    cmd.generation = source.media.selectionSerial;
     return cmd;
 }
 void Submit(const Command& cmd, HWND receiver) {
@@ -1031,6 +1076,56 @@ MixerButton MixerButtonGeometry(const osd_model::Snapshot& value,
     const double gap = std::clamp(bodyH * .025, 4.0, 10.0);
     return {true, size, std::max(0.0, (bodyW - size) / 2.0),
         std::max(0.0, bodyH - size - bottom), size + bottom + gap};
+}
+// Computed card layout, shared by future XAML painting and hit geometry.
+struct MediaGeometry {
+    Frame frame;
+    double artX = 0, artY = 0, artSize = 0;
+    double textX = 0, textW = 0, titleY = 0, artistY = 0;
+    double timelineY = 0, timeY = 0, controlsY = 0;
+    double controlRadius = 0, controlX[3]{};
+    double extraX = 0, extraY[2]{};
+};
+MediaGeometry MediaLayout(const osd_model::Snapshot& value) {
+    MediaGeometry g;
+    g.frame = LevelFrame(value);
+    const double w = g.frame.width, h = g.frame.height;
+    const double pad = std::clamp(value.innerPadding * .7, 9.0, 17.0);
+    const double artGap = std::clamp(w * .035, 8.0, 16.0);
+    const double availableW = std::max(1.0, w - 2.0 * pad);
+    const double availableH = std::max(1.0, h - 2.0 * pad);
+    const bool extra = (value.media.canShuffle && value.media.shuffleKnown) ||
+                       (value.media.canRepeat && value.media.repeatMode >= 0);
+    const double minControlW = extra ? 139.0 : 112.0;
+    g.artSize = std::max(1.0, std::min({
+        availableH, availableW * .52,
+        std::max(1.0, availableW - artGap - minControlW)}));
+    g.artX = pad;
+    g.artY = pad + std::max(0.0, (availableH - g.artSize) / 2.0);
+    g.textX = g.artX + g.artSize + artGap;
+    g.textW = std::max(1.0, w - pad - g.textX);
+    g.titleY = g.artY + g.artSize * .025;
+    g.artistY = g.artY + g.artSize * .235;
+    g.timelineY = g.artY + g.artSize * .448;
+    g.timeY = g.artY + g.artSize * .575;
+    g.controlsY = g.artY + g.artSize * .81;
+    const double scale = std::clamp(
+        value.media.controlSizePercent / 100.0, .9, 1.35);
+    // Include extra column AND all three controls before solving radius.
+    g.controlRadius = std::max(1.0, std::min({
+        g.artSize * .115 * scale, 20.0 * scale,
+        (g.textW - (extra ? 6.0 : 0.0)) / (extra ? 8.0 : 6.0)}));
+    const double extraW = extra ? 2.0 * g.controlRadius + 6.0 : 0.0;
+    const double first = g.textX + extraW + g.controlRadius;
+    const double gap = std::max(0.0, (g.textW - extraW -
+        6.0 * g.controlRadius) / 2.0);
+    g.controlX[0] = first;
+    g.controlX[1] = first + 2.0 * g.controlRadius + gap;
+    g.controlX[2] = g.controlX[1] + 2.0 * g.controlRadius + gap;
+    g.extraX = first - 1.5 * g.controlRadius - 4.0;
+    g.extraY[0] = g.controlsY - .55 * g.controlRadius;
+    g.extraY[1] = g.controlsY + .55 * g.controlRadius;
+    return g;
 }
 struct Status {
     Frame frame;
@@ -1221,7 +1316,7 @@ struct State {
     shapes::Rectangle track{nullptr};
     shapes::Rectangle fill{nullptr};
     media::RectangleGeometry fillClip{nullptr};
-    shapes::Ellipse thumb{nullptr};
+    shapes::Ellipse thumb{nullptr}, thumbCore{nullptr};
     // Shared status-card visual tree for Caps/Num/Scroll/Insert.
     controls::Border statusTile{nullptr};
     controls::TextBlock statusGlyph{nullptr}, statusTitle{nullptr},
@@ -1784,6 +1879,7 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
     state.thumb.Visibility(wx::Visibility::Collapsed);
+    state.thumbCore.Visibility(wx::Visibility::Collapsed);
 
     state.mixerChevron.Visibility(wx::Visibility::Collapsed);
     state.mixerSurface.Visibility(wx::Visibility::Collapsed);
@@ -1887,6 +1983,7 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
     state.thumb.Visibility(wx::Visibility::Collapsed);
+    state.thumbCore.Visibility(wx::Visibility::Collapsed);
     state.statusTile.Visibility(wx::Visibility::Collapsed);
     state.statusTitle.Visibility(wx::Visibility::Collapsed);
     state.statusDetail.Visibility(wx::Visibility::Collapsed);
@@ -1993,6 +2090,7 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
     state.thumb.Visibility(wx::Visibility::Collapsed);
+    state.thumbCore.Visibility(wx::Visibility::Collapsed);
     state.mixerChevron.Visibility(wx::Visibility::Collapsed);
     state.statusTile.Visibility(wx::Visibility::Collapsed);
     state.statusTitle.Visibility(wx::Visibility::Collapsed);
@@ -2252,7 +2350,8 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     }
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
-        !state.fillClip || !state.thumb || !state.statusTile) return;
+        !state.fillClip || !state.thumb || !state.thumbCore ||
+        !state.statusTile) return;
     if (state.current.kind != value.kind) state.wheelRemainder = 0;
     state.current = value;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
@@ -2293,7 +2392,12 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     state.value.Foreground(Brush(value.text));
     state.track.Fill(Brush(value.track));
     state.fill.Fill(Brush(value.accent));
-    state.thumb.Fill(Brush(value.accent));
+    // Mirror the Mixer's native Slider thumb: contrast shell and accent dot.
+    // This is presentation only; bar hit testing/commands are untouched.
+    state.thumb.Fill(Brush(0xffffff));
+    state.thumb.Stroke(Brush(value.accent));
+    state.thumb.StrokeThickness(1.0);
+    state.thumbCore.Fill(Brush(value.accent));
 
     const int percent = std::clamp(value.percent, 0, 100);
     // Segoe Fluent Icons is provided by Windows; no external font assets.
@@ -2390,6 +2494,13 @@ void DrawSnapshot(State& state, const Snapshot& value) {
             std::max(trackTop + thumbHalf, trackBottom - thumbHalf));
         controls::Canvas::SetLeft(state.thumb, centerX - thumbHalf);
         controls::Canvas::SetTop(state.thumb, thumbY - thumbHalf);
+        const double core = thumbSize * .62;
+        state.thumbCore.Width(core);
+        state.thumbCore.Height(core);
+        state.thumbCore.Visibility(thumbSize > 0.0 && value.valueKnown
+            ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+        controls::Canvas::SetLeft(state.thumbCore, centerX - core / 2.0);
+        controls::Canvas::SetTop(state.thumbCore, thumbY - core / 2.0);
         controls::Canvas::SetLeft(state.icon,
             std::max(0.0, (bodyW - iconW) / 2.0));
         controls::Canvas::SetTop(state.icon, iconTop);
@@ -2461,6 +2572,14 @@ void DrawSnapshot(State& state, const Snapshot& value) {
             std::max(thumbHalf, trackW - thumbHalf));
         controls::Canvas::SetLeft(state.thumb, trackX + thumbX - thumbHalf);
         controls::Canvas::SetTop(state.thumb, midY - thumbHalf);
+        const double core = thumbSize * .62;
+        state.thumbCore.Width(core);
+        state.thumbCore.Height(core);
+        state.thumbCore.Visibility(thumbSize > 0.0 && value.valueKnown
+            ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+        controls::Canvas::SetLeft(state.thumbCore,
+            trackX + thumbX - core / 2.0);
+        controls::Canvas::SetTop(state.thumbCore, midY - core / 2.0);
         controls::Canvas::SetLeft(state.icon, iconX);
         controls::Canvas::SetTop(state.icon,
             std::max(0.0, (bodyH - iconH) / 2.0));
@@ -2615,8 +2734,15 @@ void CreateContent(State& state) {
     shapes::Ellipse thumb;
     thumb.Width(11.0);
     thumb.Height(11.0);
-    thumb.Fill(Brush(0x67acff));
+    thumb.Fill(Brush(0xffffff));
+    thumb.Stroke(Brush(0x67acff));
+    thumb.StrokeThickness(1.0);
     canvas.Children().Append(thumb);
+    shapes::Ellipse thumbCore;
+    thumbCore.Width(7.0);
+    thumbCore.Height(7.0);
+    thumbCore.Fill(Brush(0x67acff));
+    canvas.Children().Append(thumbCore);
 
     controls::TextBlock value;
     value.Text(L"0%");
@@ -2727,6 +2853,7 @@ void CreateContent(State& state) {
     state.fill = fill;
     state.fillClip = fillClip;
     state.thumb = thumb;
+    state.thumbCore = thumbCore;
     state.value = value;
     state.statusTile = statusTile;
     state.statusGlyph = statusGlyph;
@@ -2832,6 +2959,7 @@ void CloseSurface(State& state) {
     state.statusTitle = nullptr;
     state.statusGlyph = nullptr;
     state.statusTile = nullptr;
+    state.thumbCore = nullptr;
     state.thumb = nullptr;
     state.fillClip = nullptr;
     state.fill = nullptr;
