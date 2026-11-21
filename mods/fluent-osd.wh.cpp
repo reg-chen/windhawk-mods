@@ -78,13 +78,32 @@ a bounded set of named colors (including `Transparent`, `White`,
 - **WindhawkBlur:** Supports tint, opacity, blur and noise options.
 - Arbitrary XAML, bindings and unsupported brush attributes are not
   accepted. Invalid definitions fall back to a solid background.
-  On non-activating OSD windows, AcrylicBrush uses an in-Island Composition
-  approximation rather than native XAML Acrylic. Both BackgroundSource values
-  use the tested Backdrop source; HostBackdrop is accepted as a compatibility
-  alias, not a true host-wide backdrop. This is a visual approximation of
-  native AcrylicBrush, not a byte-identical reproduction. Power/advanced
-  effects fallback is honored when FallbackColor is explicitly configured.
   Arbitrary XAML/XamlReader is not enabled in Explorer.
+
+## Native Acrylic A/B test (separate branch)
+
+This branch changes **only** the `AcrylicBrush` markup implementation to the
+real `Windows.UI.Xaml.Media.AcrylicBrush`, with `BackgroundSource="Backdrop"`.
+It samples XAML content inside the Island; it is **not** expected to blur the
+webpage or desktop outside the OSD window. Native Acrylic may use its solid
+`FallbackColor` depending on Windows state, accessibility, or host behavior.
+
+`BackgroundSource="HostBackdrop"` is **not supported** by this experimental
+renderer: a nested Grid layer cannot reliably own the window-wide backdrop.
+That value is rejected with an explicit diagnostic; it is **never** silently
+reinterpreted as `Backdrop`.
+
+`TintColor`, `TintOpacity`, optional `TintLuminosityOpacity`, `Opacity`,
+`FallbackColor`, and `AlwaysUseFallback` map to native brush properties.
+`WindhawkBlur` is unchanged, still uses the existing Composition effect
+pipeline, and serves as the side-by-side visual reference. Creating the native
+brush is **not** proof that Windows chose to render an acrylic effect.
+
+Test native mode:
+`<AcrylicBrush BackgroundSource="Backdrop" TintColor="#05070D" TintOpacity="0.74" TintLuminosityOpacity="0.16" FallbackColor="#FFFF00FF" />`
+The intentionally bright fallback identifies a solid-fallback case visually;
+remove or replace it after the test. Test `AlwaysUseFallback="True"` as a
+positive control for that fallback.
 
 ## Compatibility and limitations
 
@@ -2818,6 +2837,7 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
         auto fallback = tint;
         double opacity = 1.0, tintOpacity = 1.0, luminosityOpacity = 0.0;
         bool hasFallback = false, forceFallback = false;
+        bool hasLuminosityOpacity = false;
         for (const auto& attr : root.attrs) {
             if (attr.first == L"TintColor") {
                 if (!ParseBrushColor(state, attr.second, tint)) return false;
@@ -2831,14 +2851,19 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
             } else if (attr.first == L"TintLuminosityOpacity") {
                 if (!ParseBrushFraction(attr.second, luminosityOpacity))
                     return false;
+                hasLuminosityOpacity = true;
             } else if (attr.first == L"Opacity") {
                 if (!ParseBrushFraction(attr.second, opacity)) return false;
             } else if (attr.first == L"BackgroundSource") {
-                // Legacy HostBackdrop is accepted for compatibility.
-                // Non-activating XAML Islands use the known-working
-                // in-Island Composition backdrop for both spellings.
-                if (attr.second != L"HostBackdrop" &&
-                    attr.second != L"Backdrop") return false;
+                // HostBackdrop belongs to the host/window backdrop surface.
+                // Nested Grid layers cannot assume ownership of that surface.
+                // Never silently map HostBackdrop to another backdrop mode.
+                if (attr.second == L"HostBackdrop") {
+                    Wh_Log(L"Fluent OSD/XAML: HostBackdrop unsupported in "
+                           L"layered native AcrylicBrush; layer rejected");
+                    return false;
+                }
+                if (attr.second != L"Backdrop") return false;
             } else if (attr.first == L"AlwaysUseFallback") {
                 if (attr.second == L"True" || attr.second == L"true")
                     forceFallback = true;
@@ -2847,33 +2872,31 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
                 else return false;
             } else return false;
         }
+
+        // Native Windows.UI.Xaml.Media.AcrylicBrush test: unlike the
+        // Composition-based WindhawkBlurBrush, Backdrop samples XAML content
+        // inside this Island, NOT the web/desktop behind the OSD HWND.
+        // A solid fallback may therefore be expected on this host.
+        // Preserve native fallback handling rather than synthesizing blur.
         if (!hasFallback) fallback = tint;
-        if (forceFallback) {
-            auto solid = media::SolidColorBrush(fallback);
-            solid.Opacity(opacity);
-            output = solid;
-            return true;
-        }
-        // XAML's native AcrylicBrush falls back on inactive popup HWNDs.
-        // Keep the AcrylicBrush markup/API, but render its tint/luminosity
-        // via a bounded Composition effect in the XAML Border itself.
-        // This preserves card rounding and avoids a host-wide DWM backdrop.
-        osd_blur::BrushSpec acrylic;
-        acrylic.tint = tint;
-        acrylic.tint.A = static_cast<BYTE>(std::lround(
-            static_cast<double>(tint.A) * tintOpacity));
-        acrylic.tintLuminosityOpacity =
-            static_cast<float>(luminosityOpacity);
-        acrylic.blurAmount = 18.0f;
-        acrylic.noiseOpacity = 0.02f;
-        acrylic.fallback = fallback;
-        acrylic.hasFallback = hasFallback;
-        // Match m417z's XamlBlurBrush CreateBackdropBrush path; no
-        // DWM host backdrop flag or HWND-wide opaque rectangle is needed.
-        auto brush = winrt::make<osd_blur::WindhawkBlurBrush>(card, acrylic)
-                         .as<media::Brush>();
+        auto brush = media::AcrylicBrush();
+        brush.BackgroundSource(media::AcrylicBackgroundSource::Backdrop);
+        brush.TintColor(tint);
+        brush.TintOpacity(tintOpacity);
+        if (hasLuminosityOpacity)
+            brush.TintLuminosityOpacity(
+                winrt::box_value(luminosityOpacity)
+                    .as<winrt::Windows::Foundation::IReference<double>>());
+        brush.FallbackColor(fallback);
+        brush.AlwaysUseFallback(forceFallback);
         brush.Opacity(opacity);
         output = brush;
+
+        // Constructed != rendered. Windows may still choose solid fallback
+        // depending on the Island's active state and system policy.
+        Wh_Log(L"Fluent OSD/XAML: native AcrylicBrush constructed "
+               L"(source=Backdrop, forcedFallback=%d)",
+               forceFallback ? 1 : 0);
         return true;
     }
     if (root.name == L"ImageBrush") {
