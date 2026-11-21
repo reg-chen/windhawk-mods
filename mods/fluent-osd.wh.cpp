@@ -720,6 +720,7 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #include <limits>
 #include <cstdlib>
 #include <utility>
+#include <type_traits>
 #include <string>
 
 namespace {
@@ -1017,6 +1018,13 @@ Surface SurfaceGeometry(const osd_model::Snapshot& value,
     return out;
 }
 } // namespace osd_layout
+
+// Compile-time structural contracts: owned cross-thread view descriptions,
+// plain-value control commands, and no WinRT types at either boundary.
+static_assert(std::is_copy_constructible_v<osd_model::Snapshot>,
+    "OSD snapshots must own their data across the renderer boundary");
+static_assert(std::is_trivially_copyable_v<osd_control::Command>,
+    "OSD control commands must be plain-value transport records");
 
 // Optional native XAML backend. WinRT visual objects stay on its STA.
 namespace xaml_osd {
