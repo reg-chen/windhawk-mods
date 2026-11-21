@@ -775,6 +775,8 @@ struct MediaModel {
     bool canShuffle = false, shuffleKnown = false, shuffleActive = false;
     bool canRepeat = false, hasTimeline = false, canSeek = false;
     int repeatMode = -1, controlSizePercent = 100;
+    bool squareButtons = false;
+    int buttonCornerRadius = 6; // DIP radius in square mode, 0 = sharp.
     int64_t start = 0, end = 0, position = 0;
     uint64_t observedTick = 0;
 };
@@ -1084,6 +1086,14 @@ MixerButton MixerButtonGeometry(const osd_model::Snapshot& value,
         std::max(0.0, bodyH - size - bottom), size + bottom + gap};
 }
 // Computed card layout, shared by future XAML painting and hit geometry.
+// One shape policy for Previous/Play/Next, Shuffle/Repeat and session switch.
+double MediaButtonCornerRadius(const osd_model::MediaModel& model,
+                               double diameter) {
+    const double radius = std::max(0.0, diameter / 2.0);
+    return model.squareButtons
+        ? std::clamp(static_cast<double>(model.buttonCornerRadius), 0.0, radius)
+        : radius;
+}
 struct MediaGeometry {
     Frame frame;
     double artX = 0, artY = 0, artSize = 0;
@@ -2086,12 +2096,15 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
 
 // Native, scrollable Mixer panel. All controls are constructed on the XAML
 // STA from a copied view-model; no Core Audio pointers are shared with it.
-// The only BGRA -> WriteableBitmap adapter. Both clipboard and Mixer icons
-// use an owned snapshot, with the bitmap allocated only on the XAML STA.
+// The one BGRA -> WriteableBitmap adapter for clipboard, Mixer icons and
+// already-downscaled SMTC art. Clipboard has its own stricter source bounds.
+// Only the XAML STA creates the bitmap.
+constexpr uint32_t kMaxXamlBitmapSide = 320;
 imaging::WriteableBitmap BitmapFromPixels(
         uint32_t width, uint32_t height,
         const std::vector<uint8_t>& pixels) {
-    if (!width || !height || width > 224 || height > 164)
+    if (!width || !height || width > kMaxXamlBitmapSide ||
+        height > kMaxXamlBitmapSide)
         return imaging::WriteableBitmap{nullptr};
     const size_t bytes = static_cast<size_t>(width) * height * 4;
     if (bytes != pixels.size()) return imaging::WriteableBitmap{nullptr};
@@ -2141,12 +2154,34 @@ imaging::WriteableBitmap Decode(const std::vector<uint8_t>& bytes) {
     if (FAILED(frame->GetSize(&w,&h))||!w||!h||w>4096||h>4096||
         uint64_t(w)*h>8388608ULL)
         return imaging::WriteableBitmap{nullptr};
+    // Cover artwork often arrives as 300/512/1024px squares. The shared
+    // bitmap adapter intentionally owns a small bounded pixel buffer; feeding
+    // WIC's full-size decode into it silently discarded other SMTC covers.
+    // Constrain the longest side while preserving aspect ratio and let WIC
+    // downsample rather than allocating the original 8MP pixel buffer.
+    const double ratio = std::min(1.0, double(kMaxXamlBitmapSide) /
+        double(std::max(w, h)));
+    const UINT targetW = std::max<UINT>(1,
+        static_cast<UINT>(std::lround(double(w) * ratio)));
+    const UINT targetH = std::max<UINT>(1,
+        static_cast<UINT>(std::lround(double(h) * ratio)));
+    ComPtr<IWICBitmapScaler> scaler;
+    IWICBitmapSource* source = frame.Get();
+    if (targetW != w || targetH != h) {
+        if (FAILED(factory->CreateBitmapScaler(scaler.GetAddressOf())) ||
+            FAILED(scaler->Initialize(frame.Get(), targetW, targetH,
+                WICBitmapInterpolationModeFant)))
+            return imaging::WriteableBitmap{nullptr};
+        source = scaler.Get();
+    }
     ComPtr<IWICFormatConverter> cv;
-    if (FAILED(factory->CreateFormatConverter(cv.GetAddressOf()))||
-        FAILED(cv->Initialize(frame.Get(),GUID_WICPixelFormat32bppPBGRA,
-            WICBitmapDitherTypeNone,nullptr,0.0,WICBitmapPaletteTypeCustom)))
+    if (FAILED(factory->CreateFormatConverter(cv.GetAddressOf())) ||
+        FAILED(cv->Initialize(source, GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)))
         return imaging::WriteableBitmap{nullptr};
-    const uint32_t stride=w*4;
+    w = targetW;
+    h = targetH;
+    const uint32_t stride = w * 4;
     std::vector<uint8_t> pixels(static_cast<size_t>(stride)*h);
     if (FAILED(cv->CopyPixels(nullptr,stride,
              static_cast<UINT>(pixels.size()),pixels.data())))
@@ -2190,6 +2225,8 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         prev.repeatMode==m.repeatMode&&prev.hasTimeline==m.hasTimeline&&
         prev.canSeek==m.canSeek&&prev.start==m.start&&prev.end==m.end&&
         prev.controlSizePercent==m.controlSizePercent&&
+        prev.squareButtons==m.squareButtons&&
+        prev.buttonCornerRadius==m.buttonCornerRadius&&
         state.current.anchor.left==snap.anchor.left&&
         state.current.anchor.top==snap.anchor.top&&
         state.current.anchor.right==snap.anchor.right&&
@@ -2290,7 +2327,10 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         cycle.Width(2*r);cycle.Height(2*r);
         cycle.MinWidth(0);cycle.MinHeight(0);
         cycle.Padding(wx::Thickness{0,0,0,0});
-        cycle.CornerRadius(wx::CornerRadius{r,r,r,r});
+        const double corner = osd_layout::MediaButtonCornerRadius(
+            m, 2.0 * r);
+        cycle.CornerRadius(wx::CornerRadius{
+            corner, corner, corner, corner});
         cycle.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
         cycle.FontSize(std::max(10.0,r));
         cycle.Content(winrt::box_value(winrt::hstring(L"\uE76C")));
@@ -2357,8 +2397,9 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         b.Width(size);b.Height(size);
         b.MinWidth(0);b.MinHeight(0);
         b.Padding(wx::Thickness{0,0,0,0});
+        const double corner = osd_layout::MediaButtonCornerRadius(m, size);
         b.CornerRadius(wx::CornerRadius{
-            size/2,size/2,size/2,size/2});
+            corner, corner, corner, corner});
         b.HorizontalContentAlignment(wx::HorizontalAlignment::Center);
         b.VerticalContentAlignment(wx::VerticalAlignment::Center);
         b.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
@@ -10070,6 +10111,8 @@ osd_model::MediaModel BuildXamlMediaModel() {
     m.position=g_mediaCurrent.timelinePosition;
     m.observedTick=g_mediaCurrent.timelineObservedTick;
     m.controlSizePercent=g_mediaControlSizePercent.load();
+    m.squareButtons=g_controlButtonSquare.load();
+    m.buttonCornerRadius=g_controlButtonCornerRadius.load();
     if(!g_showMediaControls.load()) {
         m.canPrevious=m.canToggle=m.canNext=false;
         m.canShuffle=m.canRepeat=false;
