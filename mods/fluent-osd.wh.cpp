@@ -37,7 +37,9 @@ relay clicks/drags/wheels to the existing audio and brightness
 workers. DDC targets have independent XAML hosts and their original
 monitor identity. Caps/Num/Scroll/Insert now use a shared XAML status card.
 Both single-item and aggregated USB/Bluetooth/network notices now use native
-XAML with click-to-expand details and ScrollViewer. Remaining GDI+ paths are
+XAML with click-to-expand details and ScrollViewer. Keyboard backlight,
+airplane mode, camera/access, microphone, virtual desktop and system text
+events use the same XAML status card. Remaining GDI+ paths are
 transitional for clipboard/media/mixer and will be deleted as migration finishes.
 
 ## Features
