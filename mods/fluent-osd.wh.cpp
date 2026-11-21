@@ -3473,10 +3473,12 @@ int g_mixerDragIndex = -1;
 struct MixerEntry {
     std::wstring title;
     HICON appIcon = nullptr; // owned; released before clear
+    std::vector<uint8_t> iconPixels; // Captured once per session refresh.
     Microsoft::WRL::ComPtr<ISimpleAudioVolume> volume;
     float scalar = 0;
     bool muted = false;
 };
+std::vector<uint8_t> MixerIconPixels(HICON);
 [[clang::no_destroy]] std::vector<MixerEntry> g_mixerEntries;    // Explorer UI thread only
 [[clang::no_destroy]] Microsoft::WRL::ComPtr<IAudioEndpointVolume> g_mixerMaster;
 int g_mixerWheelRemainder = 0;
@@ -7661,6 +7663,7 @@ void RefreshMixer() {
             if (SUCCEEDED(info->GetProcessId(&pid))) {
                 if (entry.title.empty()) entry.title = ProcessTitle(pid);
                 entry.appIcon = ProcessIcon(pid);
+                entry.iconPixels = MixerIconPixels(entry.appIcon);
             }
             info->Release();
         }
@@ -9370,7 +9373,7 @@ osd_model::MixerModel BuildMixerModel() {
             std::lround(item.scalar * 100.0f)), 0, 100);
         row.muted = item.muted;
         row.enabled = item.volume.Get() != nullptr;
-        row.iconPixels = MixerIconPixels(item.appIcon);
+        row.iconPixels = item.iconPixels;
         model.rows.push_back(std::move(row));
     }
     return model;
