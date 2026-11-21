@@ -52,21 +52,33 @@ a single-line brush definition (without `Fill:=`).
 | Brush | Example |
 | --- | --- |
 | `SolidColorBrush` | `<SolidColorBrush Color="$mainColor" Opacity="0.8" />` |
-| `AcrylicBrush` | `<AcrylicBrush BackgroundSource="HostBackdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />` |
+| `AcrylicBrush` | `<AcrylicBrush BackgroundSource="Backdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />` |
 | `LinearGradientBrush` | `<LinearGradientBrush StartPoint="0,0" EndPoint="1,1"><GradientStop Color="$mainColor" Offset="0" /><GradientStop Color="#80000000" Offset="1" /></LinearGradientBrush>` |
 | `ImageBrush` | `<ImageBrush ImageSource="C:\Pictures\osd.png" Stretch="UniformToFill" Opacity="0.8" />` |
 | `WindhawkBlur` | `<WindhawkBlur BlurAmount="18" TintColor="$mainColor" TintOpacity="0.3" NoiseOpacity="0.02" />` |
 
 Supported color values include `#RRGGBB`, `#AARRGGBB`,
-`$mainColor`, `$accentColor`, `$textColor` and `$trackColor`.
+`$mainColor`, `$accentColor`, `$textColor`, `$trackColor`, and
+a bounded set of named colors (including `Transparent`, `White`,
+`Red`, `Yellow`, `Blue` and `LimeGreen`).
 
 - **ImageBrush:** Local absolute paths only, files up to 16 MiB;
-  images are decoded to at most 1024 pixels per side.
-- **LinearGradientBrush:** 2–12 gradient stops.
+  images are decoded to at most 1024 pixels per side. Supports native
+  Stretch, AlignmentX and AlignmentY.
+- **LinearGradientBrush:** 2–12 gradient stops; bounded coordinates,
+  MappingMode, SpreadMethod and ColorInterpolationMode are supported.
+  Gradient offsets may extend to 4 as in existing Styler examples.
+- **SolidColorBrush:** Native Color and Opacity, unchanged.
 - **WindhawkBlur:** Supports tint, opacity, blur and noise options.
 - Arbitrary XAML, bindings and unsupported brush attributes are not
   accepted. Invalid definitions fall back to a solid background.
-  Acrylic effects depend on Windows transparency settings.
+  On non-activating OSD windows, AcrylicBrush uses an in-Island Composition
+  approximation rather than native XAML Acrylic. Both BackgroundSource values
+  use the tested Backdrop source; HostBackdrop is accepted as a compatibility
+  alias, not a true host-wide backdrop. This is a visual approximation of
+  native AcrylicBrush, not a byte-identical reproduction. Power/advanced
+  effects fallback is honored when FallbackColor is explicitly configured.
+  Arbitrary XAML/XamlReader is not enabled in Explorer.
 
 ## Compatibility and limitations
 
@@ -330,7 +342,7 @@ External project and product names/trademarks belong to their owners.
           #! $min: 0
           #! $max: 100
           #! $format: slider
-        - ddcCustomBrush: '<AcrylicBrush BackgroundSource="HostBackdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />'
+        - ddcCustomBrush: '<AcrylicBrush BackgroundSource="Backdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />'
           $name: Custom background brush (single-line)
           $name:zh-TW: 自訂背景筆刷（單行）
           $description: Supports AcrylicBrush, SolidColorBrush, LinearGradientBrush, local ImageBrush and WindhawkBlur. Invalid definitions fall back to solid.
@@ -2620,6 +2632,32 @@ bool ParseBrushNumber(const std::wstring& input, double min, double max,
     value = static_cast<float>(num);
     return true;
 }
+// XAML gradient points may extend outside 0..1 or use absolute coordinates.
+// Keep parsing locale-independent and bounded to avoid untrusted numeric data
+// becoming NaN, infinity or enormous Composition geometry.
+bool ParseBrushCoordinate(const std::wstring& text, double& value) {
+    if (text.empty() || text.size() > 20) return false;
+    size_t pos = 0;
+    double sign = 1.0;
+    if (text[pos] == L'-' || text[pos] == L'+') {
+        sign = text[pos] == L'-' ? -1.0 : 1.0;
+        if (++pos == text.size()) return false;
+    }
+    double num = 0.0, scale = 1.0;
+    bool dot = false, digit = false;
+    for (; pos < text.size(); ++pos) {
+        const wchar_t c = text[pos];
+        if (c == L'.' && !dot) { dot = true; continue; }
+        if (c < L'0' || c > L'9') return false;
+        digit = true;
+        if (!dot) num = num * 10.0 + (c - L'0');
+        else { scale *= 0.1; num += (c - L'0') * scale; }
+        if (num > 4096.0) return false;
+    }
+    if (!digit) return false;
+    value = num * sign;
+    return true;
+}
 bool ParseBrushPoint(const std::wstring& text,
                      winrt::Windows::Foundation::Point& result) {
     const size_t comma = text.find(L',');
@@ -2627,8 +2665,8 @@ bool ParseBrushPoint(const std::wstring& text,
         comma + 1 >= text.size() ||
         text.find(L',', comma + 1) != std::wstring::npos) return false;
     double x = 0.0, y = 0.0;
-    if (!ParseBrushFraction(text.substr(0, comma), x) ||
-        !ParseBrushFraction(text.substr(comma + 1), y)) return false;
+    if (!ParseBrushCoordinate(text.substr(0, comma), x) ||
+        !ParseBrushCoordinate(text.substr(comma + 1), y)) return false;
     result = {static_cast<float>(x), static_cast<float>(y)};
     return true;
 }
@@ -2641,18 +2679,58 @@ bool ParseBrushColor(const Snapshot& state, const std::wstring& text,
     else if (text == L"$textColor") rgb = state.text;
     else if (text == L"$trackColor") rgb = state.track;
     else {
-        if (text.empty() || text[0] != L'#' ||
-            (text.size() != 7 && text.size() != 9)) return false;
+        // Bounded set of XAML named colors used by Styler-style themes.
+        // ThemeResource/markup expressions deliberately remain disallowed.
+        static constexpr std::pair<PCWSTR, uint32_t> kNamedColors[] = {
+            {L"Transparent", 0x00000000},
+            {L"Black", 0xFF000000},
+            {L"White", 0xFFFFFFFF},
+            {L"Red", 0xFFFF0000},
+            {L"Green", 0xFF008000},
+            {L"Blue", 0xFF0000FF},
+            {L"Yellow", 0xFFFFFF00},
+            {L"Lime", 0xFF00FF00},
+            {L"LimeGreen", 0xFF32CD32},
+            {L"Cyan", 0xFF00FFFF},
+            {L"Aqua", 0xFF00FFFF},
+            {L"Magenta", 0xFFFF00FF},
+            {L"Fuchsia", 0xFFFF00FF},
+            {L"Orange", 0xFFFFA500},
+            {L"Purple", 0xFF800080},
+            {L"Gray", 0xFF808080},
+            {L"Silver", 0xFFC0C0C0},
+            {L"DarkGray", 0xFFA9A9A9},
+            {L"LightGray", 0xFFD3D3D3},
+            {L"Navy", 0xFF000080},
+            {L"Teal", 0xFF008080},
+            {L"Olive", 0xFF808000},
+            {L"Maroon", 0xFF800000},
+            {L"DarkBlue", 0xFF00008B},
+        };
+        bool named = false;
         uint32_t packed = 0;
-        for (size_t i = 1; i < text.size(); ++i) {
-            const wchar_t c = text[i];
-            const int digit = c >= L'0' && c <= L'9' ? c - L'0' :
-                c >= L'a' && c <= L'f' ? c - L'a' + 10 :
-                c >= L'A' && c <= L'F' ? c - L'A' + 10 : -1;
-            if (digit < 0) return false;
-            packed = (packed << 4) | static_cast<uint32_t>(digit);
+        for (const auto& entry : kNamedColors) {
+            if (_wcsicmp(text.c_str(), entry.first) == 0) {
+                packed = entry.second;
+                named = true;
+                break;
+            }
         }
-        if (text.size() == 9) alpha = static_cast<BYTE>(packed >> 24);
+        if (named) {
+            alpha = static_cast<BYTE>(packed >> 24);
+        } else {
+            if (text.empty() || text[0] != L'#' ||
+                (text.size() != 7 && text.size() != 9)) return false;
+            for (size_t i = 1; i < text.size(); ++i) {
+                const wchar_t c = text[i];
+                const int digit = c >= L'0' && c <= L'9' ? c - L'0' :
+                    c >= L'a' && c <= L'f' ? c - L'a' + 10 :
+                    c >= L'A' && c <= L'F' ? c - L'A' + 10 : -1;
+                if (digit < 0) return false;
+                packed = (packed << 4) | static_cast<uint32_t>(digit);
+            }
+            if (text.size() == 9) alpha = static_cast<BYTE>(packed >> 24);
+        }
         rgb = packed & 0xFFFFFF;
     }
     color = {alpha, static_cast<BYTE>(rgb >> 16),
@@ -2698,9 +2776,7 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
             static_cast<BYTE>(state.background)};
         auto fallback = tint;
         double opacity = 1.0, tintOpacity = 1.0, luminosityOpacity = 0.0;
-        bool setTintOpacity = false, setLuminosity = false;
         bool hasFallback = false, forceFallback = false;
-        auto source = media::AcrylicBackgroundSource::HostBackdrop;
         for (const auto& attr : root.attrs) {
             if (attr.first == L"TintColor") {
                 if (!ParseBrushColor(state, attr.second, tint)) return false;
@@ -2711,19 +2787,17 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
             } else if (attr.first == L"TintOpacity") {
                 if (!ParseBrushFraction(attr.second, tintOpacity))
                     return false;
-                setTintOpacity = true;
             } else if (attr.first == L"TintLuminosityOpacity") {
                 if (!ParseBrushFraction(attr.second, luminosityOpacity))
                     return false;
-                setLuminosity = true;
             } else if (attr.first == L"Opacity") {
                 if (!ParseBrushFraction(attr.second, opacity)) return false;
             } else if (attr.first == L"BackgroundSource") {
-                if (attr.second == L"HostBackdrop")
-                    source = media::AcrylicBackgroundSource::HostBackdrop;
-                else if (attr.second == L"Backdrop")
-                    source = media::AcrylicBackgroundSource::Backdrop;
-                else return false;
+                // Legacy HostBackdrop is accepted for compatibility.
+                // Non-activating XAML Islands use the known-working
+                // in-Island Composition backdrop for both spellings.
+                if (attr.second != L"HostBackdrop" &&
+                    attr.second != L"Backdrop") return false;
             } else if (attr.first == L"AlwaysUseFallback") {
                 if (attr.second == L"True" || attr.second == L"true")
                     forceFallback = true;
@@ -2733,16 +2807,30 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
             } else return false;
         }
         if (!hasFallback) fallback = tint;
-        auto brush = media::AcrylicBrush();
-        brush.BackgroundSource(source);
-        brush.TintColor(tint);
-        brush.FallbackColor(fallback);
-        if (setTintOpacity) brush.TintOpacity(tintOpacity);
-        if (setLuminosity)
-            brush.TintLuminosityOpacity(winrt::box_value(
-                luminosityOpacity).as<
-                winrt::Windows::Foundation::IReference<double>>());
-        brush.AlwaysUseFallback(forceFallback);
+        if (forceFallback) {
+            auto solid = media::SolidColorBrush(fallback);
+            solid.Opacity(opacity);
+            output = solid;
+            return true;
+        }
+        // XAML's native AcrylicBrush falls back on inactive popup HWNDs.
+        // Keep the AcrylicBrush markup/API, but render its tint/luminosity
+        // via a bounded Composition effect in the XAML Border itself.
+        // This preserves card rounding and avoids a host-wide DWM backdrop.
+        osd_blur::BrushSpec acrylic;
+        acrylic.tint = tint;
+        acrylic.tint.A = static_cast<BYTE>(std::lround(
+            static_cast<double>(tint.A) * tintOpacity));
+        acrylic.tintLuminosityOpacity =
+            static_cast<float>(luminosityOpacity);
+        acrylic.blurAmount = 18.0f;
+        acrylic.noiseOpacity = 0.02f;
+        acrylic.fallback = fallback;
+        acrylic.hasFallback = hasFallback;
+        // Match m417z's XamlBlurBrush CreateBackdropBrush path; no
+        // DWM host backdrop flag or HWND-wide opaque rectangle is needed.
+        auto brush = winrt::make<osd_blur::WindhawkBlurBrush>(card, acrylic)
+                         .as<media::Brush>();
         brush.Opacity(opacity);
         output = brush;
         return true;
@@ -2754,6 +2842,8 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
         std::wstring path;
         double opacity = 1.0;
         auto stretch = media::Stretch::UniformToFill;
+        auto alignX = media::AlignmentX::Center;
+        auto alignY = media::AlignmentY::Center;
         for (const auto& attr : root.attrs) {
             if (attr.first == L"ImageSource") {
                 path = attr.second;
@@ -2769,6 +2859,20 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
                 else if (attr.second == L"None")
                     stretch = media::Stretch::None;
                 else return false;
+            } else if (attr.first == L"AlignmentX") {
+                if (attr.second == L"Left") alignX = media::AlignmentX::Left;
+                else if (attr.second == L"Center")
+                    alignX = media::AlignmentX::Center;
+                else if (attr.second == L"Right")
+                    alignX = media::AlignmentX::Right;
+                else return false;
+            } else if (attr.first == L"AlignmentY") {
+                if (attr.second == L"Top") alignY = media::AlignmentY::Top;
+                else if (attr.second == L"Center")
+                    alignY = media::AlignmentY::Center;
+                else if (attr.second == L"Bottom")
+                    alignY = media::AlignmentY::Bottom;
+                else return false;
             } else return false;
         }
         if (path.empty()) return false;
@@ -2777,6 +2881,8 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
         auto brush = media::ImageBrush();
         brush.ImageSource(pixels);
         brush.Stretch(stretch);
+        brush.AlignmentX(alignX);
+        brush.AlignmentY(alignY);
         brush.Opacity(opacity);
         output = brush;
         return true;
@@ -2853,6 +2959,20 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
             else if (attr.second == L"Repeat")
                 spread = media::GradientSpreadMethod::Repeat;
             else return false;
+        } else if (attr.first == L"MappingMode") {
+            if (attr.second == L"RelativeToBoundingBox")
+                brush.MappingMode(media::BrushMappingMode::RelativeToBoundingBox);
+            else if (attr.second == L"Absolute")
+                brush.MappingMode(media::BrushMappingMode::Absolute);
+            else return false;
+        } else if (attr.first == L"ColorInterpolationMode") {
+            if (attr.second == L"SRgbLinearInterpolation")
+                brush.ColorInterpolationMode(
+                    media::ColorInterpolationMode::SRgbLinearInterpolation);
+            else if (attr.second == L"ScRgbLinearInterpolation")
+                brush.ColorInterpolationMode(
+                    media::ColorInterpolationMode::ScRgbLinearInterpolation);
+            else return false;
         } else return false;
     }
     int count = 0;
@@ -2875,8 +2995,12 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
                     return false;
                 hasColor = true;
             } else if (attr.first == L"Offset") {
-                if (!ParseBrushFraction(attr.second, offset))
+                // Native XAML permits stops outside 0..1 (Styler themes do
+                // use this); keep a finite bounded range.
+                float bounded = 0.0f;
+                if (!ParseBrushNumber(attr.second, 0.0, 4.0, bounded))
                     return false;
+                offset = bounded;
                 hasOffset = true;
             } else return false;
         }
@@ -2909,7 +3033,9 @@ void ApplyBackground(State& state, const Snapshot& snapshot) {
     media::Brush brush{nullptr};
     bool valid = false;
     if (snapshot.customBackground) {
-        try { valid = TryBuildBackgroundBrush(snapshot, state.card, brush); }
+        try {
+            valid = TryBuildBackgroundBrush(snapshot, state.card, brush);
+        }
         catch (const winrt::hresult_error& ex) {
             Wh_Log(L"Custom background brush unavailable: 0x%08lX",
                    static_cast<unsigned long>(ex.code()));
