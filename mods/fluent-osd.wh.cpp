@@ -774,6 +774,9 @@ constexpr UINT kHideMessage = WM_APP + 681;
 constexpr UINT kInputMessage = WM_APP + 690; // To existing Explorer UI receiver.
 constexpr UINT_PTR kHideTimer = 683;
 constexpr UINT_PTR kFadeTimer = 684;
+constexpr UINT_PTR kStatusLineTimer = 685;
+constexpr double kOffLineRatio = .35;
+constexpr DWORD kStatusLineAnimationMs = 220;
 constexpr int kWidth = 354, kHeight = 49; // Default horizontal card pixels.
 
 std::atomic<HWND> g_ready{nullptr};
@@ -862,6 +865,13 @@ struct State {
     controls::TextBlock statusGlyph{nullptr}, statusTitle{nullptr},
                         statusDetail{nullptr};
     shapes::Rectangle statusUnderline{nullptr};
+    // Width is a ratio of the current text column; its center stays fixed.
+    // The previous interpolated ratio is retained for interruption/reversal.
+    bool statusLineAnimating = false;
+    ULONGLONG statusLineStart = 0;
+    double statusLineFrom = 1.0, statusLineTo = 1.0;
+    double statusLineRatio = 1.0, statusLineTextW = 0.0;
+    double statusLineCenterX = 0.0;
 
     // Intrinsic size of *all possible* speaker and volume-value states.
     // These change only with the corresponding font size; neither text
@@ -906,7 +916,9 @@ void HideSurface(State& state) {
     if (state.host) {
         KillTimer(state.host, kHideTimer);
         KillTimer(state.host, kFadeTimer);
+        KillTimer(state.host, kStatusLineTimer);
     }
+    state.statusLineAnimating = false;
     if (state.canvas) state.canvas.ReleasePointerCaptures();
     // CaptureLost may invoke the shared interaction callback and restart
     // the inactivity timer. Cancel once more before hiding the HWND.
@@ -1130,13 +1142,86 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
     ArmInteractionTimer(state, state.dragging || state.iconPressed);
 }
 
+
+// Native XAML status underline: animate a dimensionless width ratio instead
+// of pixel positions. The underline stays centered through custom size/DPI
+// changes, and a second key event reverses from its current visible width.
+void PaintStatusUnderline(State& state) {
+    if (!state.statusUnderline) return;
+    const double width = state.statusLineTextW * state.statusLineRatio;
+    state.statusUnderline.Width(width);
+    controls::Canvas::SetLeft(state.statusUnderline,
+        state.statusLineCenterX - width / 2.0);
+}
+
+void AdvanceStatusUnderline(State& state, ULONGLONG now) {
+    if (!state.statusLineAnimating) return;
+    const double fraction = std::clamp(
+        static_cast<double>(now - state.statusLineStart) /
+            kStatusLineAnimationMs, 0.0, 1.0);
+    // Cubic ease-in/out: gentle start and stop, symmetrical on reversal.
+    const double ease = fraction * fraction * (3.0 - 2.0 * fraction);
+    state.statusLineRatio = state.statusLineFrom +
+        (state.statusLineTo - state.statusLineFrom) * ease;
+    PaintStatusUnderline(state);
+    if (fraction >= 1.0) {
+        state.statusLineAnimating = false;
+        if (state.host) KillTimer(state.host, kStatusLineTimer);
+    }
+}
+
+void TransitionStatusUnderline(State& state, bool sameVisibleStatus,
+                               bool active, double textX, double textW) {
+    const ULONGLONG now = GetTickCount64();
+    // Capture the exact interpolated value before an interrupted transition.
+    AdvanceStatusUnderline(state, now);
+    const double target = active ? 1.0 : kOffLineRatio;
+    const bool sameTarget = sameVisibleStatus &&
+        state.current.statusActive == active;
+    if (!sameVisibleStatus) {
+        // A fresh card also animates, even when the prior popup expired.
+        // The alternate state provides a visible expansion/contraction.
+        state.statusLineRatio = active ? kOffLineRatio : 1.0;
+        state.statusLineAnimating = false;
+        if (state.host) KillTimer(state.host, kStatusLineTimer);
+    } else if (sameTarget && !state.statusLineAnimating) {
+        state.statusLineRatio = target;
+    }
+    state.statusLineTextW = textW;
+    state.statusLineCenterX = textX + textW / 2.0;
+    PaintStatusUnderline(state);
+
+    // Identical repeat events do not restart an in-flight animation.
+    if (sameTarget && state.statusLineAnimating) return;
+    if (std::abs(state.statusLineRatio - target) < 0.0001) {
+        state.statusLineRatio = target;
+        state.statusLineAnimating = false;
+        PaintStatusUnderline(state);
+        if (state.host) KillTimer(state.host, kStatusLineTimer);
+        return;
+    }
+    state.statusLineFrom = state.statusLineRatio;
+    state.statusLineTo = target;
+    state.statusLineStart = now;
+    state.statusLineAnimating = true;
+    if (!SetTimer(state.host, kStatusLineTimer, 16, nullptr)) {
+        state.statusLineAnimating = false;
+        state.statusLineRatio = target;
+        PaintStatusUnderline(state);
+    }
+}
+
 void DrawStatusSnapshot(State& state, const Snapshot& value) {
     if (!state.host || !state.card || !state.canvas ||
         !state.statusTile || !state.statusTitle || !state.statusGlyph ||
         !state.statusDetail || !state.statusUnderline) return;
     if (state.pointerActive && state.canvas)
         state.canvas.ReleasePointerCaptures();
-    state.current = value;
+    // Sample previous value before overwriting the key and toggle state.
+    const bool sameVisibleStatus =
+        IsWindowVisible(state.host) &&
+        state.current.kind == LevelKind::LockStatus &&
+        state.current.statusTitle == value.statusTitle;
     state.wheelRemainder = 0;
     state.dragging = state.iconPressed = state.pointerActive = false;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
@@ -1231,18 +1316,17 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     controls::Canvas::SetTop(state.statusTitle, top);
     controls::Canvas::SetLeft(state.statusDetail, textX);
     controls::Canvas::SetTop(state.statusDetail, top + titleFont * 1.43 + lineGap);
-    // ON spans the text column; OFF is shorter. Center both under the
-    // title/detail column using the actual computed underline width.
-    const double underlineW = value.statusActive ? textW : textW * .35;
-    state.statusUnderline.Width(underlineW);
+    // ON expands to the full text column; OFF contracts to 35%.
+    // Animate both while keeping the underline centered below the text.
     state.statusUnderline.Height(lineHeight);
     state.statusUnderline.RadiusX(lineHeight / 2.0);
     state.statusUnderline.RadiusY(lineHeight / 2.0);
     state.statusUnderline.Fill(Brush(value.accent,
         value.statusActive ? 255 : 145));
-    controls::Canvas::SetLeft(state.statusUnderline,
-        textX + (textW - underlineW) / 2.0);
     controls::Canvas::SetTop(state.statusUnderline, underlineTop);
+    TransitionStatusUnderline(state, sameVisibleStatus, value.statusActive,
+                              textX, textW);
+    state.current = value;
     ShowPositionedSurface(state, value, insetX, insetY, bodyW, bodyH);
 }
 
@@ -1258,6 +1342,9 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     state.current = value;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
     state.canvas.IsHitTestVisible(true);
+    if (state.statusLineAnimating && state.host)
+        KillTimer(state.host, kStatusLineTimer);
+    state.statusLineAnimating = false;
     state.statusTile.Visibility(wx::Visibility::Collapsed);
     state.statusTitle.Visibility(wx::Visibility::Collapsed);
     state.statusDetail.Visibility(wx::Visibility::Collapsed);
@@ -1521,6 +1608,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         state->fadeStart = GetTickCount64();
                         SetTimer(hwnd, kFadeTimer, 16, nullptr);
                     } else HideSurface(*state);
+                } else if (wp == kStatusLineTimer) {
+                    AdvanceStatusUnderline(*state, GetTickCount64());
                 } else if (wp == kFadeTimer && state->fading && state->card) {
                     const auto elapsed = GetTickCount64() - state->fadeStart;
                     const double duration = static_cast<double>(
