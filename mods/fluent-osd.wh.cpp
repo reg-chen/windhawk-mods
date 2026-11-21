@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.19
+// @version         1.0.20
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.19)
+## XAML migration experiment (v1.0.20)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -898,7 +898,7 @@ void SendInput(State& state, InputAction action, int value) {
     g_inputQueue.push_back(command);
     ReleaseSRWLockExclusive(&g_inputLock);
     if (!PostMessageW(state.current.receiver, kInputMessage, 0, 0)) {
-        Wh_Log(L"XAML v1.0.19: input post failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.20: input post failed (%lu)", GetLastError());
     }
 }
 
@@ -908,6 +908,9 @@ void HideSurface(State& state) {
         KillTimer(state.host, kFadeTimer);
     }
     if (state.canvas) state.canvas.ReleasePointerCaptures();
+    // CaptureLost may invoke the shared interaction callback and restart
+    // the inactivity timer. Cancel once more before hiding the HWND.
+    if (state.host) KillTimer(state.host, kHideTimer);
     state.dragging = state.iconPressed = state.pointerActive = false;
     state.fading = state.fadeOut = false;
     if (state.host) ShowWindow(state.host, SW_HIDE);
@@ -1111,7 +1114,7 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
     }
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.19: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.20: show failed (%lu)", GetLastError());
         return;
     }
     if (!wasVisible) {
@@ -1131,6 +1134,8 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     if (!state.host || !state.card || !state.canvas ||
         !state.statusTile || !state.statusTitle || !state.statusGlyph ||
         !state.statusDetail || !state.statusUnderline) return;
+    if (state.pointerActive && state.canvas)
+        state.canvas.ReleasePointerCaptures();
     state.current = value;
     state.wheelRemainder = 0;
     state.dragging = state.iconPressed = state.pointerActive = false;
@@ -1179,6 +1184,7 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
 
     state.statusTile.Width(tileSize);
     state.statusTile.Height(tileSize);
+    state.statusGlyph.Width(tileSize);
     const double tileRadius = std::min(tileSize * .19, radius);
     state.statusTile.CornerRadius(wx::CornerRadius{
         tileRadius, tileRadius, tileRadius, tileRadius});
@@ -1203,6 +1209,8 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.statusDetail.Foreground(Brush(value.text, 195));
     state.statusTitle.Width(textW);
     state.statusDetail.Width(textW);
+    state.statusTitle.TextTrimming(wx::TextTrimming::CharacterEllipsis);
+    state.statusDetail.TextTrimming(wx::TextTrimming::CharacterEllipsis);
     const double lineGap = std::clamp(bodyH * .045, 2.0, 6.0);
     const double textBlockH = titleFont * 1.43 + detailFont * 1.43 + lineGap;
     const double top = std::max(0.0, (bodyH - textBlockH) / 2.0 - 2.0);
@@ -1465,13 +1473,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.19: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.20: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.19: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.20: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
@@ -1666,7 +1674,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     // Island; the XAML Border provides the only visible card background.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
-    Wh_Log(L"XAML v1.0.19: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+    Wh_Log(L"XAML v1.0.20: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
         static_cast<unsigned long>(rounded),
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
@@ -1703,7 +1711,7 @@ void CloseSurface(State& state) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.19: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.20: island close failed"); }
         state.source = nullptr;
     }
     state.island = nullptr;
@@ -1738,7 +1746,7 @@ void DeliverPending(State& root) {
             try {
                 CreateSurface(*fresh, GetModuleHandleW(nullptr));
             } catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.19: DDC target create failed 0x%08lX",
+                Wh_Log(L"XAML v1.0.20: DDC target create failed 0x%08lX",
                     static_cast<unsigned long>(ex.code()));
                 CloseSurface(*fresh);
                 continue;
@@ -1763,7 +1771,7 @@ void TryEnableIslandTransparency() {
     try {
         auto currentWindow = wx::Window::Current();
         if (!currentWindow) {
-            Wh_Log(L"XAML v1.0.19: Window.Current unavailable for transparency");
+            Wh_Log(L"XAML v1.0.20: Window.Current unavailable for transparency");
             return;
         }
         ComPtr<IXamlSourceTransparency> transparency;
@@ -1772,10 +1780,10 @@ void TryEnableIslandTransparency() {
             reinterpret_cast<void**>(transparency.GetAddressOf()));
         if (SUCCEEDED(hr) && transparency)
             hr = transparency->put_IsBackgroundTransparent(1);
-        Wh_Log(L"XAML v1.0.19: Island transparency HRESULT=0x%08lX",
+        Wh_Log(L"XAML v1.0.20: Island transparency HRESULT=0x%08lX",
             static_cast<unsigned long>(hr));
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.19: transparency initialization exception 0x%08lX",
+        Wh_Log(L"XAML v1.0.20: transparency initialization exception 0x%08lX",
             static_cast<unsigned long>(ex.code()));
     }
 }
@@ -1808,7 +1816,7 @@ DWORD WINAPI ThreadProc(void*) {
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.19: renderer ready (per-display DDC)");
+                Wh_Log(L"XAML v1.0.20: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -1817,11 +1825,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.19: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.20: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.19: unexpected startup exception");
+        Wh_Log(L"XAML v1.0.20: unexpected startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -1830,7 +1838,7 @@ DWORD WINAPI ThreadProc(void*) {
     CloseSurface(root);
     if (root.manager) {
         try { root.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.19: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.20: manager close failed"); }
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
@@ -1844,7 +1852,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.19: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.20: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -5531,7 +5539,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
                 FindMonitorByDeviceName(target.event.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
-                Wh_Log(L"XAML v1.0.19: unresolved DDC display '%s'",
+                Wh_Log(L"XAML v1.0.20: unresolved DDC display '%s'",
                        target.event.device);
                 continue;
             }
@@ -5544,13 +5552,13 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
             push(master, anchor, g_scale);
     }
     if (batch.empty()) {
-        Wh_Log(L"XAML v1.0.19: no resolvable DDC snapshots");
+        Wh_Log(L"XAML v1.0.20: no resolvable DDC snapshots");
         xaml_osd::Hide();
         return false;
     }
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.19: DDC batch not delivered; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.20: DDC batch not delivered; NO GDI+ fallback");
     return ok;
 }
 
@@ -7938,7 +7946,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     HideGdiLevelForXaml();
     RECT target{};
     if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-        Wh_Log(L"Fluent OSD v1.0.19: XAML %s missing anchor",
+        Wh_Log(L"Fluent OSD v1.0.20: XAML %s missing anchor",
                brightness ? L"brightness" : L"volume");
         return;
     }
@@ -7948,13 +7956,13 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     const int index = brightness ? 1 : 0;
     if (xaml_osd::Show(snapshot)) {
         if (!routeLogged[index]) {
-            Wh_Log(L"Fluent OSD v1.0.19: native %s -> XAML only",
+            Wh_Log(L"Fluent OSD v1.0.20: native %s -> XAML only",
                    brightness ? L"brightness" : L"volume");
             routeLogged[index] = true;
         }
         unavailableLogged[index] = false;
     } else if (!unavailableLogged[index]) {
-        Wh_Log(L"Fluent OSD v1.0.19: XAML %s unavailable; NO GDI+ fallback",
+        Wh_Log(L"Fluent OSD v1.0.20: XAML %s unavailable; NO GDI+ fallback",
                brightness ? L"brightness" : L"volume");
         unavailableLogged[index] = true;
     }
@@ -7967,7 +7975,7 @@ void ShowMigratedXamlLockStatus() {
     HideGdiLevelForXaml();
     RECT target{};
     if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-        Wh_Log(L"XAML v1.0.19: lock status missing placement anchor");
+        Wh_Log(L"XAML v1.0.20: lock status missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlSnapshot(
@@ -7981,7 +7989,7 @@ void ShowMigratedXamlLockStatus() {
     snapshot.statusActive = g_lastLockValue;
     snapshot.durationMs = OsdDuration(DurationKind::LockKeys);
     if (!xaml_osd::Show(snapshot))
-        Wh_Log(L"XAML v1.0.19: lock status unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.20: lock status unavailable; NO GDI+ fallback");
 }
 
 void ShowNativeVolumePopup() {
@@ -8315,7 +8323,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (target != g_ddcTargets.end())
                     target->event.value = write.previousValue;
                 if (master) g_visible.value = write.previousValue;
-                Wh_Log(L"XAML v1.0.19: DDC write failed for '%s' index %lu",
+                Wh_Log(L"XAML v1.0.20: DDC write failed for '%s' index %lu",
                     write.event.device, write.event.physicalIndex);
                 if (g_popupKind == PopupKind::DdcBrightness)
                     (void)ShowXamlDdcTargets(g_visible);
@@ -9081,7 +9089,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.19 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.20 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
