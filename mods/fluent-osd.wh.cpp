@@ -1310,12 +1310,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
-                    ShowWindow(hwnd, SW_HIDE);
+                    HideAll(*state);
                 } catch (...) {
                     Wh_Log(L"XAML v1.0.17: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
-                    ShowWindow(hwnd, SW_HIDE);
+                    HideAll(*state);
                 }
             }
             return 0;
@@ -7805,6 +7805,9 @@ void ProcessXamlInputs() {
         if (selected == g_ddcTargets.end()) continue;
         auto& event = selected->event;
         if (event.maximum <= event.minimum) continue; // Unknown range.
+        // Keep the actively edited physical target in the XAML batch.
+        selected->expiresAt = GetTickCount64() +
+            OsdDuration(DurationKind::DdcBrightness);
         const DWORD range = event.maximum - event.minimum;
         int percent = 0;
         if (cmd.action == xaml_volume::InputAction::Wheel) {
