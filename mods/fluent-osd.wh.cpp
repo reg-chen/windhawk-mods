@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.25
+// @version         1.0.26
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.25)
+## XAML migration experiment (v1.0.26)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -43,8 +43,9 @@ events use the same XAML status card. Clipboard text/file notices reuse that
 status card; bounded image previews use a native WriteableBitmap, without
 passing GDI handles to the XAML thread. Mixer now has its own attached
 XAML Island and shares the existing Core Audio controller via typed commands.
-SMTC remains unported; legacy GDI+ code for all migrated categories stays
-only as an experimental comparison path until Windows regression validation.
+SMTC now has a paired native XAML Island; its MTA worker stays independent
+from view drawing. Commands return to the original Explorer controller.
+Legacy GDI+ is available only when experimental XAML is explicitly off.
 
 ## Features
 
@@ -146,8 +147,8 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
         - experimentalXamlVolume: false
           $name: Experimental XAML renderer for migrated OSDs (no fallback)
           $name:zh-TW: XAML 已遷移提示渲染開關（不回退）
-          $description: Enables XAML volume, brightness, lock keys, system/device/clipboard notices and the interactive Mixer. No GDI+ fallback for migrated categories. SMTC remains on the legacy renderer during migration.
-          $description:zh-TW: 音量、亮度、鎖定鍵、系統／裝置／剪貼簿通知與互動式混音器使用 XAML，已遷移類別不回退 GDI+。SMTC 尚在遷移，暫用舊渲染器。
+          $description: Enables XAML volume, brightness, lock keys, system/device/clipboard notices, Mixer and SMTC. No GDI+ fallback for migrated categories.
+          $description:zh-TW: 音量、亮度、鎖定鍵、系統／裝置／剪貼簿通知、混音器與 SMTC 使用 XAML，已遷移類別不回退 GDI+。
         - showCustomBrightness: false
           $name: Show custom Windows brightness OSD
           $name:zh-TW: 顯示自訂 Windows 亮度 OSD
@@ -679,6 +680,7 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #include <cstring>
 #include <cmath>
 #include <gdiplus.h>
+#include <wincodec.h>
 #include <dwmapi.h>
 #include <shellscalingapi.h>
 #include <cstdint>
@@ -761,14 +763,14 @@ DWORD PercentToRaw(DWORD minimum, DWORD maximum, int percent) {
 namespace osd_model {
 enum class Kind {
     Volume, NativeBrightness, DdcBrightness, LockStatus, NoticeStatus,
-    NativeEvent, ClipboardImage, Mixer
+    NativeEvent, ClipboardImage, Mixer, Media
 };
 enum class ChevronDirection { Left, Right, Up, Down };
 // Plain-value SMTC view state. The worker remains the sole GSMTC accessor.
 struct MediaModel {
     std::wstring sourceId, title, artist;
     std::vector<uint8_t> encodedArtwork;
-    uint32_t sessionCount = 0, selectionSerial = 0;
+    uint32_t generation = 0, sessionCount = 0, selectionSerial = 0;
     bool playing = false, canPrevious = false, canToggle = false, canNext = false;
     bool canShuffle = false, shuffleKnown = false, shuffleActive = false;
     bool canRepeat = false, hasTimeline = false, canSeek = false;
@@ -836,6 +838,7 @@ struct Snapshot {
     std::vector<uint8_t> clipboardPixels; // Bounded 32-bit BGRA, no HBITMAP on STA.
     MixerModel mixer;
     MediaModel media;
+    bool passiveRefresh = false;
     bool mixerChevron = false;
     ChevronDirection mixerDirection = ChevronDirection::Down;
     bool brightness = false;
@@ -857,8 +860,9 @@ struct Snapshot {
 
 // Functional transformations: unchanged input -> new owned output.
 // No renderer, HWND lookup or hardware operation occurs in these functions.
-enum class View { Level, Status, ClipboardImage, Mixer };
+enum class View { Level, Status, ClipboardImage, Mixer, Media };
 View SelectView(Kind kind) {
+    if (kind == Kind::Media) return View::Media;
     if (kind == Kind::Mixer) return View::Mixer;
     if (kind == Kind::ClipboardImage) return View::ClipboardImage;
     if (kind == Kind::LockStatus || kind == Kind::NoticeStatus ||
@@ -932,6 +936,7 @@ Target ForCategory(osd_model::Kind kind) {
         case osd_model::Kind::NativeBrightness: return Target::NativeBrightness;
         case osd_model::Kind::DdcBrightness: return Target::DdcBrightness;
         case osd_model::Kind::Mixer: return Target::Mixer;
+        case osd_model::Kind::Media: return Target::Media;
         default: return Target::None;
     }
 }
@@ -960,7 +965,8 @@ Command BuildMedia(const osd_model::Snapshot& source, Action action,
     Command cmd = Build(source, action, actionCode);
     cmd.target = Target::Media;
     cmd.mediaPosition = position;
-    cmd.generation = source.media.selectionSerial;
+    cmd.generation = source.media.generation;
+    cmd.index = static_cast<int>(source.media.selectionSerial);
     return cmd;
 }
 void Submit(const Command& cmd, HWND receiver) {
@@ -1277,6 +1283,7 @@ constexpr UINT kHideMessage = WM_APP + 681;
 constexpr UINT_PTR kHideTimer = 683;
 constexpr UINT_PTR kFadeTimer = 684;
 constexpr UINT_PTR kStatusLineTimer = 685;
+constexpr UINT_PTR kMediaProgressTimer = 686;
 constexpr double kOffLineRatio = .35;
 constexpr DWORD kStatusLineAnimationMs = 220;
 constexpr int kWidth = 354, kHeight = 49; // Default horizontal card pixels.
@@ -1334,9 +1341,18 @@ struct State {
                          mixerOutputs{nullptr};
     controls::ScrollViewer mixerRowsScroll{nullptr},
                            mixerOutputsScroll{nullptr};
-    bool mixerPopulating = false, mixerPeerOpen = false;
+    controls::Canvas mediaSurface{nullptr};
+    controls::Slider mediaSlider{nullptr};
+    controls::TextBlock mediaElapsed{nullptr};
+    controls::Image mediaCover{nullptr};
+    imaging::WriteableBitmap mediaBitmap{nullptr};
+    std::vector<uint8_t> mediaArtworkCache;
+    bool mediaPopulating = false, mediaDragging = false;
+    int64_t mediaPreview = 0;
+    uint64_t mediaPreviewHold = 0;
+    bool mixerPopulating = false, attachedPeerOpen = false;
     int mixerWheelRow = -1, mixerWheelRemainder = 0;
-    State* pairedMixer = nullptr;  // STA-only, owned by root.peers.
+    State* pairedPanel = nullptr;  // STA-only, owned by root.peers.
     State* pairedVolume = nullptr; // STA-only, root owns this State.
     bool noticeExpanded = false;
     double noticeHeaderH = 0;
@@ -1389,11 +1405,34 @@ void SendMixerInput(State& state, InputAction action, int index,
         state.current.receiver);
 }
 
+void ArmInteractionTimer(State&, bool);
+void SendMediaCommand(State& state, InputAction action,
+                      int value = 0, int64_t pos = 0) {
+    if (g_stopping.load() || !state.current.receiver) return;
+    osd_control::Submit(osd_control::BuildMedia(
+        state.current, action, value, pos), state.current.receiver);
+}
+void CompleteMediaSeek(State& state) {
+    if (!state.mediaDragging || state.current.kind != LevelKind::Media ||
+        !state.mediaSlider) return;
+    state.mediaDragging = false;
+    const auto& m = state.current.media;
+    if (!m.canSeek || !m.hasTimeline || m.end <= m.start) return;
+    const double ratio=std::clamp(state.mediaSlider.Value(),0.0,100.0)/100.0;
+    const int64_t dest=std::clamp(m.start+
+        static_cast<int64_t>(std::llround(double(m.end-m.start)*ratio)),
+        m.start,m.end);
+    state.mediaPreview=dest;
+    state.mediaPreviewHold=GetTickCount64()+1800;
+    SendMediaCommand(state,InputAction::MediaSeek,0,dest);
+    ArmInteractionTimer(state,true);
+}
 void HideSurface(State& state) {
     if (state.host) {
         KillTimer(state.host, kHideTimer);
         KillTimer(state.host, kFadeTimer);
         KillTimer(state.host, kStatusLineTimer);
+        KillTimer(state.host, kMediaProgressTimer);
     }
     state.statusLineAnimating = false;
     state.noticeExpanded = false;
@@ -1405,6 +1444,12 @@ void HideSurface(State& state) {
     }
     // Reclaim the bounded clipboard payload without shrink_to_fit allocation.
     std::vector<uint8_t>{}.swap(state.current.clipboardPixels);
+    if (state.mediaCover) state.mediaCover.Source(nullptr);
+    state.mediaBitmap=nullptr;
+    state.mediaArtworkCache.clear();
+    state.current.media.encodedArtwork.clear();
+    state.mediaDragging=false;
+    state.mediaPreviewHold=0;
     if (state.canvas) state.canvas.ReleasePointerCaptures();
     // CaptureLost may invoke the shared interaction callback and restart
     // the inactivity timer. Cancel once more before hiding the HWND.
@@ -1416,6 +1461,11 @@ void HideSurface(State& state) {
     // The action is idempotent and generation-checked at the receiver.
     if (state.current.kind == LevelKind::Mixer && !g_stopping.load())
         SendMixerInput(state, InputAction::CloseMixer, -1);
+    if (state.current.kind == LevelKind::Media && !g_stopping.load())
+        SendMediaCommand(state, InputAction::CloseMedia);
+    if ((state.current.kind == LevelKind::Media ||
+         state.current.kind == LevelKind::Mixer) && state.pairedVolume)
+        HideSurface(*state.pairedVolume);
 }
 
 void HideAll(State& root) {
@@ -1433,11 +1483,11 @@ void ArmInteractionTimer(State& state, bool active) {
         state.fading = state.fadeOut = false;
         if (state.card) state.card.Opacity(1.0);
     }
-    if (state.mixerPeerOpen && state.pairedMixer &&
-        state.pairedMixer->host) {
+    if (state.attachedPeerOpen && state.pairedPanel &&
+        state.pairedPanel->host) {
         // The attached pair is one interactive surface. Hovering either
         // card pauses the MIXER inactivity timer; volume stays visible.
-        State& panel = *state.pairedMixer;
+        State& panel = *state.pairedPanel;
         KillTimer(panel.host, kHideTimer);
         if (!(active || PointerInsideHost(state) ||
               PointerInsideHost(panel))) {
@@ -1447,7 +1497,8 @@ void ArmInteractionTimer(State& state, bool active) {
         }
         return;
     }
-    if (!active && state.current.kind == LevelKind::Mixer &&
+    if (!active && (state.current.kind == LevelKind::Mixer ||
+                    state.current.kind == LevelKind::Media) &&
         state.pairedVolume && PointerInsideHost(*state.pairedVolume))
         return;
     if (!active)
@@ -1495,7 +1546,8 @@ void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.canvas || !state.host ||
         (state.current.kind == LevelKind::LockStatus ||
          state.current.kind == LevelKind::NativeEvent ||
-         state.current.kind == LevelKind::Mixer)) return;
+         state.current.kind == LevelKind::Mixer ||
+         state.current.kind == LevelKind::Media)) return;
     const auto point = args.GetCurrentPoint(state.canvas);
     if (!point.Properties().IsLeftButtonPressed()) return;
     const auto pos = point.Position();
@@ -1580,7 +1632,8 @@ void PointerWheel(State& state, const xinput::PointerRoutedEventArgs& args) {
         state.current.kind == LevelKind::LockStatus ||
         state.current.kind == LevelKind::NoticeStatus ||
         state.current.kind == LevelKind::NativeEvent ||
-        state.current.kind == LevelKind::Mixer) return;
+        state.current.kind == LevelKind::Mixer ||
+        state.current.kind == LevelKind::Media) return;
     const int delta = args.GetCurrentPoint(state.canvas)
         .Properties().MouseWheelDelta();
     const int steps = osd_input::ConsumeWheelSteps(delta, state.wheelRemainder);
@@ -1675,7 +1728,7 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
     if (!SetWindowPos(state.host, HWND_TOPMOST,
                        placed.x, placed.y, placed.width, placed.height,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.25: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.26: show failed (%lu)", GetLastError());
         return;
     }
     if (!wasVisible) {
@@ -1688,7 +1741,8 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
         KillTimer(state.host, kFadeTimer);
         state.card.Opacity(1.0);
     }
-    ArmInteractionTimer(state, state.dragging || state.iconPressed);
+    if (!value.passiveRefresh || !wasVisible)
+        ArmInteractionTimer(state, state.dragging || state.iconPressed);
 }
 
 
@@ -2057,6 +2111,288 @@ imaging::WriteableBitmap BitmapFromPixels(
     return bitmap;
 }
 
+namespace media_artwork {
+// WIC adapter, never runs in SMTC worker, bounded to 1 MiB/8 megapixels.
+imaging::WriteableBitmap Decode(const std::vector<uint8_t>& bytes) {
+    if (bytes.empty() || bytes.size()>1024u*1024u)
+        return imaging::WriteableBitmap{nullptr};
+    HGLOBAL mem=GlobalAlloc(GMEM_MOVEABLE,bytes.size());
+    if (!mem) return imaging::WriteableBitmap{nullptr};
+    void* ptr=GlobalLock(mem);
+    if (!ptr) { GlobalFree(mem); return imaging::WriteableBitmap{nullptr}; }
+    memcpy(ptr,bytes.data(),bytes.size());
+    GlobalUnlock(mem);
+    ComPtr<IStream> stream;
+    if (FAILED(CreateStreamOnHGlobal(mem,TRUE,stream.GetAddressOf()))) {
+        GlobalFree(mem); return imaging::WriteableBitmap{nullptr};
+    }
+    ComPtr<IWICImagingFactory> factory;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory,nullptr,
+             CLSCTX_INPROC_SERVER,IID_PPV_ARGS(factory.GetAddressOf()))))
+        return imaging::WriteableBitmap{nullptr};
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(factory->CreateDecoderFromStream(stream.Get(),nullptr,
+             WICDecodeMetadataCacheOnLoad,decoder.GetAddressOf())))
+        return imaging::WriteableBitmap{nullptr};
+    ComPtr<IWICBitmapFrameDecode> frame;
+    if (FAILED(decoder->GetFrame(0,frame.GetAddressOf())))
+        return imaging::WriteableBitmap{nullptr};
+    UINT w=0,h=0;
+    if (FAILED(frame->GetSize(&w,&h))||!w||!h||w>4096||h>4096||
+        uint64_t(w)*h>8388608ULL)
+        return imaging::WriteableBitmap{nullptr};
+    ComPtr<IWICFormatConverter> cv;
+    if (FAILED(factory->CreateFormatConverter(cv.GetAddressOf()))||
+        FAILED(cv->Initialize(frame.Get(),GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone,nullptr,0.0,WICBitmapPaletteTypeCustom)))
+        return imaging::WriteableBitmap{nullptr};
+    const uint32_t stride=w*4;
+    std::vector<uint8_t> pixels(static_cast<size_t>(stride)*h);
+    if (FAILED(cv->CopyPixels(nullptr,stride,
+             static_cast<UINT>(pixels.size()),pixels.data())))
+        return imaging::WriteableBitmap{nullptr};
+    try { return BitmapFromPixels(w,h,pixels); }
+    catch (...) { return imaging::WriteableBitmap{nullptr}; }
+}
+}
+void AdvanceMediaTimeline(State& state) {
+    if (state.current.kind!=LevelKind::Media||
+        !state.mediaSlider||!state.mediaElapsed||state.mediaDragging) return;
+    const auto& m=state.current.media;
+    if (!m.hasTimeline||m.end<=m.start) return;
+    const uint64_t now=GetTickCount64();
+    if (now<state.mediaPreviewHold) return;
+    const int64_t pos=osd_model::MediaPosition(m,now);
+    state.mediaPopulating=true;
+    state.mediaSlider.Value(std::clamp(
+        100.0*double(pos-m.start)/double(m.end-m.start),0.0,100.0));
+    state.mediaElapsed.Text(osd_model::MediaTime(pos-m.start));
+    state.mediaPopulating=false;
+}
+void DrawMediaSnapshot(State& state,const Snapshot& snap) {
+    if (!state.host||!state.card||!state.canvas||!state.mediaSurface) return;
+    const auto& m=snap.media;
+    if (state.current.kind==LevelKind::Media&&state.mediaDragging&&
+        state.current.media.sourceId==m.sourceId&&
+        state.current.media.selectionSerial==m.selectionSerial)
+        return; // Seeking owns capture; do not reconstruct the controls.
+    const auto& prev=state.current.media;
+    const bool same=state.current.kind==LevelKind::Media &&
+        IsWindowVisible(state.host)&&prev.sourceId==m.sourceId &&
+        prev.selectionSerial==m.selectionSerial&&
+        prev.generation==m.generation&&prev.title==m.title&&
+        prev.artist==m.artist&&prev.encodedArtwork==m.encodedArtwork&&
+        prev.playing==m.playing&&prev.canPrevious==m.canPrevious&&
+        prev.canToggle==m.canToggle&&prev.canNext==m.canNext&&
+        prev.canShuffle==m.canShuffle&&prev.canRepeat==m.canRepeat&&
+        prev.shuffleKnown==m.shuffleKnown&&
+        prev.shuffleActive==m.shuffleActive&&
+        prev.repeatMode==m.repeatMode&&prev.hasTimeline==m.hasTimeline&&
+        prev.canSeek==m.canSeek&&prev.start==m.start&&prev.end==m.end&&
+        prev.controlSizePercent==m.controlSizePercent&&
+        state.current.anchor.left==snap.anchor.left&&
+        state.current.anchor.top==snap.anchor.top&&
+        state.current.anchor.right==snap.anchor.right&&
+        state.current.anchor.bottom==snap.anchor.bottom&&
+        state.current.scale==snap.scale;
+    if (state.mediaPreviewHold&&
+        (prev.sourceId!=m.sourceId||
+         prev.selectionSerial!=m.selectionSerial||
+         std::llabs(m.position-state.mediaPreview)<15000000LL))
+        state.mediaPreviewHold=0;
+    state.current=snap;
+    if (same) { AdvanceMediaTimeline(state); return; }
+    state.mediaDragging=false;
+    state.mediaPopulating=true;
+    state.dragging=state.iconPressed=state.pointerActive=false;
+    const auto g=osd_layout::MediaLayout(snap);
+    const double w=g.frame.width,h=g.frame.height;
+    state.canvas.IsHitTestVisible(true);
+    state.canvas.Width(w);state.canvas.Height(h);
+    state.card.Background(Brush(snap.background,snap.backgroundAlpha));
+    const double radius=std::clamp(double(snap.cornerRadius),0.0,34.0);
+    state.card.CornerRadius(wx::CornerRadius{
+        radius,radius,radius,radius});
+    state.card.BorderBrush(Brush(snap.track));
+    const double border=snap.borderless?0.0:1.0;
+    state.card.BorderThickness(wx::Thickness{border,border,border,border});
+    state.icon.Visibility(wx::Visibility::Collapsed);
+    state.value.Visibility(wx::Visibility::Collapsed);
+    state.track.Visibility(wx::Visibility::Collapsed);
+    state.fill.Visibility(wx::Visibility::Collapsed);
+    state.thumb.Visibility(wx::Visibility::Collapsed);
+    state.thumbCore.Visibility(wx::Visibility::Collapsed);
+    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerSurface.Visibility(wx::Visibility::Collapsed);
+    state.statusTile.Visibility(wx::Visibility::Collapsed);
+    state.statusTitle.Visibility(wx::Visibility::Collapsed);
+    state.statusDetail.Visibility(wx::Visibility::Collapsed);
+    state.statusUnderline.Visibility(wx::Visibility::Collapsed);
+    state.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.noticeHeading.Visibility(wx::Visibility::Collapsed);
+    state.noticeScroll.Visibility(wx::Visibility::Collapsed);
+    state.clipboardFrame.Visibility(wx::Visibility::Collapsed);
+    state.clipboardCaption.Visibility(wx::Visibility::Collapsed);
+    state.mediaSurface.Visibility(wx::Visibility::Visible);
+    state.mediaSurface.Width(w);state.mediaSurface.Height(h);
+    state.mediaSlider=nullptr;
+    state.mediaElapsed=nullptr;
+    state.mediaCover=nullptr;
+    state.mediaSurface.Children().Clear();
+    if (state.mediaArtworkCache!=m.encodedArtwork) {
+        state.mediaArtworkCache=m.encodedArtwork;
+        state.mediaBitmap=media_artwork::Decode(m.encodedArtwork);
+    }
+    auto place=[&](wx::FrameworkElement const& e,double x,double y) {
+        controls::Canvas::SetLeft(e,x);
+        controls::Canvas::SetTop(e,y);
+        state.mediaSurface.Children().Append(e);
+    };
+    controls::Border cover;
+    cover.Width(g.artSize);cover.Height(g.artSize);
+    const double cr=std::clamp(g.artSize*.056,4.0,14.0);
+    cover.CornerRadius(wx::CornerRadius{cr,cr,cr,cr});
+    cover.Background(Brush(snap.track,180));
+    if (state.mediaBitmap) {
+        controls::Image img;
+        img.Width(g.artSize);img.Height(g.artSize);
+        img.Stretch(media::Stretch::UniformToFill);
+        img.Source(state.mediaBitmap);
+        cover.Child(img);state.mediaCover=img;
+    } else {
+        controls::TextBlock fallback;
+        fallback.Text(L"\u266B");
+        fallback.FontSize(std::clamp(g.artSize*.3,20.0,48.0));
+        fallback.Foreground(Brush(snap.text,190));
+        fallback.TextAlignment(wx::TextAlignment::Center);
+        fallback.VerticalAlignment(wx::VerticalAlignment::Center);
+        cover.Child(fallback);
+    }
+    place(cover,g.artX,g.artY);
+    auto text=[&](const std::wstring& t,double x,double y,
+                  double width,double height,double font,BYTE alpha) {
+        controls::TextBlock v;
+        v.Text(winrt::hstring(t));
+        v.Width(std::max(1.0,width));v.Height(std::max(1.0,height));
+        v.FontSize(font);v.Foreground(Brush(snap.text,alpha));
+        v.TextTrimming(wx::TextTrimming::CharacterEllipsis);
+        v.VerticalAlignment(wx::VerticalAlignment::Center);
+        place(v,x,y);
+        return v;
+    };
+    text(m.title,g.textX,g.titleY,g.textW,g.artSize*.21,
+         std::clamp(snap.fontSize+1,12,22),255);
+    text(m.artist,g.textX,g.artistY,g.textW,g.artSize*.17,
+         std::clamp(snap.fontSize-2,10,18),190);
+    if (m.sessionCount>1&&g.artSize>45) {
+        const double r=std::clamp(g.artSize*.105,9.0,14.0);
+        controls::Button cycle;
+        cycle.Width(2*r);cycle.Height(2*r);
+        cycle.MinWidth(0);cycle.MinHeight(0);
+        cycle.Padding(wx::Thickness{0,0,0,0});
+        cycle.CornerRadius(wx::CornerRadius{r,r,r,r});
+        cycle.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+        cycle.FontSize(std::max(10.0,r));
+        cycle.Content(winrt::box_value(winrt::hstring(L"\uE76C")));
+        cycle.Background(Brush(0x181b22,205));
+        cycle.Foreground(Brush(0xffffff));
+        cycle.Click([&state](auto const&,auto const&) {
+            SendMediaCommand(state,InputAction::MediaAction,7);
+            ArmInteractionTimer(state,true);
+        });
+        place(cycle,g.artX+g.artSize-2*r-4,g.artY+4);
+    }
+    if (m.hasTimeline&&m.end>m.start) {
+        controls::Slider slider;
+        slider.Width(g.textW);
+        slider.Height(std::max(24.0,g.artSize*.18));
+        slider.MinWidth(0);
+        slider.Minimum(0);slider.Maximum(100);
+        slider.SmallChange(1);slider.IsEnabled(m.canSeek);
+        const int64_t pos=osd_model::MediaPosition(m,GetTickCount64());
+        slider.Value(std::clamp(100.0*double(pos-m.start)/
+            double(m.end-m.start),0.0,100.0));
+        state.mediaElapsed=text(osd_model::MediaTime(pos-m.start),
+            g.textX,g.timeY,g.textW*.5,std::max(12.0,g.artSize*.15),
+            std::clamp(snap.fontSize-4,9,14),190);
+        auto total=text(osd_model::MediaTime(m.end-m.start),
+            g.textX+g.textW*.5,g.timeY,g.textW*.5,
+            std::max(12.0,g.artSize*.15),
+            std::clamp(snap.fontSize-4,9,14),190);
+        total.TextAlignment(wx::TextAlignment::Right);
+        state.mediaSlider=slider;
+        slider.ValueChanged([&state](auto const&,auto const& a) {
+            if (state.mediaPopulating||
+                state.current.kind!=LevelKind::Media||
+                !state.current.media.canSeek) return;
+            const auto& m=state.current.media;
+            const int64_t p=m.start+static_cast<int64_t>(std::llround(
+                double(m.end-m.start)*
+                (std::clamp(a.NewValue(),0.0,100.0)/100.0)));
+            if (state.mediaElapsed)
+                state.mediaElapsed.Text(osd_model::MediaTime(p-m.start));
+            if (!state.mediaDragging)
+                SendMediaCommand(state,InputAction::MediaSeek,0,p);
+            ArmInteractionTimer(state,true);
+        });
+        slider.AddHandler(wx::UIElement::PointerPressedEvent(),
+            winrt::box_value(xinput::PointerEventHandler(
+                [&state](auto const&,auto const&) {
+                    if(state.current.kind==LevelKind::Media)
+                        state.mediaDragging=true;
+                })),true);
+        slider.AddHandler(wx::UIElement::PointerReleasedEvent(),
+            winrt::box_value(xinput::PointerEventHandler(
+                [&state](auto const&,auto const&) {
+                    CompleteMediaSeek(state);
+                })),true);
+        slider.PointerCaptureLost([&state](auto const&,auto const&) {
+            CompleteMediaSeek(state);
+        });
+        place(slider,g.textX,g.timelineY-std::max(3.0,g.artSize*.028));
+    }
+    auto action=[&](int code,const wchar_t* glyph,
+                    double x,double y,double size,bool enabled,bool active) {
+        controls::Button b;
+        b.Width(size);b.Height(size);
+        b.MinWidth(0);b.MinHeight(0);
+        b.Padding(wx::Thickness{0,0,0,0});
+        b.CornerRadius(wx::CornerRadius{
+            size/2,size/2,size/2,size/2});
+        b.HorizontalContentAlignment(wx::HorizontalAlignment::Center);
+        b.VerticalContentAlignment(wx::VerticalAlignment::Center);
+        b.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+        b.FontSize(std::max(10.0,size*.46));
+        b.Content(winrt::box_value(winrt::hstring(glyph)));
+        b.Background(Brush(active?snap.accent:snap.track,active?110:175));
+        b.Foreground(Brush(snap.text));b.IsEnabled(enabled);
+        b.Click([&state,code](auto const&,auto const&) {
+            SendMediaCommand(state,InputAction::MediaAction,code);
+            ArmInteractionTimer(state,true);
+        });
+        place(b,x-size/2,y-size/2);
+    };
+    const double sz=g.controlRadius*2;
+    if(m.canPrevious||m.canToggle||m.canNext) {
+        action(1,L"\uE892",g.controlX[0],g.controlsY,
+               sz,m.canPrevious,false);
+        action(2,m.playing?L"\uE769":L"\uE768",
+               g.controlX[1],g.controlsY,sz,m.canToggle,false);
+        action(3,L"\uE893",g.controlX[2],g.controlsY,
+               sz,m.canNext,false);
+    }
+    if(m.canShuffle&&m.shuffleKnown)
+        action(5,L"\uE8B1",g.extraX,g.extraY[0],
+               g.controlRadius,true,m.shuffleActive);
+    if(m.canRepeat&&m.repeatMode>=0)
+        action(6,m.repeatMode==1?L"\uE8ED":L"\uE8EE",
+               g.extraX,g.extraY[1],g.controlRadius,true,m.repeatMode>0);
+    state.mediaPopulating=false;
+    ShowPositionedSurface(state,snap,g.frame.insetX,g.frame.insetY,w,h);
+    if (m.hasTimeline&&m.playing)
+        SetTimer(state.host,kMediaProgressTimer,100,nullptr);
+    else KillTimer(state.host,kMediaProgressTimer);
+}
 void DrawMixerSnapshot(State& state, const Snapshot& data) {
     if (!state.host || !state.canvas || !state.card ||
         !state.mixerSurface || !state.mixerColumn ||
@@ -2331,10 +2667,16 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         DrawMixerSnapshot(state, value);
         return;
     }
+    if (view == osd_model::View::Media) {
+        DrawMediaSnapshot(state, value);
+        return;
+    }
     if (state.mixerChevron)
         state.mixerChevron.Visibility(wx::Visibility::Collapsed);
     if (state.mixerSurface)
         state.mixerSurface.Visibility(wx::Visibility::Collapsed);
+    if (state.mediaSurface)
+        state.mediaSurface.Visibility(wx::Visibility::Collapsed);
     if (view == osd_model::View::ClipboardImage) {
         DrawClipboardImageSnapshot(state, value);
         return;
@@ -2625,13 +2967,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.25: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.26: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.25: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.26: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
@@ -2660,6 +3002,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     } else HideSurface(*state);
                 } else if (wp == kStatusLineTimer) {
                     AdvanceStatusUnderline(*state, GetTickCount64());
+                } else if (wp == kMediaProgressTimer) {
+                    AdvanceMediaTimeline(*state);
                 } else if (wp == kFadeTimer && state->fading && state->card) {
                     const auto elapsed = GetTickCount64() - state->fadeStart;
                     const double duration = static_cast<double>(
@@ -2840,6 +3184,11 @@ void CreateContent(State& state) {
     mixerSurface.Child(mixerColumn);
     canvas.Children().Append(mixerSurface);
 
+    controls::Canvas mediaSurface;
+    mediaSurface.Visibility(wx::Visibility::Collapsed);
+    mediaSurface.Background(Brush(0,0));
+    canvas.Children().Append(mediaSurface);
+
     controls::Viewbox viewbox;
     viewbox.Stretch(media::Stretch::Fill);
     viewbox.Child(canvas);
@@ -2874,6 +3223,7 @@ void CreateContent(State& state) {
     state.mixerOutputs = mixerOutputs;
     state.mixerRowsScroll = mixerRowsScroll;
     state.mixerOutputsScroll = mixerOutputsScroll;
+    state.mediaSurface = mediaSurface;
     canvas.PointerPressed([&state](auto const&, const xinput::PointerRoutedEventArgs& e) {
         PointerPressed(state, e);
     });
@@ -2919,7 +3269,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     // Island; the XAML Border provides the only visible card background.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
-    Wh_Log(L"XAML v1.0.25: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+    Wh_Log(L"XAML v1.0.26: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
         static_cast<unsigned long>(rounded),
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
@@ -2940,6 +3290,12 @@ void CreateSurface(State& state, HINSTANCE instance) {
 
 void CloseSurface(State& state) {
     HideSurface(state);
+    state.mediaSlider=nullptr;
+    state.mediaElapsed=nullptr;
+    state.mediaCover=nullptr;
+    state.mediaBitmap=nullptr;
+    state.mediaArtworkCache.clear();
+    state.mediaSurface=nullptr;
     state.mixerOutputsScroll = nullptr;
     state.mixerRowsScroll = nullptr;
     state.mixerOutputs = nullptr;
@@ -2971,7 +3327,7 @@ void CloseSurface(State& state) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.25: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.26: island close failed"); }
         state.source = nullptr;
     }
     state.island = nullptr;
@@ -2989,18 +3345,25 @@ void DeliverPending(State& root) {
     ReleaseSRWLockExclusive(&g_snapshotLock);
     if (batch.empty()) return;
 
-    // Composite Mixer: primary volume card plus a second native XAML
-    // panel Island, both updated from a single owned snapshot batch.
+    // Volume and its attached Media/Mixer panel share one lifetime.
     if (batch.size() == 2 && batch.front().kind == LevelKind::Volume &&
-        batch.back().kind == LevelKind::Mixer) {
-        for (auto& peer : root.peers)
-            if (peer.first != L"mixer") HideSurface(*peer.second);
-        root.mixerPeerOpen = true;
+        (batch.back().kind == LevelKind::Mixer ||
+         batch.back().kind == LevelKind::Media)) {
+        const std::wstring panelKey =
+            batch.back().kind == LevelKind::Media ? L"media" : L"mixer";
+        for (auto it=root.peers.begin();it!=root.peers.end();) {
+            if (it->first!=panelKey) {
+                it->second->pairedVolume=nullptr;
+                CloseSurface(*it->second);
+                it=root.peers.erase(it);
+            } else ++it;
+        }
+        root.attachedPeerOpen = true;
         DrawSnapshot(root, batch.front());
         // Mixer owns the active inactivity timer while open. Do not hide
         // the parent volume card earlier than its attached panel.
         if (root.host) KillTimer(root.host, kHideTimer);
-        auto found = root.peers.find(L"mixer");
+        auto found = root.peers.find(panelKey);
         if (found == root.peers.end()) {
             auto fresh = std::make_unique<State>();
             try { CreateSurface(*fresh, GetModuleHandleW(nullptr)); }
@@ -3010,19 +3373,19 @@ void DeliverPending(State& root) {
                 CloseSurface(*fresh);
                 return;
             }
-            found = root.peers.emplace(L"mixer", std::move(fresh)).first;
+            found = root.peers.emplace(panelKey, std::move(fresh)).first;
         }
-        root.pairedMixer = found->second.get();
+        root.pairedPanel = found->second.get();
         found->second->pairedVolume = &root;
         DrawSnapshot(*found->second, batch.back());
         return;
     }
     const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
     if (!ddc) {
-        root.mixerPeerOpen = false;
-        root.pairedMixer = nullptr;
+        root.attachedPeerOpen = false;
+        root.pairedPanel = nullptr;
         for (auto it = root.peers.begin(); it != root.peers.end();) {
-            if (it->first == L"mixer") {
+            if (it->first == L"mixer" || it->first == L"media") {
                 it->second->pairedVolume = nullptr;
                 CloseSurface(*it->second);
                 it = root.peers.erase(it);
@@ -3034,8 +3397,8 @@ void DeliverPending(State& root) {
         DrawSnapshot(root, batch.back());
         return;
     }
-    root.mixerPeerOpen = false;
-    root.pairedMixer = nullptr;
+    root.attachedPeerOpen = false;
+    root.pairedPanel = nullptr;
     HideSurface(root);
     std::unordered_set<std::wstring> requested;
     for (const auto& snap : batch) {
@@ -3047,7 +3410,7 @@ void DeliverPending(State& root) {
             try {
                 CreateSurface(*fresh, GetModuleHandleW(nullptr));
             } catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.25: DDC target create failed 0x%08lX",
+                Wh_Log(L"XAML v1.0.26: DDC target create failed 0x%08lX",
                     static_cast<unsigned long>(ex.code()));
                 CloseSurface(*fresh);
                 continue;
@@ -3072,7 +3435,7 @@ void TryEnableIslandTransparency() {
     try {
         auto currentWindow = wx::Window::Current();
         if (!currentWindow) {
-            Wh_Log(L"XAML v1.0.25: Window.Current unavailable for transparency");
+            Wh_Log(L"XAML v1.0.26: Window.Current unavailable for transparency");
             return;
         }
         ComPtr<IXamlSourceTransparency> transparency;
@@ -3081,10 +3444,10 @@ void TryEnableIslandTransparency() {
             reinterpret_cast<void**>(transparency.GetAddressOf()));
         if (SUCCEEDED(hr) && transparency)
             hr = transparency->put_IsBackgroundTransparent(1);
-        Wh_Log(L"XAML v1.0.25: Island transparency HRESULT=0x%08lX",
+        Wh_Log(L"XAML v1.0.26: Island transparency HRESULT=0x%08lX",
             static_cast<unsigned long>(hr));
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.25: transparency initialization exception 0x%08lX",
+        Wh_Log(L"XAML v1.0.26: transparency initialization exception 0x%08lX",
             static_cast<unsigned long>(ex.code()));
     }
 }
@@ -3117,7 +3480,7 @@ DWORD WINAPI ThreadProc(void*) {
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.25: renderer ready (per-display DDC)");
+                Wh_Log(L"XAML v1.0.26: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -3126,18 +3489,18 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.25: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.26: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.25: unexpected startup exception");
+        Wh_Log(L"XAML v1.0.26: unexpected startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
     // Break STA-only peer references before either Island is destroyed;
     // CloseSurface releases pointer captures and may invoke callbacks.
-    root.mixerPeerOpen = false;
-    root.pairedMixer = nullptr;
+    root.attachedPeerOpen = false;
+    root.pairedPanel = nullptr;
     for (auto& peer : root.peers) {
         peer.second->pairedVolume = nullptr;
         CloseSurface(*peer.second);
@@ -3146,7 +3509,7 @@ DWORD WINAPI ThreadProc(void*) {
     CloseSurface(root);
     if (root.manager) {
         try { root.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.25: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.26: manager close failed"); }
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
@@ -3160,7 +3523,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.25: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.26: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -3176,6 +3539,10 @@ bool Show(const Snapshot& snapshot) {
     return ShowBatch(std::vector<Snapshot>{snapshot});
 }
 
+bool IsPrimaryVisible() {
+    const HWND hwnd=g_ready.load(std::memory_order_acquire);
+    return hwnd && IsWindowVisible(hwnd)!=FALSE;
+}
 void Hide() {
     const HWND hwnd = g_ready.load(std::memory_order_acquire);
     if (hwnd) PostMessageW(hwnd, kHideMessage, 0, 0);
@@ -3755,7 +4122,8 @@ float g_mixerMasterLevel = 0;
 bool g_mixerMasterMuted = false;
 // UI-thread controller state; XAML visual tree never owns Core Audio pointers.
 bool g_xamlMixerOpen = false, g_xamlMixerOutputExpanded = false;
-uint32_t g_xamlMixerGeneration = 1;
+bool g_xamlMediaOpen = false;
+uint32_t g_xamlMixerGeneration = 1, g_xamlMediaGeneration = 1;
 struct AudioOutputOption { std::wstring id; std::wstring name; };
 [[clang::no_destroy]] std::vector<AudioOutputOption> g_mixerOutputOptions; // UI thread only
 [[clang::no_destroy]] std::wstring g_mixerOutputId;
@@ -4173,7 +4541,9 @@ void ShowNotice(std::wstring, std::wstring, DurationKind, NoticeIcon);
 void ShowMigratedXamlDeviceNotice(DurationKind);
 void ShowMigratedXamlClipboardNotice();
 void ResetXamlMixerController();
+void ResetXamlMediaController();
 bool BuildMixerPanelAnchors(RECT& main, RECT& panel, float scale);
+bool ShowXamlMediaPanel(bool passiveRefresh = false);
 std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot();
 namespace bt_monitor {
     void Start();
@@ -6871,6 +7241,8 @@ xaml_osd::Snapshot MakeXamlStatusSnapshot(
 void HideGdiLevelForXaml() {
     if (g_popupKind != PopupKind::NativeVolume && g_xamlMixerOpen)
         ResetXamlMixerController();
+    if (g_popupKind != PopupKind::NativeVolume && g_xamlMediaOpen)
+        ResetXamlMediaController();
     if (g_popupWnd) {
         KillTimer(g_popupWnd, kHideTimer);
         KillTimer(g_popupWnd, kFadeTimer);
@@ -6879,7 +7251,8 @@ void HideGdiLevelForXaml() {
         ShowWindow(g_popupWnd, SW_HIDE);
     }
     HideMirroredWindows(false);
-    if (g_xamlMixerOpen && g_popupKind == PopupKind::NativeVolume) {
+    if ((g_xamlMixerOpen || g_xamlMediaOpen) &&
+        g_popupKind == PopupKind::NativeVolume) {
         // A rendering-backend hide must not perform a Mixer close:
         // ClosePanel also destroys the endpoint/session snapshot.
         if (g_panelWnd) ShowWindow(g_panelWnd, SW_HIDE);
@@ -6919,7 +7292,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
                 FindMonitorByDeviceName(target.event.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
-                Wh_Log(L"XAML v1.0.25: unresolved DDC display '%s'",
+                Wh_Log(L"XAML v1.0.26: unresolved DDC display '%s'",
                        target.event.device);
                 continue;
             }
@@ -6932,13 +7305,13 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
             push(master, anchor, g_scale);
     }
     if (batch.empty()) {
-        Wh_Log(L"XAML v1.0.25: no resolvable DDC snapshots");
+        Wh_Log(L"XAML v1.0.26: no resolvable DDC snapshots");
         xaml_osd::Hide();
         return false;
     }
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.25: DDC batch not delivered; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.26: DDC batch not delivered; NO GDI+ fallback");
     return ok;
 }
 
@@ -7763,6 +8136,13 @@ void StopMixerOutputNotifications() {
     g_mixerNotifyEnumerator.Reset();
 }
 
+void ResetXamlMediaController() {
+    if (!g_xamlMediaOpen) return;
+    g_xamlMediaOpen=false;
+    if (g_popupWnd) KillTimer(g_popupWnd,kMediaAnimationTimer);
+    ++g_xamlMediaGeneration;
+    if (!g_xamlMediaGeneration) ++g_xamlMediaGeneration;
+}
 void ResetXamlMixerController() {
     if (!g_xamlMixerOpen) return;
     g_xamlMixerOpen = false;
@@ -9356,10 +9736,14 @@ void ResetHideTimerFor(DurationKind kind) {
 // XAML-off setting; failure/initialization never silently paints the old UI.
 void ShowMigratedXamlLevel(PopupKind kind) {
     const bool brightness = kind == PopupKind::NativeBrightness;
+    if(!brightness&&g_showSmtcOnVolume.load()&&
+       g_mediaCurrent.available&&!g_xamlMixerOpen&&
+       ShowXamlMediaPanel()) return;
+    if(g_xamlMediaOpen) ResetXamlMediaController();
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"Fluent OSD v1.0.25: XAML %s missing anchor",
+        Wh_Log(L"Fluent OSD v1.0.26: XAML %s missing anchor",
                brightness ? L"brightness" : L"volume");
         return;
     }
@@ -9375,13 +9759,13 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     const int index = brightness ? 1 : 0;
     if (xaml_osd::Show(snapshot)) {
         if (!routeLogged[index]) {
-            Wh_Log(L"Fluent OSD v1.0.25: native %s -> XAML only",
+            Wh_Log(L"Fluent OSD v1.0.26: native %s -> XAML only",
                    brightness ? L"brightness" : L"volume");
             routeLogged[index] = true;
         }
         unavailableLogged[index] = false;
     } else if (!unavailableLogged[index]) {
-        Wh_Log(L"Fluent OSD v1.0.25: XAML %s unavailable; NO GDI+ fallback",
+        Wh_Log(L"Fluent OSD v1.0.26: XAML %s unavailable; NO GDI+ fallback",
                brightness ? L"brightness" : L"volume");
         unavailableLogged[index] = true;
     }
@@ -9394,7 +9778,7 @@ void ShowMigratedXamlLockStatus() {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.25: lock status missing placement anchor");
+        Wh_Log(L"XAML v1.0.26: lock status missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -9405,7 +9789,7 @@ void ShowMigratedXamlLockStatus() {
         ? Tr(OsdText::On) : Tr(OsdText::Off);
     snapshot.statusActive = g_lastLockValue;
     if (!xaml_osd::Show(snapshot))
-        Wh_Log(L"XAML v1.0.25: lock status unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.26: lock status unavailable; NO GDI+ fallback");
 }
 
 // Entire USB/Bluetooth/network category: single-item notifications and
@@ -9416,7 +9800,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.25: device notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.26: device notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -9434,7 +9818,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
         default: return;
     }
     if (!xaml_osd::Show(snapshot))
-        Wh_Log(L"XAML v1.0.25: device notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.26: device notice unavailable; NO GDI+ fallback");
 }
 
 // A native system event already has one immutable display payload; use
@@ -9444,7 +9828,7 @@ void ShowMigratedXamlNativeEvent() {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.25: native event missing placement anchor");
+        Wh_Log(L"XAML v1.0.26: native event missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -9502,7 +9886,7 @@ void ShowMigratedXamlNativeEvent() {
             return;
     }
     if (!xaml_osd::Show(snapshot))
-        Wh_Log(L"XAML v1.0.25: native event unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.26: native event unavailable; NO GDI+ fallback");
 }
 
 // Convert the already-downscaled clipboard HBITMAP into a private, bounded
@@ -9550,7 +9934,7 @@ void ShowMigratedXamlClipboardNotice() {
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         ClearClipboardThumbnail();
-        Wh_Log(L"XAML v1.0.25: clipboard notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.26: clipboard notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -9575,7 +9959,7 @@ void ShowMigratedXamlClipboardNotice() {
         snapshot.scale = g_scale;
     }
     if (!xaml_osd::Show(snapshot))
-        Wh_Log(L"XAML v1.0.25: clipboard notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.26: clipboard notice unavailable; NO GDI+ fallback");
 }
 
 
@@ -9658,9 +10042,44 @@ osd_model::MixerModel BuildMixerModel() {
     return model;
 }
 
+osd_model::MediaModel BuildXamlMediaModel() {
+    osd_model::MediaModel m;
+    m.generation=g_xamlMediaGeneration;
+    m.sessionCount=g_mediaCurrent.sessionCount;
+    m.selectionSerial=g_mediaCurrent.selectionSerial;
+    m.sourceId=g_mediaCurrent.sourceId;
+    m.title=g_mediaCurrent.title.empty()?
+        Tr(OsdText::MediaPlayback):g_mediaCurrent.title;
+    m.artist=g_mediaCurrent.artist;
+    if (g_showMediaArtwork.load())
+        m.encodedArtwork.assign(g_mediaCurrent.artwork.begin(),
+                                g_mediaCurrent.artwork.end());
+    m.playing=g_mediaCurrent.playing;
+    m.canPrevious=g_mediaCurrent.canPrevious;
+    m.canToggle=g_mediaCurrent.canToggle;
+    m.canNext=g_mediaCurrent.canNext;
+    m.canShuffle=g_mediaCurrent.canShuffle;
+    m.shuffleKnown=g_mediaCurrent.shuffleKnown;
+    m.shuffleActive=g_mediaCurrent.shuffleActive;
+    m.canRepeat=g_mediaCurrent.canRepeat;
+    m.repeatMode=g_mediaCurrent.repeatMode;
+    m.hasTimeline=g_mediaCurrent.hasTimeline;
+    m.canSeek=g_mediaCurrent.canSeek;
+    m.start=g_mediaCurrent.timelineStart;
+    m.end=g_mediaCurrent.timelineEnd;
+    m.position=g_mediaCurrent.timelinePosition;
+    m.observedTick=g_mediaCurrent.timelineObservedTick;
+    m.controlSizePercent=g_mediaControlSizePercent.load();
+    if(!g_showMediaControls.load()) {
+        m.canPrevious=m.canToggle=m.canNext=false;
+        m.canShuffle=m.canRepeat=false;
+    }
+    return m;
+}
 // Existing panel attachment/monitor geometry is shared with GDI+,
 // but neither XAML Island queries a GDI HWND for its position.
-bool BuildMixerPanelAnchors(RECT& main, RECT& panel, float scale) {
+bool BuildAttachedPanelAnchors(
+        RECT& main, RECT& panel, float scale, bool isMedia) {
     if (!osd_placement::CurrentAnchor(main)) return false;
     MONITORINFO mi{sizeof(mi)};
     if (!GetMonitorInfoW(MonitorFromRect(&main,
@@ -9668,9 +10087,11 @@ bool BuildMixerPanelAnchors(RECT& main, RECT& panel, float scale) {
     const bool vertical = g_verticalVolumeBrightness.load();
     const int mw = main.right - main.left, mh = main.bottom - main.top;
     const int pw = vertical ? static_cast<int>(std::lround(
-        g_verticalMixerWidth.load() * scale)) : mw;
+        (isMedia?g_verticalSmtcWidth.load():
+                 g_verticalMixerWidth.load())*scale)) : mw;
     const int ph = vertical ? mh : static_cast<int>(std::lround(
-        g_horizontalMixerHeight.load() * scale));
+        (isMedia?g_horizontalSmtcHeight.load():
+                 g_horizontalMixerHeight.load())*scale));
     const int position = g_position.load();
     const auto direction = DirectionForPopup(main, mi.rcWork,
                                              position, vertical);
@@ -9709,6 +10130,44 @@ bool BuildMixerPanelAnchors(RECT& main, RECT& panel, float scale) {
     return true;
 }
 
+bool BuildMixerPanelAnchors(RECT& main,RECT& panel,float scale) {
+    return BuildAttachedPanelAnchors(main,panel,scale,false);
+}
+bool BuildMediaPanelAnchors(RECT& main,RECT& panel,float scale) {
+    return BuildAttachedPanelAnchors(main,panel,scale,true);
+}
+bool ShowXamlMediaPanel(bool passiveRefresh) {
+    if(g_xamlMixerOpen||!g_showSmtcOnVolume.load()||
+       !g_mediaCurrent.available) return false;
+    RECT main{},panel{};
+    if(!BuildMediaPanelAnchors(main,panel,g_scale)) return false;
+    HideGdiLevelForXaml();
+    auto volume=MakeXamlSnapshot(PopupKind::NativeVolume,main,g_scale);
+    volume.durationMs=OsdDuration(DurationKind::Media);
+    volume.passiveRefresh=passiveRefresh;
+    if(volume.mixerChevron) {
+        RECT pairedMain{},pairedPanel{};
+        if(BuildMixerPanelAnchors(pairedMain,pairedPanel,g_scale))
+            volume.mixerDirection=osd_layout::MixerChevronDirection(
+                pairedMain,pairedPanel,volume.vertical,false);
+    }
+    auto media=MakeXamlSnapshot(PopupKind::NativeVolume,panel,g_scale);
+    media.kind=osd_model::Kind::Media;
+    media.mixerChevron=false;
+    media.durationMs=OsdDuration(DurationKind::Media);
+    media.passiveRefresh=passiveRefresh;
+    media.media=BuildXamlMediaModel();
+    if(!xaml_osd::ShowBatch({volume,media})) {
+        Wh_Log(L"XAML SMTC: panel unavailable; NO GDI+ fallback");
+        ResetXamlMediaController();
+        return false;
+    }
+    g_xamlMediaOpen=true;
+    if(g_popupWnd)
+        SetTimer(g_popupWnd,kMediaAnimationTimer,
+                 kMediaAnimationIntervalMs,nullptr);
+    return true;
+}
 void ShowXamlMixerPanel() {
     if (!g_xamlMixerOpen) return;
     RECT main{}, panel{};
@@ -9741,6 +10200,7 @@ void ShowNativeVolumePopup() {
     BrightnessEvent ev{};
     MovePopupToDisplay(ev);
     if (g_xamlForMigrated.load()) {
+        if(g_showSmtcOnVolume.load()&&!g_xamlMixerOpen) RequestMedia();
         if (g_xamlMixerOpen) ShowXamlMixerPanel();
         else ShowMigratedXamlLevel(PopupKind::NativeVolume);
         return;
@@ -9808,12 +10268,34 @@ ControlEffects ApplyOsdCommands(
     ControlEffects effects;
     if (g_closing.load()) return effects;
     for (const auto& cmd : commands) {
+        if(cmd.target==osd_control::Target::Media) {
+            if(!g_xamlMediaOpen||
+               cmd.generation!=g_xamlMediaGeneration) continue;
+            if(cmd.action==osd_control::Action::CloseMedia) {
+                ResetXamlMediaController();
+                continue;
+            }
+            if(cmd.index!=static_cast<int>(
+                    g_mediaCurrent.selectionSerial)) continue;
+            if(cmd.action==osd_control::Action::MediaAction) {
+                if(cmd.value>=1&&cmd.value<=7&&cmd.value!=4)
+                    RequestMedia(cmd.value);
+            } else if(cmd.action==osd_control::Action::MediaSeek&&
+                      g_mediaCurrent.canSeek&&g_mediaCurrent.hasTimeline&&
+                      g_mediaCurrent.timelineEnd>g_mediaCurrent.timelineStart) {
+                RequestMedia(4,std::clamp(cmd.mediaPosition,
+                    g_mediaCurrent.timelineStart,
+                    g_mediaCurrent.timelineEnd));
+            }
+            continue;
+        }
         if (cmd.target == osd_control::Target::Mixer) {
             if (cmd.action == osd_control::Action::OpenMixer) {
                 if (g_xamlMixerOpen) {
                     ResetXamlMixerController();
                 } else if (g_showMixerArrow.load() &&
                            g_popupKind == PopupKind::NativeVolume) {
+                    ResetXamlMediaController();
                     ClosePanel();
                     g_xamlMixerOutputExpanded = false;
                     RefreshMixer();
@@ -10108,12 +10590,21 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::llabs(g_mediaCurrent.timelinePosition -
                        g_mediaPreviewPosition) < 15000000LL)
             g_mediaSeekHoldUntil = 0;
-        UpdateMediaArtworkCache();
-        if (g_panelMode == PanelMode::Media && g_panelWnd &&
-            IsWindowVisible(g_panelWnd)) RenderPanel();
-        if (g_popupKind == PopupKind::NativeVolume &&
-            g_popupWnd && IsWindowVisible(g_popupWnd))
-            ShowVolumePanelIfReady();
+        if(!g_xamlForMigrated.load()) {
+            UpdateMediaArtworkCache();
+            if(g_panelMode==PanelMode::Media&&g_panelWnd&&
+               IsWindowVisible(g_panelWnd)) RenderPanel();
+            if(g_popupKind==PopupKind::NativeVolume&&g_popupWnd&&
+               IsWindowVisible(g_popupWnd)) ShowVolumePanelIfReady();
+        } else if(g_popupKind==PopupKind::NativeVolume&&
+                  !g_xamlMixerOpen&&xaml_osd::IsPrimaryVisible()) {
+            if(g_mediaCurrent.available&&g_showSmtcOnVolume.load())
+                (void)ShowXamlMediaPanel(true);
+            else {
+                ResetXamlMediaController();
+                ShowMigratedXamlLevel(PopupKind::NativeVolume);
+            }
+        }
         return 0;
     }
     if (msg == kLockToggleMessage && hwnd == g_receiveWnd) {
@@ -10165,7 +10656,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (target != g_ddcTargets.end())
                     target->event.value = write.previousValue;
                 if (master) g_visible.value = write.previousValue;
-                Wh_Log(L"XAML v1.0.25: DDC write failed for '%s' index %lu",
+                Wh_Log(L"XAML v1.0.26: DDC write failed for '%s' index %lu",
                     write.event.device, write.event.physicalIndex);
                 if (g_popupKind == PopupKind::DdcBrightness)
                     (void)ShowXamlDdcTargets(g_visible);
@@ -10251,6 +10742,18 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_TIMER && hwnd == g_popupWnd &&
         wp == kMediaAnimationTimer) {
+        if(g_xamlForMigrated.load()) {
+            if(!g_xamlMediaOpen) {
+                KillTimer(hwnd,kMediaAnimationTimer);
+                return 0;
+            }
+            const uint64_t now=GetTickCount64();
+            if(now-g_mediaLastRefreshTick>=kMediaRefreshIntervalMs) {
+                g_mediaLastRefreshTick=now;
+                RequestMedia();
+            }
+            return 0;
+        }
         if (g_panelMode != PanelMode::Media || !g_panelWnd ||
             !IsWindowVisible(g_panelWnd)) {
             KillTimer(hwnd, kMediaAnimationTimer);
@@ -10931,7 +11434,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.25 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.26 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
