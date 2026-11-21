@@ -957,6 +957,23 @@ Status StatusGeometry(const osd_model::Snapshot& value) {
     g.textTop = g.lock ? std::min(centeredTop, availableTop) : centeredTop;
     return g;
 }
+struct Details {
+    double rowH = 0, headingH = 0, viewportH = 0, totalH = 0;
+};
+Details DetailsGeometry(size_t rowCount, int fontSize, double workHeight,
+                        double headerH, double insetY, double pad) {
+    Details g;
+    g.rowH = std::max(26.0, fontSize * 1.8);
+    g.headingH = std::max(20.0, fontSize * 1.5);
+    const double maxExtra = std::max(g.rowH,
+        workHeight - headerH - 2.0 * insetY - 3.0 * pad);
+    g.viewportH = std::min({
+        static_cast<double>(rowCount) * g.rowH,
+        6.0 * g.rowH,
+        std::max(g.rowH, maxExtra - g.headingH - 2.0 * pad)});
+    g.totalH = headerH + g.headingH + g.viewportH + 2.0 * pad;
+    return g;
+}
 struct Clipboard {
     Frame frame;
     double inset = 0, radius = 0, previewW = 0, previewH = 0;
@@ -1036,7 +1053,6 @@ constexpr GUID kTransparencyIID = {
 constexpr wchar_t kClass[] = L"Windhawk.FluentOSD.XamlMigration.Host";
 constexpr UINT kShowMessage = WM_APP + 680;
 constexpr UINT kHideMessage = WM_APP + 681;
-constexpr UINT kInputMessage = osd_control::kMessage; // Renderer-neutral command delivery.
 constexpr UINT_PTR kHideTimer = 683;
 constexpr UINT_PTR kFadeTimer = 684;
 constexpr UINT_PTR kStatusLineTimer = 685;
@@ -1055,7 +1071,6 @@ HANDLE g_thread = nullptr;
 using LevelKind = osd_model::Kind;
 using Snapshot = osd_model::Snapshot;
 using InputAction = osd_control::Action;
-using InputCommand = osd_control::Command;
 std::vector<Snapshot> g_pending; // Atomic update batches for the XAML STA.
 
 struct State {
@@ -1510,22 +1525,19 @@ void UpdateNoticeDetails(State& state, const Snapshot& value,
         totalBodyH = headerH;
         return;
     }
-    const double rowH = std::max(26.0, value.fontSize * 1.8);
-    const double headingH = std::max(20.0, value.fontSize * 1.5);
-    const double scale = std::clamp(
-        static_cast<double>(value.scale), 0.5, 6.0);
     MONITORINFO mi{sizeof(mi)};
     const HMONITOR monitor = MonitorFromRect(&value.anchor,
                                             MONITOR_DEFAULTTONEAREST);
-    const double screenH = GetMonitorInfoW(monitor, &mi)
+    const double scale = std::clamp(
+        static_cast<double>(value.scale), 0.5, 6.0);
+    const double workH = GetMonitorInfoW(monitor, &mi)
         ? (mi.rcWork.bottom - mi.rcWork.top) / scale : 640.0;
-    const double maxExtra = std::max(rowH,
-        screenH - headerH - 2.0 * insetY - 3.0 * pad);
-    const double viewportH = std::min({
-        static_cast<double>(value.noticeDetails.size()) * rowH,
-        6.0 * rowH,
-        std::max(rowH, maxExtra - headingH - 2.0 * pad)});
-    totalBodyH = headerH + headingH + viewportH + 2.0 * pad;
+    const auto layout = osd_layout::DetailsGeometry(
+        value.noticeDetails.size(), value.fontSize,
+        workH, headerH, insetY, pad);
+    const double rowH = layout.rowH, headingH = layout.headingH;
+    const double viewportH = layout.viewportH;
+    totalBodyH = layout.totalH;
     state.noticeHeading.Text(winrt::hstring(value.noticeDetailsHeading));
     state.noticeHeading.FontSize(std::clamp(value.fontSize, 11, 22));
     state.noticeHeading.Foreground(Brush(value.text));
@@ -8867,9 +8879,9 @@ void ProcessXamlInputs() {
         if (cmd.target == osd_control::Target::Volume) {
             if (g_popupKind != PopupKind::NativeVolume) continue;
             bool ok = false;
-            if (cmd.action == xaml_osd::InputAction::ToggleMute)
+            if (cmd.action == osd_control::Action::ToggleMute)
                 ok = ToggleDefaultAudioMute();
-            else if (cmd.action == xaml_osd::InputAction::Wheel) {
+            else if (cmd.action == osd_control::Action::Wheel) {
                 const int steps = cmd.value / WHEEL_DELTA;
                 ok = steps != 0 && AdjustDefaultAudioWheel(steps);
             } else ok = SetDefaultAudioBarPercent(cmd.value);
@@ -8881,8 +8893,8 @@ void ProcessXamlInputs() {
         if (cmd.target == osd_control::Target::NativeBrightness) {
             if (g_popupKind != PopupKind::NativeBrightness ||
                 !g_nativePercentKnown) continue;
-            if (cmd.action == xaml_osd::InputAction::ToggleMute) continue;
-            const int requested = cmd.action == xaml_osd::InputAction::Wheel
+            if (cmd.action == osd_control::Action::ToggleMute) continue;
+            const int requested = cmd.action == osd_control::Action::Wheel
                 ? g_nativePercent + (cmd.value / WHEEL_DELTA) * kWheelStepPercent
                 : cmd.value;
             const int percent = std::clamp(requested, 0, 100);
@@ -8901,7 +8913,7 @@ void ProcessXamlInputs() {
 
         if (cmd.target != osd_control::Target::DdcBrightness ||
             g_popupKind != PopupKind::DdcBrightness ||
-            cmd.action == xaml_osd::InputAction::ToggleMute) continue;
+            cmd.action == osd_control::Action::ToggleMute) continue;
         const auto selected = std::find_if(
             g_ddcTargets.begin(), g_ddcTargets.end(),
             [&](const DdcTargetState& target) {
@@ -8916,7 +8928,7 @@ void ProcessXamlInputs() {
             OsdDuration(DurationKind::DdcBrightness);
         const DWORD range = event.maximum - event.minimum;
         int percent = 0;
-        if (cmd.action == xaml_osd::InputAction::Wheel) {
+        if (cmd.action == osd_control::Action::Wheel) {
             bool known = false;
             percent = BrightnessPercent(event, &known) +
                 (cmd.value / WHEEL_DELTA) * kWheelStepPercent;
@@ -8952,7 +8964,7 @@ void ProcessXamlInputs() {
 }
 
 LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (hwnd == g_receiveWnd && msg == xaml_osd::kInputMessage) {
+    if (hwnd == g_receiveWnd && msg == osd_control::kMessage) {
         ProcessXamlInputs();
         return 0;
     }
