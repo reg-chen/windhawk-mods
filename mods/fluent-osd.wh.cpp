@@ -848,6 +848,115 @@ std::vector<Command> Drain() {
 }
 } // namespace osd_control
 
+// Pure geometry functions. Inputs are owned values; outputs are dimensions
+// and coordinates only. No HWND queries, XAML controls, GDI state or timers.
+namespace osd_layout {
+struct Frame {
+    double insetX = 0, insetY = 0;
+    double width = 0, height = 0;
+};
+Frame CardFrame(const osd_model::Snapshot& value,
+                double insetXRatio, double insetYRatio) {
+    const double scale = std::clamp(
+        static_cast<double>(value.scale), 0.5, 6.0);
+    const double logicalW = std::max(32.0,
+        static_cast<double>(value.anchor.right - value.anchor.left) / scale);
+    const double logicalH = std::max(32.0,
+        static_cast<double>(value.anchor.bottom - value.anchor.top) / scale);
+    const double x = std::min(logicalW * insetXRatio, logicalW / 8.0);
+    const double y = std::min(logicalH * insetYRatio, logicalH / 8.0);
+    return {x, y, std::max(28.0, logicalW - x * 2.0),
+                  std::max(28.0, logicalH - y * 2.0)};
+}
+struct Status {
+    Frame frame;
+    bool lock = false, interactive = false;
+    double radius = 0, pad = 0, tileSize = 0, tileX = 0, tileY = 0;
+    double textX = 0, textW = 0, lineGap = 0;
+    double underlineH = 0, underlineTop = 0, textTop = 0;
+    int titleFont = 15, detailFont = 12;
+};
+Status StatusGeometry(const osd_model::Snapshot& value) {
+    Status g;
+    // The fractions preserve the former 296x92 base card margins, but
+    // all positions are recomputed from the actual current dimensions.
+    g.frame = CardFrame(value, 8.0 / 296.0, 7.0 / 92.0);
+    const double w = g.frame.width, h = g.frame.height;
+    g.lock = value.kind == osd_model::Kind::LockStatus;
+    g.interactive = value.kind == osd_model::Kind::NoticeStatus &&
+        value.noticeDetails.size() > 1;
+    g.radius = static_cast<double>(
+        std::clamp(value.cornerRadius, 0, 34));
+    g.pad = std::clamp(
+        static_cast<double>(value.innerPadding), 6.0, 22.0) * .68;
+    g.tileSize = std::max(18.0,
+        std::min(h - 2.0 * g.pad, h * .69));
+    g.tileX = g.pad;
+    g.tileY = (h - g.tileSize) / 2.0;
+    g.textX = g.tileX + g.tileSize + g.pad;
+    const double arrowW = g.interactive
+        ? std::max(15.0, g.pad * 1.7) : 0.0;
+    g.textW = std::max(1.0, w - g.textX - g.pad - arrowW);
+    g.titleFont = std::clamp(value.fontSize, 10, 24);
+    g.detailFont = std::max(10, g.titleFont - 3);
+    g.lineGap = std::clamp(h * .045, 2.0, 6.0);
+    const double textBlockH =
+        g.titleFont * 1.43 + g.detailFont * 1.43 + g.lineGap;
+    g.underlineH = std::max(2.0, h * .04);
+    const double bottomInset = std::max(g.pad, g.radius * .65);
+    g.underlineTop = std::max(0.0,
+        h - bottomInset - g.underlineH);
+    const double centeredTop = std::max(0.0,
+        (h - textBlockH) / 2.0 - 2.0);
+    const double availableTop = std::max(0.0,
+        g.underlineTop - g.lineGap - textBlockH);
+    g.textTop = g.lock ? std::min(centeredTop, availableTop) : centeredTop;
+    return g;
+}
+struct Clipboard {
+    Frame frame;
+    double inset = 0, radius = 0, previewW = 0, previewH = 0;
+    double captionFont = 12;
+};
+Clipboard ClipboardGeometry(const osd_model::Snapshot& value) {
+    Clipboard g;
+    g.frame = CardFrame(value, 8.0 / 264.0, 7.0 / 224.0);
+    g.inset = std::clamp(
+        static_cast<double>(value.innerPadding), 6.0, 22.0) * .68;
+    g.captionFont = std::clamp(value.fontSize - 2, 10, 18);
+    g.previewW = std::max(1.0, g.frame.width - 2.0 * g.inset);
+    g.previewH = std::max(1.0,
+        g.frame.height - 3.0 * g.inset - g.captionFont * 1.5);
+    g.radius = static_cast<double>(std::clamp(value.cornerRadius, 0, 34));
+    return g;
+}
+struct Surface {
+    int x = 0, y = 0, width = 0, height = 0;
+};
+Surface SurfaceGeometry(const osd_model::Snapshot& value,
+                        double insetX, double insetY,
+                        double width, double height,
+                        const RECT* work) {
+    const double scale = std::clamp(
+        static_cast<double>(value.scale), 0.5, 6.0);
+    Surface out;
+    out.width = std::max(28, static_cast<int>(std::lround(width * scale)));
+    out.height = std::max(28, static_cast<int>(std::lround(height * scale)));
+    out.x = value.anchor.left +
+        static_cast<int>(std::lround(insetX * scale));
+    out.y = value.anchor.top +
+        static_cast<int>(std::lround(insetY * scale));
+    if (work && value.kind == osd_model::Kind::NoticeStatus &&
+        height > static_cast<double>(
+            value.anchor.bottom - value.anchor.top) / scale -
+            2.0 * insetY + .5)
+        out.y = std::clamp(out.y, static_cast<int>(work->top),
+            std::max(static_cast<int>(work->top),
+                     static_cast<int>(work->bottom) - out.height));
+    return out;
+}
+} // namespace osd_layout
+
 // Optional native XAML backend. WinRT visual objects stay on its STA.
 namespace xaml_osd {
 namespace wx = winrt::Windows::UI::Xaml;
@@ -1225,24 +1334,15 @@ void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
 void ShowPositionedSurface(State& state, const Snapshot& value,
                            double insetX, double insetY,
                            double bodyW, double bodyH) {
-    const float scale = std::clamp(value.scale, 0.5f, 6.0f);
-    const int hostW = std::max(28, static_cast<int>(std::lround(bodyW * scale)));
-    const int hostH = std::max(28, static_cast<int>(std::lround(bodyH * scale)));
-    const int x = value.anchor.left +
-        static_cast<int>(std::lround(insetX * scale));
-    int y = value.anchor.top +
-        static_cast<int>(std::lround(insetY * scale));
-    if (value.kind == LevelKind::NoticeStatus && bodyH >
-        static_cast<double>(value.anchor.bottom - value.anchor.top) / scale -
-            2.0 * insetY + .5) {
-        MONITORINFO mi{sizeof(mi)};
-        if (GetMonitorInfoW(MonitorFromRect(&value.anchor,
-                MONITOR_DEFAULTTONEAREST), &mi)) {
-            const int top = static_cast<int>(mi.rcWork.top);
-            const int bottom = static_cast<int>(mi.rcWork.bottom);
-            y = std::clamp(y, top, std::max(top, bottom - hostH));
-        }
-    }
+    // Only this adapter asks Windows for work-area bounds. The positioning
+    // arithmetic itself is pure and can be exercised without an HWND.
+    MONITORINFO monitor{sizeof(monitor)};
+    const bool hasWork = GetMonitorInfoW(
+        MonitorFromRect(&value.anchor, MONITOR_DEFAULTTONEAREST),
+        &monitor) != FALSE;
+    const auto placed = osd_layout::SurfaceGeometry(value,
+        insetX, insetY, bodyW, bodyH,
+        hasWork ? &monitor.rcWork : nullptr);
     const bool wasVisible = IsWindowVisible(state.host) != FALSE;
     if (!wasVisible)
         state.card.Opacity(value.fadeEnabled ? 0.0 : 1.0);
@@ -1251,7 +1351,8 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
         state.fading = state.fadeOut = false;
         state.card.Opacity(1.0);
     }
-    if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
+    if (!SetWindowPos(state.host, HWND_TOPMOST,
+                       placed.x, placed.y, placed.width, placed.height,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
         Wh_Log(L"XAML v1.0.24: show failed (%lu)", GetLastError());
         return;
@@ -1444,36 +1545,18 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.dragging = state.iconPressed = state.pointerActive = false;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
 
-    // Same host canvas as other status notices: 296x92 by default. The
-    // card inset is proportional to the source status canvas, while actual
-    // card size and content columns are derived from the active bounds.
-    const double logicalW = std::max(32.0,
-        static_cast<double>(value.anchor.right - value.anchor.left) / state.scale);
-    const double logicalH = std::max(32.0,
-        static_cast<double>(value.anchor.bottom - value.anchor.top) / state.scale);
-    const double insetX = std::min(logicalW * (8.0 / 296.0), logicalW / 8.0);
-    const double insetY = std::min(logicalH * (7.0 / 92.0), logicalH / 8.0);
-    const double bodyW = std::max(28.0, logicalW - 2.0 * insetX);
-    const double bodyH = std::max(28.0, logicalH - 2.0 * insetY);
-    const double pad = std::clamp(
-        static_cast<double>(value.innerPadding), 6.0, 22.0) * .68;
-    const double tileSize = std::max(18.0,
-        std::min(bodyH - 2.0 * pad, bodyH * .69));
-    const double tileX = pad, tileY = (bodyH - tileSize) / 2.0;
-    const double textX = tileX + tileSize + pad;
-    const bool clickableNotice =
-        value.kind == LevelKind::NoticeStatus &&
-        value.noticeDetails.size() > 1;
-    const double arrowSpace = clickableNotice
-        ? std::max(15.0, pad * 1.7) : 0.0;
-    const double textW = std::max(1.0,
-        bodyW - textX - pad - arrowSpace);
+    const auto layout = osd_layout::StatusGeometry(value);
+    const double insetX = layout.frame.insetX, insetY = layout.frame.insetY;
+    const double bodyW = layout.frame.width, bodyH = layout.frame.height;
+    const double pad = layout.pad, tileSize = layout.tileSize;
+    const double tileX = layout.tileX, tileY = layout.tileY;
+    const double textX = layout.textX, textW = layout.textW;
+    const bool clickableNotice = layout.interactive;
 
     state.canvas.IsHitTestVisible(clickableNotice);
     state.canvas.Width(bodyW);
     state.card.Background(Brush(value.background, value.backgroundAlpha));
-    const double radius = static_cast<double>(
-        std::clamp(value.cornerRadius, 0, 34));
+    const double radius = layout.radius;
     state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
     state.card.BorderBrush(Brush(value.track));
     const double border = value.borderless ? 0.0 : 1.0;
@@ -1520,8 +1603,7 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
         value.statusFontIcon || value.statusActive ? 255 : 195));
     state.statusTitle.Text(winrt::hstring(value.statusTitle));
     state.statusDetail.Text(winrt::hstring(value.statusDetail));
-    const int titleFont = std::clamp(value.fontSize, 10, 24);
-    const int detailFont = std::max(10, titleFont - 3);
+    const int titleFont = layout.titleFont, detailFont = layout.detailFont;
     state.statusTitle.FontSize(titleFont);
     state.statusDetail.FontSize(detailFont);
     state.statusTitle.Foreground(Brush(value.text));
@@ -1530,23 +1612,10 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.statusDetail.Width(textW);
     state.statusTitle.TextTrimming(wx::TextTrimming::CharacterEllipsis);
     state.statusDetail.TextTrimming(wx::TextTrimming::CharacterEllipsis);
-    const double lineGap = std::clamp(bodyH * .045, 2.0, 6.0);
-    const double textBlockH = titleFont * 1.43 + detailFont * 1.43 + lineGap;
-    const double lineHeight = std::max(2.0, bodyH * .04);
-    // Reserve enough bottom clearance for the card's rounded corners.
-    // Keep the underline within the unrounded interior instead of
-    // anchoring it against the very bottom edge.
-    const double bottomInset = std::max(pad, radius * .65);
-    const double underlineTop = std::max(0.0,
-        bodyH - bottomInset - lineHeight);
-    const double centeredTextTop = std::max(0.0,
-        (bodyH - textBlockH) / 2.0 - 2.0);
-    // On short/high-radius cards, shift the text block upward to preserve
-    // its gap to the underline rather than overlapping either element.
-    const double availableTextTop = std::max(0.0,
-        underlineTop - lineGap - textBlockH);
-    const double top = lock ? std::min(centeredTextTop, availableTextTop)
-                            : centeredTextTop;
+    const double lineGap = layout.lineGap;
+    const double lineHeight = layout.underlineH;
+    const double underlineTop = layout.underlineTop;
+    const double top = layout.textTop;
     controls::Canvas::SetLeft(state.statusTitle, textX);
     controls::Canvas::SetTop(state.statusTitle, top);
     controls::Canvas::SetLeft(state.statusDetail, textX);
@@ -1580,23 +1649,12 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
         !state.clipboardFrame || !state.clipboardImage ||
         !state.clipboardCaption) return;
     state.scale = std::clamp(static_cast<double>(data.scale), 0.5, 6.0);
-    const double logicalW = std::max(32.0,
-        static_cast<double>(data.anchor.right - data.anchor.left) / state.scale);
-    const double logicalH = std::max(32.0,
-        static_cast<double>(data.anchor.bottom - data.anchor.top) / state.scale);
-    const double insetX = std::min(logicalW * (8.0 / 264.0), logicalW / 8.0);
-    const double insetY = std::min(logicalH * (7.0 / 224.0), logicalH / 8.0);
-    const double bodyW = std::max(28.0, logicalW - 2.0 * insetX);
-    const double bodyH = std::max(28.0, logicalH - 2.0 * insetY);
-    const double inset = std::clamp(
-        static_cast<double>(data.innerPadding), 6.0, 22.0) * .68;
-    const double captionFont = std::clamp(data.fontSize - 2, 10, 18);
-    const double captionHeight = captionFont * 1.5;
-    const double frameW = std::max(1.0, bodyW - 2.0 * inset);
-    const double frameH = std::max(1.0,
-        bodyH - 3.0 * inset - captionHeight);
-    const double radius = static_cast<double>(
-        std::clamp(data.cornerRadius, 0, 34));
+    const auto layout = osd_layout::ClipboardGeometry(data);
+    const double insetX = layout.frame.insetX, insetY = layout.frame.insetY;
+    const double bodyW = layout.frame.width, bodyH = layout.frame.height;
+    const double inset = layout.inset, captionFont = layout.captionFont;
+    const double frameW = layout.previewW, frameH = layout.previewH;
+    const double radius = layout.radius;
     state.canvas.IsHitTestVisible(false);
     state.canvas.Width(bodyW);
     state.canvas.Height(bodyH);
