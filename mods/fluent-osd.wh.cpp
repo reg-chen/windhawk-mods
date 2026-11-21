@@ -737,6 +737,7 @@ constexpr GUID kTransparencyIID = {
 constexpr wchar_t kClass[] = L"Windhawk.FluentOSD.XamlMigration.Host";
 constexpr UINT kShowMessage = WM_APP + 680;
 constexpr UINT kHideMessage = WM_APP + 681;
+constexpr UINT kInputMessage = WM_APP + 690; // To existing Explorer UI receiver.
 constexpr UINT_PTR kHideTimer = 683;
 constexpr int kWidth = 354, kHeight = 49; // Default horizontal card pixels.
 
@@ -774,6 +775,25 @@ struct Snapshot {
 };
 std::vector<Snapshot> g_pending; // Batched, atomic DDC update across monitors.
 
+enum class InputAction { SetPercent, Wheel, ToggleMute };
+struct InputCommand {
+    LevelKind kind = LevelKind::Volume;
+    InputAction action = InputAction::SetPercent;
+    int value = 0;
+    WCHAR device[CCHDEVICENAME]{};
+    DWORD physicalIndex = 0, minimum = 0, maximum = 0;
+};
+SRWLOCK g_inputLock = SRWLOCK_INIT;
+std::vector<InputCommand> g_inputQueue;
+
+std::vector<InputCommand> TakeInputs() {
+    std::vector<InputCommand> result;
+    AcquireSRWLockExclusive(&g_inputLock);
+    result.swap(g_inputQueue);
+    ReleaseSRWLockExclusive(&g_inputLock);
+    return result;
+}
+
 struct State {
     HWND host = nullptr, island = nullptr;
     HWND barInput = nullptr, iconInput = nullptr;
@@ -808,6 +828,166 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
     return media::SolidColorBrush(winrt::Windows::UI::Color{
         alpha, static_cast<BYTE>(rgb >> 16), static_cast<BYTE>(rgb >> 8),
         static_cast<BYTE>(rgb)});
+}
+
+// All audio/WMI/DDC writes stay on the original Explorer OSD UI thread.
+// The STA handles pointer geometry and sends only bounded POD commands.
+void SendInput(State& state, InputAction action, int value) {
+    if (g_stopping.load() || !state.current.receiver) return;
+    InputCommand command;
+    command.kind = state.current.kind;
+    command.action = action;
+    command.value = value;
+    wcscpy_s(command.device, state.current.device);
+    command.physicalIndex = state.current.physicalIndex;
+    command.minimum = state.current.minimum;
+    command.maximum = state.current.maximum;
+    AcquireSRWLockExclusive(&g_inputLock);
+    if (g_inputQueue.size() >= 64) g_inputQueue.erase(g_inputQueue.begin());
+    g_inputQueue.push_back(command);
+    ReleaseSRWLockExclusive(&g_inputLock);
+    if (!PostMessageW(state.current.receiver, kInputMessage, 0, 0)) {
+        Wh_Log(L"XAML v1.0.17: input post failed (%lu)", GetLastError());
+    }
+}
+
+void HideSurface(State& state) {
+    if (state.host) KillTimer(state.host, kHideTimer);
+    if (state.barInput) ShowWindow(state.barInput, SW_HIDE);
+    if (state.iconInput) ShowWindow(state.iconInput, SW_HIDE);
+    if (state.host) ShowWindow(state.host, SW_HIDE);
+    state.dragging = false;
+    state.iconPressed = false;
+}
+
+void HideAll(State& root) {
+    HideSurface(root);
+    for (auto& peer : root.peers) HideSurface(*peer.second);
+}
+
+// Window-based hit surfaces are independent of the legacy layered GDI+
+// hit targets; they do not draw any UI or own any COM/audio resources.
+void PositionInputs(State& state, int hostX, int hostY) {
+    if (!state.barInput || !state.iconInput) return;
+    const double scale = state.scale;
+    const double halo = std::max(6.0,
+        static_cast<double>(state.current.thumbDiameter) / 2.0 + 3.0);
+    auto place = [&](HWND window, double x, double y, double w, double h) {
+        if (w <= 0.0 || h <= 0.0) {
+            ShowWindow(window, SW_HIDE);
+            return;
+        }
+        const int px = hostX + static_cast<int>(std::lround(x * scale));
+        const int py = hostY + static_cast<int>(std::lround(y * scale));
+        const int pw = std::max(1, static_cast<int>(std::lround(w * scale)));
+        const int ph = std::max(1, static_cast<int>(std::lround(h * scale)));
+        SetWindowPos(window, HWND_TOPMOST, px, py, pw, ph,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    };
+    if (!state.current.valueKnown || state.trackW <= 0 || state.trackH <= 0)
+        ShowWindow(state.barInput, SW_HIDE);
+    else
+        place(state.barInput, state.trackX - halo, state.trackY - halo,
+              state.trackW + 2 * halo, state.trackH + 2 * halo);
+    if (state.current.kind == LevelKind::Volume && state.current.showIcon)
+        place(state.iconInput, state.iconX - halo, state.iconY - halo,
+              state.iconW + 2 * halo, state.iconH + 2 * halo);
+    else ShowWindow(state.iconInput, SW_HIDE);
+}
+
+void DragTrack(State& state, HWND hwnd, LPARAM lp) {
+    if (state.trackW <= 0 || state.trackH <= 0 ||
+        !state.current.valueKnown) return;
+    POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+    if (!ClientToScreen(hwnd, &pt)) return;
+    RECT rect{};
+    if (!GetWindowRect(state.host, &rect)) return;
+    const double x = (pt.x - rect.left) / state.scale;
+    const double y = (pt.y - rect.top) / state.scale;
+    const double fraction = state.current.vertical
+        ? (state.trackY + state.trackH - y) / state.trackH
+        : (x - state.trackX) / state.trackW;
+    const int percent = std::clamp(static_cast<int>(std::lround(
+        std::clamp(fraction, 0.0, 1.0) * 100.0)), 0, 100);
+    if (percent == state.current.percent) return;
+    state.current.percent = percent;
+    if (state.current.kind == LevelKind::DdcBrightness) {
+        const auto min = state.current.minimum;
+        const auto max = state.current.maximum;
+        state.current.rawValue = static_cast<int>(min +
+            static_cast<DWORD>(std::lround(
+                static_cast<double>(max - min) * percent / 100.0)));
+    } else state.current.rawValue = percent;
+    SendInput(state, InputAction::SetPercent, percent);
+    // Keep the preview responsive even when a DDC/CI write is pending.
+    // Actual hardware writes are asynchronous through the existing worker.
+    const auto updated = state.current;
+    DrawSnapshot(state, updated);
+    if (state.host) KillTimer(state.host, kHideTimer);
+}
+
+bool HandleInputWindow(State& state, HWND hwnd, UINT message,
+                       WPARAM wp, LPARAM lp, LRESULT& result) {
+    const bool bar = hwnd == state.barInput;
+    const bool icon = hwnd == state.iconInput;
+    if (!bar && !icon) return false;
+    switch (message) {
+        case WM_MOUSEACTIVATE: result = MA_NOACTIVATE; return true;
+        case WM_NCHITTEST: result = HTCLIENT; return true;
+        case WM_SETCURSOR:
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            result = TRUE;
+            return true;
+        case WM_LBUTTONDOWN:
+            if (bar) {
+                state.dragging = true;
+                SetCapture(hwnd);
+                if (state.host) KillTimer(state.host, kHideTimer);
+                DragTrack(state, hwnd, lp);
+            } else {
+                state.iconPressed = true;
+                SetCapture(hwnd);
+                if (state.host) KillTimer(state.host, kHideTimer);
+            }
+            result = 0; return true;
+        case WM_MOUSEMOVE:
+            if (bar && state.dragging) DragTrack(state, hwnd, lp);
+            result = 0; return true;
+        case WM_LBUTTONUP: {
+            if (bar && state.dragging) DragTrack(state, hwnd, lp);
+            if (icon && state.iconPressed) {
+                RECT bounds{};
+                GetClientRect(hwnd, &bounds);
+                POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                if (PtInRect(&bounds, point))
+                    SendInput(state, InputAction::ToggleMute, 0);
+            }
+            state.dragging = false;
+            state.iconPressed = false;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            if (state.host) SetTimer(state.host, kHideTimer,
+                state.current.durationMs, nullptr);
+            result = 0; return true;
+        }
+        case WM_MOUSEWHEEL:
+            if (bar) {
+                SendInput(state, InputAction::Wheel,
+                    GET_WHEEL_DELTA_WPARAM(wp));
+                if (state.host) {
+                    KillTimer(state.host, kHideTimer);
+                    SetTimer(state.host, kHideTimer,
+                             state.current.durationMs, nullptr);
+                }
+            }
+            result = 0; return true;
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE:
+            state.dragging = false;
+            state.iconPressed = false;
+            result = 0; return true;
+        case WM_ERASEBKGND: result = TRUE; return true;
+    }
+    return false;
 }
 
 // Dynamic-font measurement, but stable across all runtime values.
