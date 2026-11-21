@@ -1124,14 +1124,23 @@ MediaGeometry MediaLayout(const osd_model::Snapshot& value) {
     const bool buttons = m.canPrevious || m.canToggle || m.canNext || extra;
     g.hasTimeline = m.hasTimeline && m.end > m.start;
 
-    // Solve the square cover against the control group's required width.
-    // Unlike a fixed 112/139px reservation, this responds to panel width,
-    // artwork height, available actions and configured button scale.
+    // The control row should USE the available text-column width, not
+    // merely squeeze into the smallest group that fits beside the cover.
+    // A generous preferred separation is part of the cover-size constraint.
+    const auto mainSpacing = [](double width) {
+        return std::clamp(width * .085, 10.0, 18.0);
+    };
+    const auto extraSpacing = [](double width) {
+        return std::clamp(width * .065, 8.0, 13.0);
+    };
+
+    // Solve cover width only AFTER reserving enough room for the transport
+    // controls and comfortable gaps. Otherwise maximizing artwork consumes
+    // nearly all of the playback row even on a relatively wide panel.
     const auto fits = [&](double art) {
         const double textWidth = availableW - art - artGap;
-        const double mainGap = std::clamp(textWidth * .045, 5.0, 8.0);
-        const double auxGap = extra
-            ? std::clamp(textWidth * .05, 6.0, 9.0) : 0.0;
+        const double mainGap = mainSpacing(textWidth);
+        const double auxGap = extra ? extraSpacing(textWidth) : 0.0;
         const double r = std::min(art * .115 * scale, 20.0 * scale);
         return textWidth >= (extra ? 7.0 : 6.0) * r +
             2.0 * mainGap + auxGap;
@@ -1182,9 +1191,8 @@ MediaGeometry MediaLayout(const osd_model::Snapshot& value) {
     // Align every main transport button's BOTTOM with the cover bottom.
     // With both extras, Repeat's bottom shares that baseline; Shuffle sits
     // above it at the calculated gap. This is a constraint, not a Y ratio.
-    const double mainGap = std::clamp(g.textW * .045, 5.0, 8.0);
-    const double auxGap = extra
-        ? std::clamp(g.textW * .05, 6.0, 9.0) : 0.0;
+    const double preferredMainGap = mainSpacing(g.textW);
+    const double auxGap = extra ? extraSpacing(g.textW) : 0.0;
     const double rows = g.titleH + titleGap + g.artistH +
         (g.hasTimeline ? artistSeekGap + g.timelineH +
             seekTimeGap + g.timeHeight : 0.0);
@@ -1192,18 +1200,22 @@ MediaGeometry MediaLayout(const osd_model::Snapshot& value) {
         (artBottom - pad - rows - timeControlsGap - stackedExtraGap) / 2.0);
     g.controlRadius = buttons ? std::max(1.0, std::min({
         g.artSize * .115 * scale, 20.0 * scale,
-        (g.textW - 2.0 * mainGap - auxGap) / (extra ? 7.0 : 6.0),
+        (g.textW - 2.0 * preferredMainGap - auxGap) /
+            (extra ? 7.0 : 6.0),
         maxVerticalRadius})) : 0.0;
     g.controlsY = artBottom - g.controlRadius;
-    const double groupWidth = (extra ? g.controlRadius : 0.0) + auxGap +
-        6.0 * g.controlRadius + 2.0 * mainGap;
-    const double groupLeft = g.textX +
-        std::max(0.0, (g.textW - groupWidth) / 2.0);
-    g.controlX[0] = groupLeft +
-        (extra ? g.controlRadius : 0.0) + auxGap + g.controlRadius;
+    const double auxiliaryWidth = extra ? g.controlRadius : 0.0;
+    // Distribute all remaining horizontal space into the TWO main gaps.
+    // Previous/Play/Next are spread across the full text column, while
+    // Shuffle/Repeat retain their own separate stacked column at the left.
+    const double mainGap = std::max(preferredMainGap,
+        (g.textW - auxiliaryWidth - auxGap -
+            6.0 * g.controlRadius) / 2.0);
+    g.controlX[0] = g.textX + auxiliaryWidth +
+        auxGap + g.controlRadius;
     g.controlX[1] = g.controlX[0] + 2.0 * g.controlRadius + mainGap;
     g.controlX[2] = g.controlX[1] + 2.0 * g.controlRadius + mainGap;
-    g.extraX = groupLeft + (extra ? g.controlRadius / 2.0 : 0.0);
+    g.extraX = g.textX + auxiliaryWidth / 2.0;
     g.extraY[0] = both ? artBottom - 1.5 * g.controlRadius -
         stackedExtraGap : artBottom - g.controlRadius / 2.0;
     g.extraY[1] = artBottom - g.controlRadius / 2.0;
