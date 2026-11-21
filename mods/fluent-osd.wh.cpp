@@ -1231,7 +1231,10 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     controls::Canvas::SetTop(state.statusTitle, top);
     controls::Canvas::SetLeft(state.statusDetail, textX);
     controls::Canvas::SetTop(state.statusDetail, top + titleFont * 1.43 + lineGap);
-    state.statusUnderline.Width(textW);
+    // The state line is intentionally asymmetric: ON spans the available
+    // text column, OFF is a short dash. Both share the same left anchor.
+    // Width remains proportional to the live card size, not fixed pixels.
+    state.statusUnderline.Width(value.statusActive ? textW : textW * .35);
     state.statusUnderline.Height(lineHeight);
     state.statusUnderline.RadiusX(lineHeight / 2.0);
     state.statusUnderline.RadiusY(lineHeight / 2.0);
