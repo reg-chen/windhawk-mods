@@ -2,7 +2,7 @@
 
 **Branch:** `fluent-osd-xaml`  
 **Baseline:** `fluent-osd` v1.0.1 (`8ff2d4352d8c081e78208266ff1561b5e5bfe31b`)  
-**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.21** adds passive single-item USB/Bluetooth/network notices to native XAML volume, native brightness, per-target DDC/CI and Caps/Num/Scroll/Insert. The earlier v1.0.19 build received compiler feedback for `Windows.UI.Input` projection and the missing include was added; **v1.0.21 still requires a fresh Windhawk compilation and runtime test.**
+**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.22** now carries complete USB/Bluetooth/network notification behavior in native XAML: single events, aggregated event counts, expandable lists and scrolling, in addition to migrated levels and lock keys. The earlier v1.0.19 build received compiler feedback for `Windows.UI.Input` projection and the missing include was added; **v1.0.22 still requires a fresh Windhawk compilation and runtime test.**
 
 ## Goal / non-goals
 
@@ -562,34 +562,38 @@ each OSD type.
   DPI values, and transitions to/from volume and DDC. Also verify no leftover
   HWND or Explorer shutdown blocker on mod disable/reload.
 
-## v1.0.21 — Passive USB, Bluetooth and network notifications
+## v1.0.21–v1.0.22 — Complete native XAML USB/Bluetooth/network notifications
 
-- The existing 320 ms event-batching and identity-deduplication engine is
-  unchanged; single-item USB/Bluetooth/network notifications now render
-  through the native XAML status card when `experimentalXamlVolume` is on.
-  Names, actions and device state are copied to a snapshot on the existing
-  UI thread, then drawn on the XAML STA.
-- The built-in **Segoe Fluent Icons** font supplies Bluetooth
-  `U+E702`, USB `U+E88E`, Network `U+E968` (per Microsoft's
-  [official glyph reference](https://learn.microsoft.com/en-us/windows/apps/design/iconography/segoe-fluent-icons-font)).
-  No additional icon files or runtime dependencies are introduced.
-- The status-card geometry, theme, background alpha, corner radius,
-  position, font size and fade behavior are reused. Device notifications
-  do **not** display the lock-key ON/OFF underline. Switching out of a
-  lock-card cancels the underline animation safely.
-- **Scope limit:** aggregated notifications with more than one item still
-  use the original GDI+ hit-tested, expandable list. Image/text clipboard
-  notices, SMTC/Mixer and native non-level status events remain GDI+.
-  This is deliberate functional preservation, not a renderer fallback
-  following an XAML initialization failure.
-- **Manual verification:** USB connect/disconnect, Bluetooth paired-device
-  connect/disconnect when Windows emits these events, network state
-  changes, a batch with two or more items (the details view must still
-  open), and rapid transitions from lock-key status to a device notice.
-  Check glyph presence, truncation for long device names, light/dark
-  modes, theme opacity, display placement, teardown and Explorer reload.
-  Compilation and runtime behavior remain unverified in this editing
-  environment.
+- Keep the original 320 ms event batching and identity deduplication on the
+  Explorer UI thread, but copy the bounded list of **up to 64 device names**
+  into an owned immutable XAML snapshot. The snapshot also carries localized
+  details heading and the existing configurable interactive duration.
+- The XAML status card handles **both** one-item and aggregated notifications.
+  For multiple devices, its header is interactive. Click to expand/collapse
+  the detailed device list in the **same** native XAML Island.
+- An installed Windows.UI.Xaml `ScrollViewer` with a `StackPanel` displays
+  up to six visible rows, scrolls the remainder and trims long names. The
+  expanded host is constrained to the relevant monitor's work area, instead
+  of creating an extra GDI+ details HWND.
+- The built-in **Segoe Fluent Icons** font is used for Bluetooth `U+E702`,
+  USB `U+E88E`, and network `U+E968`. Existing card theme, opacity,
+  corners, placement, fade and font-size settings are reused.
+- **Migration rule:** a category is not complete if only its passive
+  display is ported. Its details and input path must work in XAML before
+  the corresponding GDI+ renderer is retired. In the experimental branch,
+  the off-position of `experimentalXamlVolume` temporarily retains the
+  prior renderer for comparison; when XAML is selected there is **no**
+  GDI+ fallback even for multi-item notifications. Remove residual GDI+
+  code category by category after validation; do not preserve duplicate
+  backends as a long-term feature.
+- **Still unported:** clipboard and image preview, native non-level status
+  events, Mixer and SMTC. These are not evidence that the device-notification
+  migration is partial.
+- **Testing gates:** compile in Windhawk; verify single and 2–64-item
+  USB/Bluetooth/network batches, open/close, wheel/trackpad/touch scrolling,
+  hover duration, long-name ellipsis, high DPI, different taskbar positions
+  and small work areas; confirm Explorer remains responsive on disable/reload.
+  No actual Windows runtime validation has been performed in this environment.
 
 ## Migration gates
 
