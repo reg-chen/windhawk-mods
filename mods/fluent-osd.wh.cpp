@@ -1159,6 +1159,8 @@ struct State {
     controls::ScrollViewer mixerRowsScroll{nullptr},
                            mixerOutputsScroll{nullptr};
     bool mixerPopulating = false, mixerPeerOpen = false;
+    State* pairedMixer = nullptr;  // STA-only, owned by root.peers.
+    State* pairedVolume = nullptr; // STA-only, root owns this State.
     bool noticeExpanded = false;
     double noticeHeaderH = 0;
     DWORD noticeNormalDurationMs = 3000;
@@ -1192,6 +1194,7 @@ imaging::WriteableBitmap BitmapFromPixels(
     uint32_t, uint32_t, const std::vector<uint8_t>&);
 void DrawMixerSnapshot(State&, const Snapshot&);
 void ToggleNoticeDetails(State&);
+bool PointerInsideHost(const State&);
 
 // All audio/WMI/DDC writes stay on the original Explorer OSD UI thread.
 // The STA handles pointer geometry and sends only bounded POD commands.
@@ -1253,7 +1256,24 @@ void ArmInteractionTimer(State& state, bool active) {
         state.fading = state.fadeOut = false;
         if (state.card) state.card.Opacity(1.0);
     }
-    if (!active && !state.mixerPeerOpen)
+    if (state.mixerPeerOpen && state.pairedMixer &&
+        state.pairedMixer->host) {
+        // The attached pair is one interactive surface. Hovering either
+        // card pauses the MIXER inactivity timer; volume stays visible.
+        State& panel = *state.pairedMixer;
+        KillTimer(panel.host, kHideTimer);
+        if (!(active || PointerInsideHost(state) ||
+              PointerInsideHost(panel))) {
+            SetTimer(panel.host, kHideTimer,
+                std::clamp(panel.current.durationMs, DWORD(500),
+                           DWORD(20000)), nullptr);
+        }
+        return;
+    }
+    if (!active && state.current.kind == LevelKind::Mixer &&
+        state.pairedVolume && PointerInsideHost(*state.pairedVolume))
+        return;
+    if (!active)
         SetTimer(state.host, kHideTimer,
             std::clamp(state.current.durationMs, DWORD(500), DWORD(20000)),
             nullptr);
@@ -2724,14 +2744,18 @@ void DeliverPending(State& root) {
             }
             found = root.peers.emplace(L"mixer", std::move(fresh)).first;
         }
+        root.pairedMixer = found->second.get();
+        found->second->pairedVolume = &root;
         DrawSnapshot(*found->second, batch.back());
         return;
     }
     const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
     if (!ddc) {
         root.mixerPeerOpen = false;
+        root.pairedMixer = nullptr;
         for (auto it = root.peers.begin(); it != root.peers.end();) {
             if (it->first == L"mixer") {
+                it->second->pairedVolume = nullptr;
                 CloseSurface(*it->second);
                 it = root.peers.erase(it);
             } else {
@@ -2743,6 +2767,7 @@ void DeliverPending(State& root) {
         return;
     }
     root.mixerPeerOpen = false;
+    root.pairedMixer = nullptr;
     HideSurface(root);
     std::unordered_set<std::wstring> requested;
     for (const auto& snap : batch) {
