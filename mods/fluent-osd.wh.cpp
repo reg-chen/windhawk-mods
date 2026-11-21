@@ -3092,6 +3092,9 @@ int g_barWheelRemainder = 0;
 int g_barWheelKind = -1;
 float g_mixerMasterLevel = 0;
 bool g_mixerMasterMuted = false;
+// UI-thread controller state; XAML visual tree never owns Core Audio pointers.
+bool g_xamlMixerOpen = false, g_xamlMixerOutputExpanded = false;
+uint32_t g_xamlMixerGeneration = 1;
 struct AudioOutputOption { std::wstring id; std::wstring name; };
 [[clang::no_destroy]] std::vector<AudioOutputOption> g_mixerOutputOptions; // UI thread only
 [[clang::no_destroy]] std::wstring g_mixerOutputId;
@@ -7179,6 +7182,8 @@ HRESULT SetWindowsDefaultPlaybackEndpoint(const std::wstring& id,
 }
 
 void RefreshMixer() {
+    ++g_xamlMixerGeneration;
+    if (!g_xamlMixerGeneration) ++g_xamlMixerGeneration;
     CleanupMixerIcons();
     g_mixerEntries.clear();
     g_mixerMaster.Reset();
@@ -7333,8 +7338,29 @@ void SelectMixerOutput(int index) {
             RefreshMixer();
         }
     }
-    RenderPanel();
-    ResetHideTimerFor(DurationKind::Interactive);
+    if (g_panelMode == PanelMode::Mixer) {
+        RenderPanel();
+        ResetHideTimerFor(DurationKind::Interactive);
+    }
+}
+
+// Shared Core Audio operation used by both view backends.
+bool SetMixerPercent(int index, int percent) {
+    if (index < 0 || index > static_cast<int>(g_mixerEntries.size()))
+        return false;
+    const float value = std::clamp(percent, 0, 100) / 100.0f;
+    if (!index) {
+        if (!g_mixerMaster || FAILED(
+            g_mixerMaster->SetMasterVolumeLevelScalar(value, nullptr)))
+            return false;
+        g_mixerMasterLevel = value;
+        return true;
+    }
+    auto& entry = g_mixerEntries[index - 1];
+    if (!entry.volume || FAILED(entry.volume->SetMasterVolume(value, nullptr)))
+        return false;
+    entry.scalar = value;
+    return true;
 }
 
 void SetMixerSlider(float x, float /* y */) {
@@ -7342,16 +7368,10 @@ void SetMixerSlider(float x, float /* y */) {
     // never accidentally modify a different app's volume.
     int index = g_mixerDragIndex;
     if (index < 0 || index > static_cast<int>(g_mixerEntries.size())) return;
-    float value = std::clamp((x - kMixerTrackStart) / MixerTrackLength(),
-                             0.0f, 1.0f);
-    if (!index) {
-        if (g_mixerMaster && SUCCEEDED(g_mixerMaster->SetMasterVolumeLevelScalar(value, nullptr)))
-            g_mixerMasterLevel = value;
-    } else {
-        auto& item = g_mixerEntries[index - 1];
-        if (item.volume && SUCCEEDED(item.volume->SetMasterVolume(value, nullptr)))
-            item.scalar = value;
-    }
+    const int percent = static_cast<int>(std::lround(100.0f *
+        std::clamp((x - kMixerTrackStart) / MixerTrackLength(),
+                   0.0f, 1.0f)));
+    (void)SetMixerPercent(index, percent);
 }
 
 // The per-session wheel targets the same full-width track used by dragging.
@@ -7436,8 +7456,10 @@ void ToggleMixerMute(int index) {
             entry.muted = actual != FALSE;
         }
     }
-    RenderPanel();
-    ResetHideTimerFor(DurationKind::Interactive);
+    if (g_panelMode == PanelMode::Mixer) {
+        RenderPanel();
+        ResetHideTimerFor(DurationKind::Interactive);
+    }
 }
 
 // ============================================================
