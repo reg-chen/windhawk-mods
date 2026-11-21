@@ -1158,7 +1158,7 @@ struct State {
                          mixerOutputs{nullptr};
     controls::ScrollViewer mixerRowsScroll{nullptr},
                            mixerOutputsScroll{nullptr};
-    bool mixerPopulating = false;
+    bool mixerPopulating = false, mixerPeerOpen = false;
     bool noticeExpanded = false;
     double noticeHeaderH = 0;
     DWORD noticeNormalDurationMs = 3000;
@@ -1251,7 +1251,7 @@ void ArmInteractionTimer(State& state, bool active) {
         state.fading = state.fadeOut = false;
         if (state.card) state.card.Opacity(1.0);
     }
-    if (!active)
+    if (!active && !state.mixerPeerOpen)
         SetTimer(state.host, kHideTimer,
             std::clamp(state.current.durationMs, DWORD(500), DWORD(20000)),
             nullptr);
@@ -2694,6 +2694,7 @@ void DeliverPending(State& root) {
         batch.back().kind == LevelKind::Mixer) {
         for (auto& peer : root.peers)
             if (peer.first != L"mixer") HideSurface(*peer.second);
+        root.mixerPeerOpen = true;
         DrawSnapshot(root, batch.front());
         // Mixer owns the active inactivity timer while open. Do not hide
         // the parent volume card earlier than its attached panel.
@@ -2715,6 +2716,7 @@ void DeliverPending(State& root) {
     }
     const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
     if (!ddc) {
+        root.mixerPeerOpen = false;
         for (auto it = root.peers.begin(); it != root.peers.end();) {
             if (it->first == L"mixer") {
                 CloseSurface(*it->second);
@@ -2727,6 +2729,7 @@ void DeliverPending(State& root) {
         DrawSnapshot(root, batch.back());
         return;
     }
+    root.mixerPeerOpen = false;
     HideSurface(root);
     std::unordered_set<std::wstring> requested;
     for (const auto& snap : batch) {
@@ -9490,7 +9493,8 @@ ControlEffects ApplyOsdCommands(
                 case osd_control::Action::MixerToggleOutput:
                     if (!g_xamlMixerOutputExpanded) {
                         RefreshMixer(); // Reconcile current endpoints.
-                        g_xamlMixerOutputExpanded = true;
+                        g_xamlMixerOutputExpanded =
+                            !g_mixerOutputOptions.empty();
                     } else {
                         g_xamlMixerOutputExpanded = false;
                     }
