@@ -5279,6 +5279,28 @@ bool ReadDefaultAudioVolume(int& percent, bool& muted) {
     return ok;
 }
 
+// Core Audio operation: the XAML controller owns rendering and timeouts.
+bool AdjustDefaultAudioWheel(int steps) {
+    if (!steps || g_popupKind != PopupKind::NativeVolume) return false;
+    Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
+    if (!OpenDefaultAudioEndpointVolume(volume)) return false;
+    float scalar = 0.0f;
+    if (FAILED(volume->GetMasterVolumeLevelScalar(&scalar))) return false;
+    const float requested = std::clamp(
+        scalar + steps * (kWheelStepPercent / 100.0f), 0.0f, 1.0f);
+    if (FAILED(volume->SetMasterVolumeLevelScalar(requested, nullptr)))
+        return false;
+    if (FAILED(volume->GetMasterVolumeLevelScalar(&scalar)))
+        scalar = requested;
+    BOOL muted = FALSE;
+    (void)volume->GetMute(&muted);
+    g_nativePercent = static_cast<int>(std::lround(
+        std::clamp(scalar, 0.0f, 1.0f) * 100.0f));
+    g_nativePercentKnown = true;
+    g_nativeMuted = muted != FALSE;
+    return true;
+}
+
 // Absolute set for click/drag of the main volume track. Do not unmute: mute
 // is a separate user state, and moving the track should not silently clear it.
 bool SetDefaultAudioBarPercent(int percent) {
@@ -6310,13 +6332,19 @@ void DisplayDdcBatch() {
 
     BrightnessEvent master{};
     bool masterChosen = false;
-    // If both displays update in the same burst, keep the already-visible
-    // target as master. The other target still receives its own peer frame.
-    // This prevents the master window bouncing when write order varies.
+    // XAML keeps the primary host hidden in DDC multi-target mode. The
+    // unexpired per-display target cache, not that HWND, determines pinning.
+    const bool priorTargetActive = std::any_of(
+        g_ddcTargets.begin(), g_ddcTargets.end(),
+        [&](const DdcTargetState& previous) {
+            return previous.expiresAt > now &&
+                previous.event.physicalIndex == g_visible.physicalIndex &&
+                _wcsicmp(previous.event.device, g_visible.device) == 0;
+        });
     bool pinnedMaster = false;
     if ((mode == 0 || mode == 3) &&
         g_popupKind == PopupKind::DdcBrightness &&
-        xaml_osd::IsPrimaryVisible() && g_visible.device[0]) {
+        priorTargetActive && g_visible.device[0]) {
         auto current = std::find_if(events.begin(), events.end(),
             [&](const BrightnessEvent& event) {
                 return event.physicalIndex == g_visible.physicalIndex &&
@@ -7085,9 +7113,6 @@ void ReadMixerOutputDevices(IMMDeviceEnumerator* enumerator) {
         else
             g_mixerOutputOptions.push_back(std::move(output));
     }
-    const int maximum = std::max(0, static_cast<int>(g_mixerOutputOptions.size()) -
-                                   kOutputPickerMaxRows);
-    g_mixerOutputScroll = std::clamp(g_mixerOutputScroll, 0, maximum);
 }
 
 // Deliberately only changes console/multimedia output. An independently
