@@ -1367,7 +1367,8 @@ void PointerReleased(State& state, const xinput::PointerRoutedEventArgs& args) {
 
 void PointerCancelled(State& state) {
     state.pointerActive = state.dragging = state.iconPressed = false;
-    ArmInteractionTimer(state, false);
+    ArmInteractionTimer(state, state.current.kind == LevelKind::Mixer &&
+                               PointerInsideHost(state));
 }
 
 void PointerWheel(State& state, const xinput::PointerRoutedEventArgs& args) {
@@ -2480,6 +2481,41 @@ void CreateContent(State& state) {
     clipboardCaption.Visibility(wx::Visibility::Collapsed);
     canvas.Children().Append(clipboardCaption);
 
+
+    // A Mixer button is part of the same native volume Island. Its click
+    // becomes a typed command; the render thread owns no Core Audio object.
+    controls::Button mixerChevron;
+    mixerChevron.Visibility(wx::Visibility::Collapsed);
+    mixerChevron.Content(winrt::box_value(winrt::hstring(L"\uE70D")));
+    mixerChevron.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+    mixerChevron.Click([&state](auto const&, auto const&) {
+        if (state.current.kind == LevelKind::Volume)
+            SendInput(state, InputAction::OpenMixer, 0);
+    });
+    canvas.Children().Append(mixerChevron);
+
+    // One native XAML panel peer for Mixer, with owned scroll viewports.
+    controls::StackPanel mixerColumn;
+    controls::StackPanel mixerRows;
+    controls::ScrollViewer mixerRowsScroll;
+    mixerRowsScroll.VerticalScrollBarVisibility(
+        controls::ScrollBarVisibility::Auto);
+    mixerRowsScroll.HorizontalScrollBarVisibility(
+        controls::ScrollBarVisibility::Disabled);
+    mixerRowsScroll.Content(mixerRows);
+    controls::StackPanel mixerOutputs;
+    controls::ScrollViewer mixerOutputsScroll;
+    mixerOutputsScroll.Visibility(wx::Visibility::Collapsed);
+    mixerOutputsScroll.VerticalScrollBarVisibility(
+        controls::ScrollBarVisibility::Auto);
+    mixerOutputsScroll.HorizontalScrollBarVisibility(
+        controls::ScrollBarVisibility::Disabled);
+    mixerOutputsScroll.Content(mixerOutputs);
+    controls::Border mixerSurface;
+    mixerSurface.Visibility(wx::Visibility::Collapsed);
+    mixerSurface.Child(mixerColumn);
+    canvas.Children().Append(mixerSurface);
+
     controls::Viewbox viewbox;
     viewbox.Stretch(media::Stretch::Fill);
     viewbox.Child(canvas);
@@ -2506,6 +2542,13 @@ void CreateContent(State& state) {
     state.clipboardFrame = clipboardFrame;
     state.clipboardImage = clipboardImage;
     state.clipboardCaption = clipboardCaption;
+    state.mixerChevron = mixerChevron;
+    state.mixerSurface = mixerSurface;
+    state.mixerColumn = mixerColumn;
+    state.mixerRows = mixerRows;
+    state.mixerOutputs = mixerOutputs;
+    state.mixerRowsScroll = mixerRowsScroll;
+    state.mixerOutputsScroll = mixerOutputsScroll;
     canvas.PointerPressed([&state](auto const&, const xinput::PointerRoutedEventArgs& e) {
         PointerPressed(state, e);
     });
@@ -2572,6 +2615,13 @@ void CreateSurface(State& state, HINSTANCE instance) {
 
 void CloseSurface(State& state) {
     HideSurface(state);
+    state.mixerOutputsScroll = nullptr;
+    state.mixerRowsScroll = nullptr;
+    state.mixerOutputs = nullptr;
+    state.mixerRows = nullptr;
+    state.mixerColumn = nullptr;
+    state.mixerSurface = nullptr;
+    state.mixerChevron = nullptr;
     state.clipboardCaption = nullptr;
     state.clipboardImage = nullptr;
     state.clipboardFrame = nullptr;
