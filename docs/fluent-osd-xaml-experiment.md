@@ -2,7 +2,7 @@
 
 **Branch:** `fluent-osd-xaml`  
 **Baseline:** `fluent-osd` v1.0.1 (`8ff2d4352d8c081e78208266ff1561b5e5bfe31b`)  
-**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.24** now also routes text, file and bitmap clipboard notifications through native XAML. The image-first preview uses an owned bounded BGRA pixel buffer and WriteableBitmap on the XAML STA, in addition to previously migrated volume, brightness, lock keys, USB/Bluetooth/network and system status events. **v1.0.24 requires a Windhawk compiler check; visual and event-runtime tests remain deferred.**
+**Status:** Experimental `fluent-osd-xaml` **v1.0.25** adds interactive native XAML Mixer (per-app volume, mute, output picker, process icons and an attached second Island) to previously migrated volume/brightness/notification categories. All Core Audio operations remain in the original UI-thread controller. **Windhawk compilation and Windows runtime tests remain unverified.**
 
 ## Goal / non-goals
 
@@ -671,6 +671,49 @@ each OSD type.
   panel hit-testing and frame assets; do not ship a permanent dual
   implementation. SMTC and Mixer remain unported.
 
+## v1.0.25 — XAML Mixer migration
+
+- The existing Mixer-chevron setting now exposes a functional native XAML
+  button on the main volume card. Opening Mixer submits a **single two-part
+  snapshot batch**: the original volume card plus a separately positioned
+  native XAML Island. Position/dimensions reuse the configured horizontal
+  Mixer height or vertical width and monitor-aware panel-attachment math.
+- `BuildMixerModel()` copies Core Audio master/app levels, mute state,
+  localized process/device names and output selection into an owned value
+  description. The XAML STA receives no COM interface or HICON.
+  Mixer model **generations** invalidate stale row/output indices when an
+  endpoint or audio session refreshes.
+- Every row uses a native Slider, live percentage TextBlock and mute
+  Button. Native ScrollViewer handles excess apps. A separate output
+  picker has a bounded scroll viewport with selected/current output
+  indication and localized failure text. Slider events are typed
+  `osd_control::Command` values, never direct Core Audio calls.
+- Per-app icons are converted once per audio session refresh to bounded
+  20×20 BGRA copies. The STA uses the same WriteableBitmap factory as
+  clipboard thumbnails. Legacy GDI is used only for extracting process
+  icon pixels, **not** drawing the XAML Mixer UI.
+- The original audio controller performs all volume/mute/device writes.
+  `ResetXamlMixerController()` releases Core Audio references and
+  unregisters endpoint notifications when the panel is dismissed,
+  replaced or fails to open. Active volume and Mixer Islands share an
+  inactivity/hover lifetime, and their back-pointers are cleared on
+  XAML STA teardown. GDI+ Mixer callbacks are never intentionally used
+  with the XAML feature switch enabled.
+- **Compile-only validation still required:** C++/WinRT Button/Slider,
+  `RangeBase.ValueChanged`, ScrollViewer, WriteableBitmap, and command
+  generation guards. No Windows compiler was invoked in this editing
+  environment.
+- **Deferred runtime validation:** per-app slider drag and wheel, mute,
+  app icon fidelity, output switch and error, audio endpoint disconnect,
+  rapid session reordering, long labels, high-DPI/external monitors,
+  all popup positions, pointer hover across cards, Explorer shutdown,
+  Windhawk unload/reload and sustained event floods.
+- **Existing limitations:** non-DDC all-monitor XAML mirroring is not
+  complete; SMTC has not been migrated. The legacy Mixer GDI+ code
+  remains only for experiment-off parity comparison and should be
+  deleted after full Windows regression testing, not preserved as a
+  permanent fallback.
+
 ## Architecture refactor — value model, pure layout, control boundary
 
 This refactor intentionally retains **v1.0.24**: it changes internal
@@ -728,14 +771,15 @@ Windhawk-compiled or exercised on Windows** in this editing environment.
 - The shared snapshot is a flat value envelope that still carries Win32
   receiver/monitor identifiers alongside appearance. This is not pure
   cross-platform FP; future extraction may separate a `VisualDescription`
-  and `ControlBinding` once remaining SMTC/Mixer data needs are known.
+  and `ControlBinding` once the remaining SMTC data needs are known.
 - `CalculatePopupPlacement` still consults existing shared settings and
   source kinds, and `MovePopupToDisplay` still positions the legacy HWND
   while GDI+ remains necessary for unported categories. The XAML presenter
   no longer *reads* that HWND for positioning.
-- The legacy GDI+ media/mixer draw code, UI interaction, some event adapters,
-  and experimental-toggle-off path remain. Do not delete functional legacy
-  code before corresponding full XAML parity and runtime regression testing.
+- Legacy GDI+ SMTC and experiment-off renderer paths remain. The native
+  XAML Mixer now owns the interactive UI, but its old GDI+ code is retained
+  pending actual Windows functional/visual parity and teardown tests.
+  Do not ship permanent duplicate backends.
 
 ### Compile-only acceptance for this phase
 
@@ -754,9 +798,9 @@ Windhawk-compiled or exercised on Windows** in this editing environment.
 1. **Compile first:** verify the current self-contained branch in Windhawk,
    including all WinRT projections, type contracts and XAML control APIs.
    Compilation passing is **not** runtime validation.
-2. **Finish category parity:** migrate SMTC, Mixer and all their buttons,
-   sliders, scroll/seek gestures, visual states and display placement;
-   keep monitoring/hardware operations behind the typed control boundary.
+2. **Finish category parity:** validate the new XAML Mixer and migrate
+   SMTC artwork, timeline/seek, media buttons and source selection while
+   retaining the shared, renderer-independent monitoring/control boundary.
 3. **Retire migrated GDI+ paths:** when verified, remove obsolete
    `UpdateLayeredWindow` category painters, legacy hit-test HWNDs,
    duplicate animation timers and rendering-only state; retain any
