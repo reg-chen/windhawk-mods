@@ -3,7 +3,7 @@
 // @name            Fluent OSD
 // @description     Native XAML on-screen displays for volume, brightness, media, mixer and Windows system events.
 // @description:zh-TW 以原生 XAML 顯示音量、亮度、媒體、混音器及 Windows 系統事件提示。
-// @version         1.1.0
+// @version         1.1.1
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -114,6 +114,27 @@ background. Acrylic rendering depends on Windows transparency policy.
   options are not used by the new native XAML controls.
 - If XAML initialization fails, there is no GDI+ visual fallback.
   Windows updates may change Shell hook symbols or undocumented APIs.
+
+## Shell-safe XAML startup
+
+Native hooks start immediately; the XAML renderer initializes only after
+the taskbar's InputSite is available beneath its XAML content bridge.
+Following the event-discovery pattern used by Taskbar Volume Control
+and Taskbar Scroll Actions, this mod observes `CreateWindowInBand` and
+notifies its controller asynchronously. A one-time check also covers
+reloading the mod after the taskbar already exists. No readiness polling
+or fixed delay is used. This relies on undocumented Shell window classes;
+Windows-version compatibility is not guaranteed.
+
+## OSD window corners
+
+Use **Custom OSD > Fluent appearance > OSD window corner radius** to
+choose a radius from 0 to 34 logical pixels (default 17). The setting
+affects the visible XAML card of all custom OSD categories, including
+volume, brightness, SMTC, mixer, DDC and system notifications.
+Windows DWM host-window corner rounding is deliberately disabled to
+prevent a second, conflicting clip; the visible XAML border owns the
+user-configured corner radius.
 
 ## Credits and license
 
@@ -417,8 +438,10 @@ product names/trademarks belong to their owners.
           #! $showIf: {ddcTextMode: custom}
           #! $format: colorRgb
         - ddcCornerRadius: 17
-          $name: Card corner radius (logical px)
-          $name:zh-TW: 卡片圓角半徑（邏輯像素）
+          $name: OSD window corner radius (logical px)
+          $name:zh-TW: OSD 視窗圓角半徑（邏輯像素）
+          $description: Controls the visible XAML card corners for all custom OSDs, including volume, SMTC, mixer and DDC. The transparent Win32 host uses no additional DWM rounding.
+          $description:zh-TW: 控制所有自訂 OSD 的可見卡片圓角，包含音量、SMTC、混音器及 DDC。透明 Win32 宿主不額外套用 DWM 圓角。
           #! $min: 0
           #! $max: 34
           #! $format: slider
@@ -5245,6 +5268,7 @@ constexpr WCHAR kWindowClass[] = L"WH.NativeOSD.DDC.01E7AFB2";
 constexpr ULONG_PTR kCopyDataTag = 0x1E7AFB2;
 constexpr UINT_PTR kEventBatchTimer = 322;
 constexpr UINT_PTR kDdcBatchTimer = 324;
+// Shell startup is signaled by the InputSite creation hook, not polled.
 constexpr UINT kDdcBatchDelayMs = 90;
 constexpr UINT_PTR kMediaAnimationTimer = 323;
 constexpr UINT kMediaAnimationIntervalMs = 100;
@@ -5260,6 +5284,7 @@ constexpr UINT kLockToggleMessage = WM_APP + 322;
 constexpr UINT kAudioRefreshMessage = WM_APP + 323;
 constexpr UINT kNetworkNoticeMessage = WM_APP + 324;
 constexpr UINT kNativeExtraMessage = WM_APP + 325;
+constexpr UINT kShellInputSiteReadyMessage = WM_APP + 329;
 constexpr DWORD kEventMagic = 0x54434444; // 'DDCT', private wire format
 
 enum class Kind : int {
@@ -5635,6 +5660,8 @@ HANDLE g_networkNotification = nullptr;
 std::atomic<int> g_networkPreviousLevel{-1};
 std::atomic<HWND> g_networkReceiver{nullptr};
 std::atomic<bool> g_closing{false};
+// Only the OSD controller thread writes this one-shot startup state.
+bool g_shellXamlStarted = false;
 std::wstring g_noticeTitle;
 std::wstring g_noticeBody;
 NoticeIcon g_noticeIcon = NoticeIcon::Clipboard; // UI thread only.
@@ -9381,7 +9408,93 @@ ControlEffects ApplyOsdCommands(
     return effects;
 }
 
+// Match the established upstream taskbar input discovery hierarchy.
+// A Bridge alone may exist before InputSite has been created.
+constexpr WCHAR kShellBridgeClass[] =
+    L"Windows.UI.Composition.DesktopWindowContentBridge";
+constexpr WCHAR kShellInputSiteClass[] =
+    L"Windows.UI.Input.InputSite.WindowClass";
+
+// Used by both the initial snapshot and event-delivered controller check.
+// Reject Explorer file-window processes which do not own Shell_TrayWnd.
+bool IsShellInputSiteReady() {
+    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!taskbar) return false;
+    DWORD taskbarPid = 0;
+    DWORD taskbarThread = GetWindowThreadProcessId(taskbar, &taskbarPid);
+    if (!taskbarThread || taskbarPid != GetCurrentProcessId()) return false;
+    HWND bridge = FindWindowExW(taskbar, nullptr, kShellBridgeClass, nullptr);
+    if (!bridge) return false;
+    HWND site = FindWindowExW(bridge, nullptr, kShellInputSiteClass, nullptr);
+    if (!site || GetParent(site) != bridge || GetParent(bridge) != taskbar)
+        return false;
+    DWORD sitePid = 0;
+    return GetWindowThreadProcessId(site, &sitePid) == taskbarThread &&
+           sitePid == taskbarPid;
+}
+
+void TryStartXamlAfterShellInputSite(HWND receiver) {
+    if (!receiver || g_closing.load(std::memory_order_acquire) ||
+        g_shellXamlStarted || !IsShellInputSiteReady()) return;
+    g_shellXamlStarted = true;
+    Wh_Log(L"Fluent OSD: Shell InputSite hierarchy ready; starting XAML");
+    xaml_osd::Start();
+}
+
+// Same creation export observed by upstream Taskbar Volume Control and
+// Taskbar Scroll Actions. Run the original first. Only notify the controller
+// asynchronously, never initialize XAML within the Shell creation stack.
+using CreateWindowInBand_t =
+    HWND (WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD,
+                   int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID, DWORD);
+CreateWindowInBand_t g_createWindowInBandOriginal = nullptr;
+
+HWND WINAPI ShellCreateWindowInBandHook(
+        DWORD exStyle, LPCWSTR className, LPCWSTR title, DWORD style,
+        int x, int y, int width, int height, HWND parent, HMENU menu,
+        HINSTANCE instance, LPVOID param, DWORD band) {
+    HWND created = g_createWindowInBandOriginal(
+        exStyle, className, title, style, x, y, width, height,
+        parent, menu, instance, param, band);
+    if (!created || g_closing.load(std::memory_order_acquire))
+        return created;
+    // lpClassName may contain a 16-bit ATOM. Do not dereference an ATOM.
+    if ((reinterpret_cast<ULONG_PTR>(className) &
+         ~static_cast<ULONG_PTR>(0xffff)) == 0 ||
+        _wcsicmp(className, kShellInputSiteClass) != 0)
+        return created;
+
+    // If the controller does not yet exist, its one-time snapshot after
+    // window creation covers this early event. The receiver is atomic.
+    HWND receiver = g_networkReceiver.load(std::memory_order_acquire);
+    if (receiver && !g_closing.load(std::memory_order_acquire))
+        (void)PostMessageW(receiver, kShellInputSiteReadyMessage, 0, 0);
+    return created;
+}
+
+void HookShellInputSiteCreation() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) {
+        Wh_Log(L"Fluent OSD: user32 unavailable; InputSite hook not installed");
+        return;
+    }
+    auto target = reinterpret_cast<CreateWindowInBand_t>(
+        GetProcAddress(user32, "CreateWindowInBand"));
+    if (!target) {
+        Wh_Log(L"Fluent OSD: CreateWindowInBand unavailable; "
+               L"existing-InputSite snapshot only");
+        return;
+    }
+    WindhawkUtils::SetFunctionHook(
+        target, ShellCreateWindowInBandHook, &g_createWindowInBandOriginal);
+    Wh_Log(L"Fluent OSD: InputSite creation hook configured");
+}
+
 LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (hwnd == g_receiveWnd && msg == kShellInputSiteReadyMessage) {
+        TryStartXamlAfterShellInputSite(hwnd);
+        return 0;
+    }
     if (hwnd == g_receiveWnd && msg == osd_control::kMessage) {
         const auto commands = osd_control::Drain();
         // Event routing owns the active-backend policy; hardware execution
@@ -9681,6 +9794,8 @@ DWORD WINAPI UiThreadProc(void*) {
     g_lockHook = SetWindowsHookExW(WH_KEYBOARD_LL, LockKeyProc, module, 0);
     if (!g_lockHook)
         Wh_Log(L"Lock-key keyboard hook unavailable (%lu)", GetLastError());
+    // Single check handles late injection; creation hook handles new InputSites.
+    if (g_receiveWnd) TryStartXamlAfterShellInputSite(g_receiveWnd);
     if (g_uiReady) SetEvent(g_uiReady);
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
@@ -9733,9 +9848,12 @@ BOOL Wh_ModInit() {
     const bool isTwinkle = _wcsicmp(name, L"Twinkle Tray.exe") == 0;
     if (!g_isExplorer && !isTwinkle) return FALSE;
     LoadSettings();
-    if (g_isExplorer) HookNativeOsd();
+    if (g_isExplorer) {
+        HookNativeOsd();
+        HookShellInputSiteCreation();
+    }
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.1.0 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.1.1 initialized (%s)", name);
     return TRUE;
 }
 
@@ -9776,14 +9894,17 @@ void Wh_ModAfterInit() {
             g_mediaWake = nullptr;
         }
     }
-    xaml_osd::Start();
+    // XAML starts from the input event or one-time controller snapshot,
+    // never directly during Windhawk's AfterInit callback.
 }
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
-    if (g_isExplorer && !g_closing.load()) xaml_osd::Start();
-    // Windhawk's settings callback is not the OSD UI thread.
+    // Settings may be called on Windhawk's worker thread. Never bypass the
+    // shell-readiness gate when reloading settings during cold startup.
     HWND target = g_networkReceiver.load(std::memory_order_acquire);
+    if (g_isExplorer && target && !g_closing.load())
+        (void)PostMessageW(target, kShellInputSiteReadyMessage, 0, 0);
     if (g_isExplorer && target && !g_closing.load())
         (void)PostMessageW(target, kBluetoothConfigMessage, 0, 0);
     // Refresh the next OSD using the newly selected theme. Settings never
