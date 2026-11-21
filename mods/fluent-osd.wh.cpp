@@ -1004,8 +1004,24 @@ MixerButton MixerButtonGeometry(const osd_model::Snapshot& value,
         return {};
     if (!value.vertical) {
         const double size = std::clamp(bodyW * .09, 20.0, 28.0);
-        return {true, size, std::max(0.0, bodyW - size - 2.0),
-            std::max(0.0, (bodyH - size) / 2.0), 0.0};
+        const double top = std::max(0.0, (bodyH - size) / 2.0);
+        // The original 2px trailing gap placed the Button's corners
+        // inside the rounded card's clipped area (especially at small
+        // heights and large user-configured corner radii).
+        // Solve the rounded-rectangle arc at the Button's top/bottom
+        // instead of guessing an offset based on one default width.
+        const double radius = std::clamp(
+            static_cast<double>(value.cornerRadius), 0.0,
+            std::min(bodyW, bodyH) / 2.0);
+        const double cornerCut = top < radius
+            ? radius - std::sqrt(std::max(0.0, top * (2.0 * radius - top)))
+            : 0.0;
+        const double breathingRoom = std::clamp(
+            static_cast<double>(value.innerPadding) * .65, 4.0, 15.0);
+        const double trailingInset = cornerCut + breathingRoom;
+        return {true, size,
+            std::max(0.0, bodyW - size - trailingInset),
+            top, 0.0};
     }
     // On the slim card, the button has its own bottom row rather
     // than sharing the speaker/track region.
@@ -2349,8 +2365,10 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         // The outer inset follows the original painted-card cutout and
         // the user's configurable inner padding.
         const double minTrack = std::max(trackThickness, wantedThumb);
+        // Reserve the entire trailing button area, including its computed
+        // rounded-corner clearance. Keep the value label/bar away from it.
         const double chevronSpace = mixerButton.visible
-            ? mixerButton.size + 4.0 : 0.0;
+            ? bodyW - mixerButton.x + 4.0 : 0.0;
         const double freeWidth = std::max(0.0,
             bodyW - iconW - labelW - minTrack - chevronSpace);
         const double pad = std::min(inner + insetX,
@@ -2619,6 +2637,8 @@ void CreateContent(State& state) {
     mixerChevron.MinWidth(0.0);
     mixerChevron.MinHeight(0.0);
     mixerChevron.Padding(wx::Thickness{0.0, 0.0, 0.0, 0.0});
+    mixerChevron.HorizontalContentAlignment(wx::HorizontalAlignment::Center);
+    mixerChevron.VerticalContentAlignment(wx::VerticalAlignment::Center);
     mixerChevron.Click([&state](auto const&, auto const&) {
         if (state.current.kind == LevelKind::Volume)
             SendInput(state, InputAction::OpenMixer, 0);
