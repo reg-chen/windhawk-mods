@@ -2,7 +2,7 @@
 
 **Branch:** `fluent-osd-xaml`  
 **Baseline:** `fluent-osd` v1.0.1 (`8ff2d4352d8c081e78208266ff1561b5e5bfe31b`)  
-**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.23** now carries complete USB/Bluetooth/network notices, the six native non-level event categories, volume/brightness and lock-key status in native XAML. The earlier v1.0.19 build received compiler feedback for `Windows.UI.Input` projection and the missing include was added; **v1.0.23 still requires fresh Windhawk compilation and runtime testing.**
+**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.24** now also routes text, file and bitmap clipboard notifications through native XAML. The image-first preview uses an owned bounded BGRA pixel buffer and WriteableBitmap on the XAML STA, in addition to previously migrated volume, brightness, lock keys, USB/Bluetooth/network and system status events. **v1.0.24 requires a Windhawk compiler check; visual and event-runtime tests remain deferred.**
 
 ## Goal / non-goals
 
@@ -624,6 +624,47 @@ each OSD type.
   long localized event text, placement on external monitor, display
   switching, and hot-unload. Static review cannot establish runtime
   reliability or glyph appearance.
+
+## v1.0.24 — Clipboard complete display migration
+
+- The existing clipboard opt-in, text-preview opt-in, image-preview opt-in
+  and text character cap remain unchanged. File-selection notifications,
+  capped text excerpts and no-preview notices reuse the native XAML
+  compact status card. The copied text is never logged.
+- If Windows supplies a usable `CF_BITMAP`, retain the old maximum source
+  and preview sizes (original bitmap 16384×16384; preview 224×164). The
+  existing Windows UI thread first creates its bounded thumbnail, then
+  converts it to at most 224×164×4 bytes of opaque BGRA. This remains a
+  Win32 clipboard/GDI *capture/conversion* step, not a GDI+ UI renderer.
+- Transfer only copied pixel bytes in an owned snapshot; no `HBITMAP`,
+  `HDC`, live `IDataObject` or WinRT object crosses the threads.
+  The XAML STA instantiates `Windows.UI.Xaml.Media.Imaging.WriteableBitmap`
+  and writes via `PixelBuffer`/IBufferByteAccess, using the system
+  `Image` control with uniform (non-distorting) scaling. The source
+  thumbnail `HBITMAP` is immediately deleted after conversion.
+  See [Microsoft's WriteableBitmap pixel-buffer API]
+  (https://learn.microsoft.com/en-us/uwp/api/windows.ui.xaml.media.imaging.writeablebitmap.pixelbuffer).
+- The image-first XAML card inherits configured background opacity,
+  corner radius, monitor placement, font size, fade and expiry duration.
+  Its image area and caption derive from card dimensions and padding.
+  If the pixel extraction fails, the card displays the original image
+  notification text using compact-card bounds: it does **not** return
+  to GDI+ or silently present stale image pixels.
+- On hide/unload/switching to another category, the XAML image source
+  is disconnected and the stored pixel vector is released. The byte
+  payload and clipboard text are not emitted to Windhawk logs.
+- **Verification deferred:** Windhawk compile; copy plain text with
+  `clipboardTextPreview` off/on, file selections, CF_BITMAP previews,
+  DIB-only format fallback, no-preview mode, consecutive images, and
+  screenshot transitions to another category. Check colors, aspect
+  ratio, long-title truncation, clipboard privacy, DPI, multiple
+  displays, and Explorer unload/reload. No Windows visual tests were
+  performed in the GitHub editing environment.
+- **Legacy cleanup:** this experimental build still retains GDI+
+  rendering when the XAML toggle is explicitly disabled. Upon passing
+  runtime regression, remove the migrated category's GDI+ draw path,
+  panel hit-testing and frame assets; do not ship a permanent dual
+  implementation. SMTC and Mixer remain unported.
 
 ## Migration gates
 
