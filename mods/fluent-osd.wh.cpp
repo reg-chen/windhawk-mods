@@ -5701,10 +5701,16 @@ HWND CreateMirrorSurface() {
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
 }
 void RefreshMirrorOutputs(HMONITOR master) {
-    // XAML creates its own per-monitor DDC hosts. Never start the legacy
-    // GDI+ replicas while the migrated DDC renderer is selected.
-    if (g_xamlForMigrated.load() &&
-        g_popupKind == PopupKind::DdcBrightness) {
+    // Every migrated popup owns its XAML Island; do not allocate unused
+    // GDI+ replica HWNDs only to hide them immediately afterward.
+    // SMTC/Mixer still have their own GDI+ path until fully migrated.
+    const bool xamlPopup = g_popupKind == PopupKind::DdcBrightness ||
+        g_popupKind == PopupKind::NativeBrightness ||
+        g_popupKind == PopupKind::NativeVolume ||
+        g_popupKind == PopupKind::LockStatus ||
+        g_popupKind == PopupKind::NativeEvent ||
+        g_popupKind == PopupKind::Notification;
+    if (g_xamlForMigrated.load() && xamlPopup) {
         DestroyMirroredWindows();
         return;
     }
