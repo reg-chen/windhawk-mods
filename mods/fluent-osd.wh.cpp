@@ -83,12 +83,10 @@ Supported color values include `#RRGGBB`, `#AARRGGBB`,
 
 Copyright (c) Reg Chen. Licensed under **GPL-3.0**.
 
-The `WindhawkBlur` brush originates from
+The `WindhawkBlur` implementation is adapted directly from
 [Windows 11 Taskbar Styler](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/windows-11-taskbar-styler.wh.cpp)
-by m417z, based on [TranslucentTB's XamlBlurBrush](https://github.com/TranslucentTB/TranslucentTB/blob/release/ExplorerTAP/XamlBlurBrush.cpp).
-This implementation also adapts
-[diogonevesofc/taskbar-styler](https://github.com/diogonevesofc/taskbar-styler)
-(GPL-3.0-or-later), an independent derivative of the Windhawk mod.
+by m417z (GPL-3.0), itself based on
+[TranslucentTB's XamlBlurBrush](https://github.com/TranslucentTB/TranslucentTB/blob/release/ExplorerTAP/XamlBlurBrush.cpp).
 External project and product names/trademarks belong to their owners.
 */
 // ==/WindhawkModReadme==
@@ -702,6 +700,7 @@ External project and product names/trademarks belong to their owners.
 // calling Length() needs its full projection (as with PointerPoint).
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.UI.h>
+#include <winrt/Windows.UI.ViewManagement.h>
 // PointerRoutedEventArgs::GetCurrentPoint returns Windows.UI.Input.PointerPoint.
 // Its Position/Properties members require the full projection, not just XAML.Input.
 #include <winrt/Windows.UI.Input.h>
@@ -1640,11 +1639,12 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
         static_cast<BYTE>(rgb)});
 }
 
-// WindhawkBlur originates from m417z's Windows 11 Taskbar Styler,
-// itself based on TranslucentTB's XamlBlurBrush. This implementation
-// ports GPL-3.0-or-later Composition effect code from the independent
-// diogonevesofc/taskbar-styler derivative.
-// No general style engine, theme-resource parser or XamlReader.
+// Directly adapted from m417z's Windows 11 Taskbar Styler (GPL-3.0),
+// XamlBlurBrush in windows-11-taskbar-styler.wh.cpp v1.11.2,
+// itself based on TranslucentTB's XamlBlurBrush.
+// Preserve its 5-stage D2D/Composition graph; Fluent OSD owns a bounded
+// parser, STA-safe noise cache, and independent XAML Island lifetime.
+// No Styler theme engine, XamlReader or taskbar-specific code is included.
 namespace osd_blur {
 // Rec. 709 luminance coefficients used by the saturation and luminosity
 // matrices. Keep them together with the effect graph when porting.
@@ -1681,9 +1681,7 @@ struct GaussianBlurEffect
     HRESULT GetSourceCount(UINT* count) noexcept;
 
    private:
-    // Upstream leaves this on its type-name default for every effect it
-    // never explicitly renames (vendor:13060); Task 4's noise graph relies
-    // on that so two effects don't end up sharing an empty "" name.
+    // Preserve the default effect name from m417z's implementation.
     winrt::hstring m_name{L"GaussianBlurEffect"};
 };
 
@@ -1714,7 +1712,7 @@ struct ColorMatrixEffect
     HRESULT GetSourceCount(UINT* count) noexcept;
 
    private:
-    // vendor:13222 - see the comment on GaussianBlurEffect::m_name.
+    // Preserve the original effect name.
     winrt::hstring m_name{L"ColorMatrixEffect"};
 };
 
@@ -1739,9 +1737,7 @@ struct CompositeEffect
     HRESULT GetSourceCount(UINT* count) noexcept;
 
    private:
-    // vendor:12666 - see the comment on GaussianBlurEffect::m_name. Upstream
-    // leaves the root Composite on this default (never calls its Name()
-    // setter), so Task 4's brush must match it exactly.
+    // The root composite retains its original default name.
     winrt::hstring m_name{L"CompositeEffect"};
 };
 
@@ -1764,7 +1760,7 @@ struct FloodEffect : winrt::implements<FloodEffect, wge::IGraphicsEffect,
     HRESULT GetSourceCount(UINT* count) noexcept;
 
    private:
-    // vendor:12791 - see the comment on GaussianBlurEffect::m_name.
+    // Preserve the original effect name.
     winrt::hstring m_name{L"FloodEffect"};
 };
 
@@ -1789,9 +1785,7 @@ struct BorderEffect : winrt::implements<BorderEffect, wge::IGraphicsEffect,
     HRESULT GetSourceCount(UINT* count) noexcept;
 
    private:
-    // vendor:12918 - see the comment on GaussianBlurEffect::m_name. Upstream
-    // leaves the Border on this default (never calls its Name() setter), so
-    // Task 4's brush must match it exactly.
+    // The border effect retains its original default name.
     winrt::hstring m_name{L"BorderEffect"};
 };
 
@@ -1836,7 +1830,7 @@ wss::IRandomAccessStream CreateNoiseStream(float density) {
         return t_cached.CloneStream();
     }
 
-    // 256x256 keeps the tiling seam out of sight at taskbar sizes.
+    // 256x256 keeps tiled noise seams inconspicuous on OSD surfaces.
     constexpr int kSize = 256;
     constexpr DWORD kBpp = 32;
     constexpr DWORD kRowSize = kSize * (kBpp / 8);
@@ -1854,11 +1848,7 @@ wss::IRandomAccessStream CreateNoiseStream(float density) {
     info_header.biBitCount = kBpp;
     info_header.biSizeImage = kDataSize;
 
-    // NoiseDensity is parsed from theme JSON with wcstod (src/core/blur.cpp),
-    // which accepts "nan"/"inf" text, and std::clamp does not filter
-    // non-finite input (NaN compares false against both bounds and would
-    // pass straight through). Normalize a non-finite or non-positive density
-    // to the neutral default before clamping.
+    // The OSD parser already bounds density; guard against bypassing it.
     if (!(density > 0.0f)) {
         density = 1.0f;
     }
@@ -1874,7 +1864,7 @@ wss::IRandomAccessStream CreateNoiseStream(float density) {
     }
 
     // Fixed seed: the noise must be identical on every thread and every run,
-    // or two taskbars would show visibly different grain.
+    // or two OSD surfaces would show visibly different grain.
     std::mt19937 rng(0);
     std::uniform_int_distribution<int> dist(0, 255);
 
@@ -2033,8 +2023,7 @@ HRESULT ColorMatrixEffect::GetNamedPropertyMapping(
         *index = D2D1_COLORMATRIX_PROP_ALPHA_MODE;
         // DIRECT, not COLORMATRIX_ALPHA_MODE: we box a raw
         // D2D1_COLORMATRIX_ALPHA_MODE value ourselves (GetProperty below),
-        // so no further mapping conversion is needed. Matches upstream
-        // (vendor:13253-13259) - the brief had this wrong.
+        // so no further mapping conversion is needed.
         *mapping = awge::GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT;
         return S_OK;
     }
@@ -2211,9 +2200,7 @@ HRESULT FloodEffect::GetProperty(
     if (index != D2D1_FLOOD_PROP_COLOR) {
         return E_BOUNDS;
     }
-    // Straight (non-premultiplied) RGBA, exactly as upstream sends it
-    // (vendor:12847-12858). Deviating here changes how the tint composites
-    // over the blur, which is the one thing this plan must not do.
+    // Preserve the original straight (non-premultiplied) RGBA tint.
     const float rgba[4] = {Color.R / 255.0f, Color.G / 255.0f,
                            Color.B / 255.0f, Color.A / 255.0f};
     *value = DetachPropertyValue(wf::PropertyValue::CreateSingleArray(
@@ -2333,19 +2320,40 @@ struct BrushSpec {
     bool hasFallback = false;
 };
 bool ShouldFallback(const BrushSpec& spec) {
+    // m417z XamlBlurBrush: no fallback unless FallbackColor was requested.
     if (!spec.hasFallback) return false;
-    SYSTEM_POWER_STATUS power{};
-    if (GetSystemPowerStatus(&power) && power.SystemStatusFlag == 1)
-        return true;
-    DWORD enabled = 1, size = sizeof(enabled);
-    return RegGetValueW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-        L"EnableTransparency", RRF_RT_REG_DWORD, nullptr,
-        &enabled, &size) == ERROR_SUCCESS && enabled == 0;
+
+    // EnergySaverState is authoritative for "Always use energy saver" on
+    // Windows 11 24H2+, unlike WinRT/Win32 power status on those builds.
+    DWORD saverState = 0;
+    DWORD bytes = sizeof(saverState);
+    bool saverActive = RegGetValueW(
+        HKEY_LOCAL_MACHINE, L"SYSTEM\CurrentControlSet\Control\Power",
+        L"EnergySaverState", RRF_RT_REG_DWORD, nullptr,
+        &saverState, &bytes) == ERROR_SUCCESS && saverState == 1;
+
+    if (!saverActive) {
+        SYSTEM_POWER_STATUS power{};
+        if (GetSystemPowerStatus(&power) && power.SystemStatusFlag == 1)
+            saverActive = true;
+    }
+
+    bool effectsDisabled = false;
+    try {
+        winrt::Windows::UI::ViewManagement::UISettings uiSettings;
+        effectsDisabled = !uiSettings.AdvancedEffectsEnabled();
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"Fluent OSD: AdvancedEffectsEnabled unavailable (0x%08lX)",
+            static_cast<unsigned long>(ex.code()));
+    } catch (...) {
+        Wh_Log(L"Fluent OSD: AdvancedEffectsEnabled query failed");
+    }
+
+    return saverActive || effectsDisabled;
 }
-class OsdBlurBrush : public media::XamlCompositionBrushBaseT<OsdBlurBrush> {
+class WindhawkBlurBrush : public media::XamlCompositionBrushBaseT<WindhawkBlurBrush> {
 public:
-    OsdBlurBrush(wx::UIElement const& owner, BrushSpec settings)
+    WindhawkBlurBrush(wx::UIElement const& owner, BrushSpec settings)
         : compositor(hosting::ElementCompositionPreview::GetElementVisual(
               owner).Compositor()), spec(std::move(settings)) {}
     void OnConnected() {
@@ -2380,99 +2388,127 @@ private:
     wuc::Compositor compositor{nullptr};
     BrushSpec spec;
 };
-wuc::CompositionBrush OsdBlurBrush::CreateEffectBrush() {
-    auto backdrop = compositor.CreateBackdropBrush();
+wuc::CompositionBrush WindhawkBlurBrush::CreateEffectBrush()
+{
+    auto backdropBrush = compositor.CreateBackdropBrush();
 
-    // 1. Blur the backdrop.
-    auto blur = winrt::make_self<GaussianBlurEffect>();
-    blur->Source = wuc::CompositionEffectSourceParameter(L"backdrop");
-    blur->BlurAmount = spec.blurAmount;
-    blur->Name(L"BlurEffect");
-    wge::IGraphicsEffectSource top = *blur;
+    // Rec. 709 luma coefficients, used for saturation and luminosity.
+    constexpr float kLumaR = 0.2126f;
+    constexpr float kLumaG = 0.7152f;
+    constexpr float kLumaB = 0.0722f;
 
-    // 2. Saturation, as a lerp between luminance and identity.
-    if (spec.tintSaturation != 1.0f) {
-        // Parenthesized: <windows.h> defines a `max` macro and this TU
-        // does not define NOMINMAX (measured: C2589 without the parens).
-        const float s = (std::max)(spec.tintSaturation, 0.0f);
-        const float inv = 1.0f - s;
-        auto sat = winrt::make_self<ColorMatrixEffect>();
-        sat->Source = top;
-        auto& m = sat->Matrix;
-        m = {inv * kLumaR + s, inv * kLumaR,     inv * kLumaR,     0.0f,
-             inv * kLumaG,     inv * kLumaG + s, inv * kLumaG,     0.0f,
-             inv * kLumaB,     inv * kLumaB,     inv * kLumaB + s, 0.0f,
-             0.0f,             0.0f,             0.0f,             1.0f,
-             0.0f,             0.0f,             0.0f,             0.0f};
-        sat->Name(L"SaturationEffect");
-        top = *sat;
+    // 1. Blur
+    auto blurEffect = winrt::make_self<GaussianBlurEffect>();
+    blurEffect->Source = wuc::CompositionEffectSourceParameter(L"backdrop");
+    blurEffect->BlurAmount = spec.blurAmount;
+    blurEffect->Name(L"BlurEffect");
+
+    wge::IGraphicsEffectSource topOfStack = *blurEffect;
+
+    // 2. Saturation (optional)
+    if (spec.tintSaturation != 1.0f)
+    {
+        float s = (std::max)(spec.tintSaturation, 0.0f);
+        float invS = 1.0f - s;
+
+        auto satMatrix = winrt::make_self<ColorMatrixEffect>();
+        satMatrix->Source = topOfStack;
+
+        // Standard saturation matrix: lerp between luminance and identity.
+        auto& m = satMatrix->Matrix;
+        m[0]  = invS * kLumaR + s; m[1]  = invS * kLumaR;     m[2]  = invS * kLumaR;     m[3]  = 0.0f;
+        m[4]  = invS * kLumaG;     m[5]  = invS * kLumaG + s; m[6]  = invS * kLumaG;     m[7]  = 0.0f;
+        m[8]  = invS * kLumaB;     m[9]  = invS * kLumaB;     m[10] = invS * kLumaB + s; m[11] = 0.0f;
+        m[12] = 0.0f;              m[13] = 0.0f;              m[14] = 0.0f;              m[15] = 1.0f;
+
+        satMatrix->Name(L"SaturationEffect");
+        topOfStack = *satMatrix;
     }
 
-    // 3. Luminosity: pull each pixel's luma towards the tint's, by `op`.
-    if (spec.tintLuminosityOpacity > 0.0f) {
-        const float op = std::clamp(spec.tintLuminosityOpacity, 0.0f, 1.0f);
-        const float tint_luma = (spec.tint.R / 255.0f) * kLumaR +
-                                (spec.tint.G / 255.0f) * kLumaG +
-                                (spec.tint.B / 255.0f) * kLumaB;
-        auto lum = winrt::make_self<ColorMatrixEffect>();
-        lum->Source = top;
-        auto& m = lum->Matrix;
-        m = {1.0f - kLumaR * op, -(kLumaR * op),     -(kLumaR * op),     0.0f,
-             -(kLumaG * op),     1.0f - kLumaG * op, -(kLumaG * op),     0.0f,
-             -(kLumaB * op),     -(kLumaB * op),     1.0f - kLumaB * op, 0.0f,
-             0.0f,               0.0f,               0.0f,               1.0f,
-             tint_luma * op,     tint_luma * op,     tint_luma * op,     0.0f};
-        lum->Name(L"LuminosityBlend");
-        top = *lum;
+    // 3. Luminosity (optional) - shifts pixel luminance towards the tint's
+    // luminance, blended by the opacity factor.
+    if (spec.tintLuminosityOpacity > 0.0f)
+    {
+        float op = std::clamp(spec.tintLuminosityOpacity, 0.0f, 1.0f);
+
+        float tintLum = (spec.tint.R / 255.0f) * kLumaR +
+                        (spec.tint.G / 255.0f) * kLumaG +
+                        (spec.tint.B / 255.0f) * kLumaB;
+
+        auto lumMatrix = winrt::make_self<ColorMatrixEffect>();
+        lumMatrix->Source = topOfStack;
+
+        auto& m = lumMatrix->Matrix;
+        m[0]  = 1.0f - (kLumaR * op); m[1]  = -(kLumaR * op);       m[2]  = -(kLumaR * op);       m[3]  = 0.0f;
+        m[4]  = -(kLumaG * op);       m[5]  = 1.0f - (kLumaG * op); m[6]  = -(kLumaG * op);       m[7]  = 0.0f;
+        m[8]  = -(kLumaB * op);       m[9]  = -(kLumaB * op);       m[10] = 1.0f - (kLumaB * op); m[11] = 0.0f;
+        m[12] = 0.0f;                 m[13] = 0.0f;                 m[14] = 0.0f;                 m[15] = 1.0f;
+        m[16] = tintLum * op;         m[17] = tintLum * op;         m[18] = tintLum * op;         m[19] = 0.0f;
+
+        lumMatrix->Name(L"LuminosityBlend");
+        topOfStack = *lumMatrix;
     }
 
-    // 4. Noise: a wrapped tile, scaled down to NoiseOpacity, over the stack.
-    wuc::CompositionSurfaceBrush noise_brush{nullptr};
-    if (spec.noiseOpacity > 0.0f) {
-        auto stream = CreateNoiseStream(spec.noiseDensity);
-        auto surface = media::LoadedImageSurface::StartLoadFromStream(stream);
-        noise_brush = compositor.CreateSurfaceBrush(surface);
-        noise_brush.Stretch(wuc::CompositionStretch::None);
+    // 4. Noise overlay (optional) - procedural tiled noise with adjustable
+    // density and opacity.
+    wuc::CompositionSurfaceBrush noiseBrush{nullptr};
+    if (spec.noiseOpacity > 0.0f)
+    {
+        float density = spec.noiseDensity;
 
-        auto border = winrt::make_self<BorderEffect>();
-        border->Source = wuc::CompositionEffectSourceParameter(L"NoiseSource");
-        border->Name(L"NoiseTile");
+        auto stream = CreateNoiseStream(density);
+        auto surface =
+            media::LoadedImageSurface::StartLoadFromStream(stream);
+        noiseBrush = compositor.CreateSurfaceBrush(surface);
+        noiseBrush.Stretch(wuc::CompositionStretch::None);
 
-        const float n = std::clamp(spec.noiseOpacity, 0.0f, 1.0f);
-        auto opacity = winrt::make_self<ColorMatrixEffect>();
-        opacity->Source = *border;
-        // Scale every channel, alpha included, matching upstream. D2D's
-        // ColorMatrix de-premultiplies before applying, so noise amplitude
-        // ends up scaling as NoiseOpacity squared (measured, Task 4 report).
-        opacity->Matrix = {n,    0.0f, 0.0f, 0.0f, 0.0f, n,    0.0f, 0.0f,
-                           0.0f, 0.0f, n,    0.0f, 0.0f, 0.0f, 0.0f, n,
-                           0.0f, 0.0f, 0.0f, 0.0f};
-        opacity->Name(L"NoiseOpacityEffect");
+        // Tile via border effect (wrap mode).
+        auto borderEffect = winrt::make_self<BorderEffect>();
+        borderEffect->Source =
+            wuc::CompositionEffectSourceParameter(L"NoiseSource");
 
-        auto noise_composite = winrt::make_self<CompositeEffect>();
-        noise_composite->Mode = D2D1_COMPOSITE_MODE_SOURCE_OVER;
-        noise_composite->Sources.push_back(top);
-        noise_composite->Sources.push_back(*opacity);
-        noise_composite->Name(L"NoiseComposite");
-        top = *noise_composite;
+        // Scale all channels by opacity for premultiplied blending.
+        float nOp = std::clamp(spec.noiseOpacity, 0.0f, 1.0f);
+
+        auto opacityEffect = winrt::make_self<ColorMatrixEffect>();
+        opacityEffect->Source = *borderEffect;
+        // Matrix: Scale all channels by opacity (for premultiplied blending).
+        opacityEffect->Matrix[0] = nOp;
+        opacityEffect->Matrix[5] = nOp;
+        opacityEffect->Matrix[10] = nOp;
+        opacityEffect->Matrix[15] = nOp;
+        opacityEffect->Name(L"NoiseOpacityEffect");
+
+        // Composite noise over the current stack.
+        auto noiseComposite = winrt::make_self<CompositeEffect>();
+        noiseComposite->Mode = D2D1_COMPOSITE_MODE_SOURCE_OVER;
+        noiseComposite->Sources.push_back(topOfStack);
+        noiseComposite->Sources.push_back(*opacityEffect);
+        noiseComposite->Name(L"NoiseComposite");
+        topOfStack = *noiseComposite;
     }
 
-    // 5. The tint, flooded over everything.
-    auto flood = winrt::make_self<FloodEffect>();
-    flood->Color = spec.tint;
-    flood->Name(L"FloodEffect");
+    // 5. Tint (flood color composited over the stack).
+    auto floodEffect = winrt::make_self<FloodEffect>();
+    floodEffect->Color = spec.tint;
+    floodEffect->Name(L"FloodEffect");
 
-    auto composite = winrt::make_self<CompositeEffect>();
-    composite->Mode = D2D1_COMPOSITE_MODE_SOURCE_OVER;
-    composite->Sources.push_back(top);
-    composite->Sources.push_back(*flood);
+    auto compositeEffect = winrt::make_self<CompositeEffect>();
+    compositeEffect->Mode = D2D1_COMPOSITE_MODE_SOURCE_OVER;
+    compositeEffect->Sources.push_back(topOfStack);
+    compositeEffect->Sources.push_back(*floodEffect);
 
-    auto factory = compositor.CreateEffectFactory(*composite);
+    auto factory = compositor.CreateEffectFactory(*compositeEffect);
     auto brush = factory.CreateBrush();
-    brush.SetSourceParameter(L"backdrop", backdrop);
-    if (noise_brush) {
-        brush.SetSourceParameter(L"NoiseSource", noise_brush);
+
+    brush.SetSourceParameter(L"backdrop", backdropBrush);
+
+    // Bind the noise brush if we created one.
+    if (noiseBrush)
+    {
+        brush.SetSourceParameter(L"NoiseSource", noiseBrush);
     }
+
     return brush;
 }
 
@@ -2789,7 +2825,7 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
                 std::lround(tintOpacity * 255.0));
         if (!settings.hasFallback) settings.fallback = settings.tint;
         if (!card) return false;
-        auto value = winrt::make<osd_blur::OsdBlurBrush>(card, settings)
+        auto value = winrt::make<osd_blur::WindhawkBlurBrush>(card, settings)
                          .as<media::Brush>();
         value.Opacity(opacity);
         output = value;
