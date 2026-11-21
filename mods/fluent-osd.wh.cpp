@@ -3,7 +3,7 @@
 // @name            Fluent OSD
 // @description     Native XAML on-screen displays for volume, brightness, media, mixer and Windows system events.
 // @description:zh-TW 以原生 XAML 顯示音量、亮度、媒體、混音器及 Windows 系統事件提示。
-// @version         1.1.2
+// @version         1.1.3
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -35,6 +35,55 @@ Windows indicators to hide and which custom OSDs to show.
   corner radius, button shapes, sizing, placement, multi-monitor display
   and visibility timing. English and Traditional Chinese are supported.
 
+## Screenshots
+
+Actual Windows 11 captures, cropped to consistent dimensions.
+
+### Volume and mixer
+
+| Horizontal volume + media | Vertical volume + media |
+| :---: | :---: |
+| ![Horizontal volume + media](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/horizontal_media.png) | ![Vertical volume + media](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/vertical_media.png) |
+
+| Horizontal volume + mixer | Vertical volume + mixer |
+| :---: | :---: |
+| ![Horizontal volume + mixer](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/horizontal_mixer.png) | ![Vertical volume + mixer](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/vertical_mixer.png) |
+
+### Brightness
+
+| Horizontal brightness | Vertical brightness |
+| :---: | :---: |
+| ![Horizontal brightness](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/brightness/horizontal.png) | ![Vertical brightness](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/brightness/vertical.png) |
+
+### Clipboard
+
+| Copied image preview | Copied text | Copied files |
+| :---: | :---: | :---: |
+| ![Copied image preview](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/clipboard/image_preview.png) | ![Copied text](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/clipboard/text.png) | ![Copied files](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/clipboard/files.png) |
+
+### Network
+
+Wi-Fi radio power and connection to a Wi-Fi profile are separate events.
+Other network interfaces retain their own connection notices.
+
+| Connected Wi-Fi profile | Disconnected network interface |
+| :---: | :---: |
+| ![Connected Wi-Fi profile](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/network/wifi_connected.png) | ![Disconnected network interface (name redacted)](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/network/interface_disconnected.png) |
+
+### Bluetooth
+
+| Keyboard connected | Mouse connected |
+| :---: | :---: |
+| ![Bluetooth keyboard](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/bluetooth/keyboard.png) | ![Bluetooth mouse](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/bluetooth/mouse.png) |
+
+### System
+
+| Caps Lock | Insert |
+| :---: | :---: |
+| ![Caps Lock](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/system/caps_lock.png) | ![Insert](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/system/insert.png) |
+
+See the [complete screenshot gallery](https://github.com/reg-chen/windhawk-mods-assets#fluent-osd-screenshots) for all examples.
+
 ## Getting started
 
 1. Configure **Windows native OSD — Hide switches** for indicators you
@@ -46,8 +95,14 @@ Windows indicators to hide and which custom OSDs to show.
 ## Custom background brushes
 
 Under **Fluent appearance > Background effect**, choose **Transparency**
-for a solid color with adjustable opacity, or **Custom brush** to enter
-a single-line brush definition (without `Fill:=`).
+for the original solid background, or **Brush layers** for one to five
+custom brushes. The same renderer handles a single enabled layer and a
+stack of multiple brushes; the separate single-brush setting is removed.
+Windhawk's Add item, Remove, and reorder commands manage the layer list.
+Each layer accepts one single-line brush definition (without `Fill:=`),
+an Enabled flag, and an independent layer opacity (0–100%).
+Layers are painted bottom to top. Empty or invalid stacks use solid fallback.
+More than one Acrylic or WindhawkBlur can increase GPU memory use.
 
 | Brush | Example |
 | --- | --- |
@@ -72,13 +127,17 @@ a bounded set of named colors (including `Transparent`, `White`,
 - **WindhawkBlur:** Supports tint, opacity, blur and noise options.
 - Arbitrary XAML, bindings and unsupported brush attributes are not
   accepted. Invalid definitions fall back to a solid background.
-  On non-activating OSD windows, AcrylicBrush uses an in-Island Composition
-  approximation rather than native XAML Acrylic. Both BackgroundSource values
-  use the tested Backdrop source; HostBackdrop is accepted as a compatibility
-  alias, not a true host-wide backdrop. This is a visual approximation of
-  native AcrylicBrush, not a byte-identical reproduction. Power/advanced
-  effects fallback is honored when FallbackColor is explicitly configured.
   Arbitrary XAML/XamlReader is not enabled in Explorer.
+
+## Blur brush tips
+
+- Put `AcrylicBrush` or `WindhawkBlur` in the first (bottom) layer.
+  Keep its layer opacity at **100%** for the best blur appearance.
+- Add gradients, images, or highlights above it and adjust their opacity
+  as desired. Change glass color/strength using the brush's own settings.
+- Native `AcrylicBrush` supports `BackgroundSource="Backdrop"` only;
+  `HostBackdrop` is not supported. Blur of content outside the OSD
+  window is not guaranteed.
 
 ## Compatibility and limitations
 
@@ -89,6 +148,12 @@ a bounded set of named colors (including `Transparent`, `White`,
 - Media and device notifications depend on the information provided by
   Windows and connected hardware; Bluetooth disconnect notifications
   may not always be available.
+- Network notifications distinguish Wi-Fi radio enable/disable from
+  association/disconnection of a particular WLAN profile. Radio changes use
+  the Native Wi-Fi PHY state; profile names are obtained from the active
+  Windows Wi-Fi connection and may be unavailable without WLAN AutoConfig.
+  Other adapter transitions and Windows connectivity hints are reported
+  separately; they do not verify VPN or Internet reachability.
 - Windows updates may affect compatibility with Shell integrations.
 
 ## Credits and license
@@ -236,8 +301,8 @@ External project and product names/trademarks belong to their owners.
         - showNetworkEvents: false
           $name: Show network connectivity OSD
           $name:zh-TW: 顯示網路連線狀態 OSD
-          $description: Windows aggregate connectivity hints, not ping or per-VPN connectivity verification.
-          $description:zh-TW: 顯示 Windows 彙總網路連線提示，不執行 Ping，也不個別驗證 VPN 連線。
+          $description: Reports network adapter connection/disconnection and Windows connectivity changes. Does not ping hosts or verify individual VPN tunnels.
+          $description:zh-TW: 顯示網路介面卡連線／中斷及 Windows 網路狀態變化；不執行 Ping 或逐一驗證 VPN 通道。
       $name: Individual OSD switches
       $name:zh-TW: 各項 OSD 開關
     - AudioAndMedia:
@@ -327,14 +392,14 @@ External project and product names/trademarks belong to their owners.
         - ddcBackgroundEffect: opacity
           $name: Background effect
           $name:zh-TW: 背景效果
-          $description: Preserve the existing solid opacity, or use one restricted custom brush definition.
-          $description:zh-TW: 保留原有純色不透明度，或改用單一受限制的自訂筆刷定義。
+          $description: Use the original solid background or a list of one to five composited brushes.
+          $description:zh-TW: 使用原有純色背景，或以 1 至 5 個筆刷圖層疊加；單層也使用相同功能。
           $options:
           - opacity: Transparency
-          - custom: Custom brush
+          - layers: Brush layers
           $options:zh-TW:
           - opacity: 透明度
-          - custom: 自訂筆刷
+          - layers: 筆刷圖層
         - ddcBackgroundOpacity: 96
           $name: Background opacity (%)
           $name:zh-TW: 背景不透明度（%）
@@ -342,12 +407,29 @@ External project and product names/trademarks belong to their owners.
           #! $min: 0
           #! $max: 100
           #! $format: slider
-        - ddcCustomBrush: '<AcrylicBrush BackgroundSource="Backdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />'
-          $name: Custom background brush (single-line)
-          $name:zh-TW: 自訂背景筆刷（單行）
-          $description: Supports AcrylicBrush, SolidColorBrush, LinearGradientBrush, local ImageBrush and WindhawkBlur. Invalid definitions fall back to solid.
-          $description:zh-TW: 支援 AcrylicBrush、SolidColorBrush、LinearGradientBrush、ImageBrush（本機圖片）和 WindhawkBlur；無效時回退純色。
-          #! $showIf: {ddcBackgroundEffect: custom}
+        - ddcBrushLayers:
+            - - enabled: true
+                $name: Enable layer
+                $name:zh-TW: 啟用圖層
+              - opacity: 100
+                $name: Layer opacity (%)
+                $name:zh-TW: 圖層不透明度（%）
+                $description: For blur brushes, 100% is recommended.
+                $description:zh-TW: 模糊筆刷建議維持 100%。
+                #! $min: 0
+                #! $max: 100
+                #! $format: slider
+              - markup: '<AcrylicBrush BackgroundSource="Backdrop" TintColor="$mainColor" TintOpacity="0.1" TintLuminosityOpacity="0" />'
+                $name: Brush markup (single line)
+                $name:zh-TW: 筆刷語法（單行）
+            - - enabled: true
+              - opacity: 100
+              - markup: '<LinearGradientBrush StartPoint="0,0" EndPoint="1,1"><GradientStop Color="#30FF0000" Offset="0" /><GradientStop Color="#300000FF" Offset="1" /></LinearGradientBrush>'
+          $name: Background brush layers (bottom to top, maximum 5)
+          $name:zh-TW: 背景筆刷圖層（由下至上，最多 5 層）
+          $description: Put blur brushes first (bottom); add gradients or highlights above them.
+          $description:zh-TW: 建議模糊筆刷放第一層，漸層及高光疊加在上方。
+          #! $showIf: {ddcBackgroundEffect: layers}
         - ddcAccentMode: system
           $name: Progress bar color source
           $name:zh-TW: 進度條顏色來源
@@ -849,7 +931,7 @@ DWORD PercentToRaw(DWORD minimum, DWORD maximum, int percent) {
 namespace osd_model {
 enum class Kind {
     Volume, NativeBrightness, DdcBrightness, LockStatus, NoticeStatus,
-    NativeEvent, ClipboardImage, Mixer, Media
+    NoticeDetails, NativeEvent, ClipboardImage, Mixer, Media
 };
 enum class ChevronDirection { Left, Right, Up, Down };
 // Plain-value SMTC view state. The worker remains the sole GSMTC accessor.
@@ -906,6 +988,21 @@ struct MixerModel {
     bool outputExpanded = false, outputFailed = false;
     int maxVisibleRows = 6;
 };
+struct BrushLayer {
+    bool enabled = true;
+    int opacity = 100;
+    std::wstring markup;
+};
+bool SameBrushLayers(const std::vector<BrushLayer>& a,
+                     const std::vector<BrushLayer>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].enabled != b[i].enabled ||
+            a[i].opacity != b[i].opacity ||
+            a[i].markup != b[i].markup)
+            return false;
+    return true;
+}
 struct Snapshot {
     Kind kind = Kind::Volume;
     std::wstring key;       // Nonempty for a physical DDC display/window.
@@ -921,6 +1018,8 @@ struct Snapshot {
     std::wstring statusTitle, statusDetail, statusGlyph;
     std::wstring noticeDetailsHeading;
     std::vector<std::wstring> noticeDetails;
+    ChevronDirection noticeDirection = ChevronDirection::Down;
+    uint32_t noticeGeneration = 0;
     DWORD noticeInteractiveDurationMs = 8000;
     uint32_t clipboardWidth = 0, clipboardHeight = 0;
     std::vector<uint8_t> clipboardPixels; // Bounded 32-bit BGRA, no HBITMAP on STA.
@@ -933,8 +1032,10 @@ struct Snapshot {
     bool brightness = false;
     bool showIcon = true;
     BYTE backgroundAlpha = 255;
-    bool customBackground = false;
+    bool layeredBackground = false;
+    // Internal, parser-only field. Each configured layer supplies its markup.
     std::wstring backgroundMarkup;
+    std::vector<BrushLayer> backgroundLayers;
     bool borderless = true, fadeEnabled = false;
     int cornerRadius = 17;
     DWORD fadeDurationMs = 160;
@@ -951,10 +1052,11 @@ struct Snapshot {
 
 // Functional transformations: unchanged input -> new owned output.
 // No renderer, HWND lookup or hardware operation occurs in these functions.
-enum class View { Level, Status, ClipboardImage, Mixer, Media };
+enum class View { Level, Status, Details, ClipboardImage, Mixer, Media };
 View SelectView(Kind kind) {
     if (kind == Kind::Media) return View::Media;
     if (kind == Kind::Mixer) return View::Mixer;
+    if (kind == Kind::NoticeDetails) return View::Details;
     if (kind == Kind::ClipboardImage) return View::ClipboardImage;
     if (kind == Kind::LockStatus || kind == Kind::NoticeStatus ||
         kind == Kind::NativeEvent) return View::Status;
@@ -1002,11 +1104,11 @@ Snapshot AsStatus(Snapshot data, Kind category,
 namespace osd_control {
 enum class Action {
     SetPercent, Wheel, ToggleMute,
-    OpenMixer, CloseMixer, MixerSetPercent, MixerToggleMute,
+    OpenMixer, CloseMixer, ToggleNoticeDetails, MixerSetPercent, MixerToggleMute,
     MixerSelectOutput, MixerToggleOutput,
     MediaAction, MediaSeek, CloseMedia
 };
-enum class Target { None, Volume, NativeBrightness, DdcBrightness, Mixer, Media };
+enum class Target { None, Volume, NativeBrightness, DdcBrightness, Mixer, Media, Notice };
 struct Command {
     Target target = Target::None;
     Action action = Action::SetPercent;
@@ -1028,6 +1130,7 @@ Target ForCategory(osd_model::Kind kind) {
         case osd_model::Kind::DdcBrightness: return Target::DdcBrightness;
         case osd_model::Kind::Mixer: return Target::Mixer;
         case osd_model::Kind::Media: return Target::Media;
+        case osd_model::Kind::NoticeStatus: return Target::Notice;
         default: return Target::None;
     }
 }
@@ -1037,7 +1140,8 @@ Command Build(const osd_model::Snapshot& source, Action action, int value) {
         ? Target::Mixer : ForCategory(source.kind);
     cmd.action = action;
     cmd.value = value;
-    cmd.generation = source.mixer.generation;
+    cmd.generation = action == Action::ToggleNoticeDetails
+        ? source.noticeGeneration : source.mixer.generation;
     wcscpy_s(cmd.device, source.device);
     cmd.physicalIndex = source.physicalIndex;
     cmd.minimum = source.minimum;
@@ -1422,7 +1526,7 @@ Status StatusGeometry(const osd_model::Snapshot& value) {
     g.tileY = (h - g.tileSize) / 2.0;
     g.textX = g.tileX + g.tileSize + g.pad;
     const double arrowW = g.interactive
-        ? std::max(15.0, g.pad * 1.7) : 0.0;
+        ? std::clamp(h * .32, 20.0, 28.0) + g.pad * .5 : 0.0;
     g.textW = std::max(1.0, w - g.textX - g.pad - arrowW);
     g.titleFont = std::clamp(value.fontSize, 10, 24);
     g.detailFont = std::max(10, g.titleFont - 3);
@@ -1581,6 +1685,8 @@ struct State {
     hosting::WindowsXamlManager manager{nullptr};
     hosting::DesktopWindowXamlSource source{nullptr};
     controls::Border card{nullptr};
+    controls::Grid backgroundStack{nullptr};
+    std::vector<controls::Border> backgroundLayerCards;
     controls::Canvas canvas{nullptr};
     controls::Viewbox viewbox{nullptr};
     controls::TextBlock icon{nullptr};
@@ -1595,7 +1701,8 @@ struct State {
     controls::TextBlock statusGlyph{nullptr}, statusTitle{nullptr},
                         statusDetail{nullptr};
     shapes::Rectangle statusUnderline{nullptr};
-    controls::TextBlock noticeChevron{nullptr}, noticeHeading{nullptr};
+    controls::Button noticeChevron{nullptr};
+    controls::TextBlock noticeHeading{nullptr};
     controls::ScrollViewer noticeScroll{nullptr};
     controls::StackPanel noticeRows{nullptr};
     controls::Border clipboardFrame{nullptr};
@@ -1639,11 +1746,12 @@ struct State {
     double iconSlotWidth = 0.0, iconSlotHeight = 0.0;
     double valueSlotWidth = 0.0, valueSlotHeight = 0.0;
     double rawSlotWidth = 0.0, rawSlotHeight = 0.0;
-    bool backgroundCached = false, cachedCustomBackground = false;
+    bool backgroundCached = false;
+    bool cachedLayeredBackground = false;
     DWORD cachedBackground = 0, cachedAccent = 0,
           cachedText = 0, cachedTrack = 0;
     BYTE cachedBackgroundAlpha = 0;
-    std::wstring cachedBackgroundMarkup;
+    std::vector<osd_model::BrushLayer> cachedBackgroundLayers;
 };
 media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
     return media::SolidColorBrush(winrt::Windows::UI::Color{
@@ -2340,7 +2448,7 @@ bool ShouldFallback(const BrushSpec& spec) {
     DWORD saverState = 0;
     DWORD bytes = sizeof(saverState);
     bool saverActive = RegGetValueW(
-        HKEY_LOCAL_MACHINE, L"SYSTEM\CurrentControlSet\Control\Power",
+        HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Power",
         L"EnergySaverState", RRF_RT_REG_DWORD, nullptr,
         &saverState, &bytes) == ERROR_SUCCESS && saverState == 1;
 
@@ -2777,6 +2885,7 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
         auto fallback = tint;
         double opacity = 1.0, tintOpacity = 1.0, luminosityOpacity = 0.0;
         bool hasFallback = false, forceFallback = false;
+        bool hasLuminosityOpacity = false;
         for (const auto& attr : root.attrs) {
             if (attr.first == L"TintColor") {
                 if (!ParseBrushColor(state, attr.second, tint)) return false;
@@ -2790,14 +2899,19 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
             } else if (attr.first == L"TintLuminosityOpacity") {
                 if (!ParseBrushFraction(attr.second, luminosityOpacity))
                     return false;
+                hasLuminosityOpacity = true;
             } else if (attr.first == L"Opacity") {
                 if (!ParseBrushFraction(attr.second, opacity)) return false;
             } else if (attr.first == L"BackgroundSource") {
-                // Legacy HostBackdrop is accepted for compatibility.
-                // Non-activating XAML Islands use the known-working
-                // in-Island Composition backdrop for both spellings.
-                if (attr.second != L"HostBackdrop" &&
-                    attr.second != L"Backdrop") return false;
+                // HostBackdrop belongs to the host/window backdrop surface.
+                // Nested Grid layers cannot assume ownership of that surface.
+                // Never silently map HostBackdrop to another backdrop mode.
+                if (attr.second == L"HostBackdrop") {
+                    Wh_Log(L"Fluent OSD/XAML: HostBackdrop unsupported in "
+                           L"layered native AcrylicBrush; layer rejected");
+                    return false;
+                }
+                if (attr.second != L"Backdrop") return false;
             } else if (attr.first == L"AlwaysUseFallback") {
                 if (attr.second == L"True" || attr.second == L"true")
                     forceFallback = true;
@@ -2806,33 +2920,30 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
                 else return false;
             } else return false;
         }
+
+        // Native Windows.UI.Xaml.Media.AcrylicBrush. Backdrop sampling in
+        // a non-activating Island does not guarantee window-external blur
+        // or post-processing of already composed sibling layers.
+        // Preserve native fallback handling rather than synthesizing blur.
         if (!hasFallback) fallback = tint;
-        if (forceFallback) {
-            auto solid = media::SolidColorBrush(fallback);
-            solid.Opacity(opacity);
-            output = solid;
-            return true;
-        }
-        // XAML's native AcrylicBrush falls back on inactive popup HWNDs.
-        // Keep the AcrylicBrush markup/API, but render its tint/luminosity
-        // via a bounded Composition effect in the XAML Border itself.
-        // This preserves card rounding and avoids a host-wide DWM backdrop.
-        osd_blur::BrushSpec acrylic;
-        acrylic.tint = tint;
-        acrylic.tint.A = static_cast<BYTE>(std::lround(
-            static_cast<double>(tint.A) * tintOpacity));
-        acrylic.tintLuminosityOpacity =
-            static_cast<float>(luminosityOpacity);
-        acrylic.blurAmount = 18.0f;
-        acrylic.noiseOpacity = 0.02f;
-        acrylic.fallback = fallback;
-        acrylic.hasFallback = hasFallback;
-        // Match m417z's XamlBlurBrush CreateBackdropBrush path; no
-        // DWM host backdrop flag or HWND-wide opaque rectangle is needed.
-        auto brush = winrt::make<osd_blur::WindhawkBlurBrush>(card, acrylic)
-                         .as<media::Brush>();
+        auto brush = media::AcrylicBrush();
+        brush.BackgroundSource(media::AcrylicBackgroundSource::Backdrop);
+        brush.TintColor(tint);
+        brush.TintOpacity(tintOpacity);
+        if (hasLuminosityOpacity)
+            brush.TintLuminosityOpacity(
+                winrt::box_value(luminosityOpacity)
+                    .as<winrt::Windows::Foundation::IReference<double>>());
+        brush.FallbackColor(fallback);
+        brush.AlwaysUseFallback(forceFallback);
         brush.Opacity(opacity);
         output = brush;
+
+        // Construction does not prove that Windows rendered the blur effect.
+        // Windows may choose fallback depending on host and system policy.
+        Wh_Log(L"Fluent OSD/XAML: native AcrylicBrush constructed "
+               L"(source=Backdrop, forcedFallback=%d)",
+               forceFallback ? 1 : 0);
         return true;
     }
     if (root.name == L"ImageBrush") {
@@ -3020,41 +3131,98 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
     output = brush;
     return true;
 }
+// The Viewbox remains last; all brush layers belong below it in the Grid.
+// Disconnect custom Composition brushes before removing the XAML visuals.
+void ClearBackgroundLayers(State& state) {
+    if (!state.backgroundStack) return;
+    auto children = state.backgroundStack.Children();
+    for (auto& layer : state.backgroundLayerCards) {
+        try { layer.Background(nullptr); } catch (...) {}
+    }
+    const size_t count = state.backgroundLayerCards.size();
+    for (size_t i = 0; i < count && children.Size() > 1; ++i)
+        children.RemoveAt(0);
+    state.backgroundLayerCards.clear();
+}
+void SetBackgroundLayerRadius(State& state, double radius) {
+    radius = std::clamp(radius, 0.0, 34.0);
+    for (auto& layer : state.backgroundLayerCards)
+        layer.CornerRadius(wx::CornerRadius{
+            radius, radius, radius, radius});
+}
 void ApplyBackground(State& state, const Snapshot& snapshot) {
     if (state.backgroundCached &&
-        state.cachedCustomBackground == snapshot.customBackground &&
+        state.cachedLayeredBackground == snapshot.layeredBackground &&
         state.cachedBackground == snapshot.background &&
         state.cachedBackgroundAlpha == snapshot.backgroundAlpha &&
         state.cachedAccent == snapshot.accent &&
         state.cachedText == snapshot.text &&
         state.cachedTrack == snapshot.track &&
-        state.cachedBackgroundMarkup == snapshot.backgroundMarkup)
+        osd_model::SameBrushLayers(
+            state.cachedBackgroundLayers, snapshot.backgroundLayers))
         return;
-    media::Brush brush{nullptr};
+    ClearBackgroundLayers(state);
     bool valid = false;
-    if (snapshot.customBackground) {
-        try {
-            valid = TryBuildBackgroundBrush(snapshot, state.card, brush);
+    if (snapshot.layeredBackground && state.backgroundStack) {
+        state.card.Background(Brush(0, 0));
+        auto children = state.backgroundStack.Children();
+        for (const auto& spec : snapshot.backgroundLayers) {
+            if (!spec.enabled || spec.markup.empty()) continue;
+            controls::Border layer;
+            layer.IsHitTestVisible(false);
+            layer.HorizontalAlignment(wx::HorizontalAlignment::Stretch);
+            layer.VerticalAlignment(wx::VerticalAlignment::Stretch);
+            // UI composite opacity is applied after brush rendering.
+            // For blur brushes use 100% to avoid unfiltered content bleeding
+            // through this entire XAML layer. Tint opacity is independent.
+            layer.Opacity(std::clamp(spec.opacity, 0, 100) / 100.0);
+            const double radius =
+                std::clamp(static_cast<double>(snapshot.cornerRadius),
+                           0.0, 34.0);
+            layer.CornerRadius(wx::CornerRadius{
+                radius, radius, radius, radius});
+            // Attach before Composition creation so ElementCompositionPreview
+            // can resolve the correct XAML Island compositor.
+            children.InsertAt(children.Size() - 1, layer);
+            Snapshot single = snapshot;
+            single.backgroundMarkup = spec.markup;
+            media::Brush layerBrush{nullptr};
+            bool built = false;
+            try {
+                built = TryBuildBackgroundBrush(single, layer, layerBrush);
+                if (built) layer.Background(layerBrush);
+            } catch (const winrt::hresult_error& ex) {
+                Wh_Log(L"Fluent OSD: background layer failed: 0x%08lX",
+                       static_cast<unsigned long>(ex.code()));
+                built = false;
+            } catch (...) {
+                Wh_Log(L"Fluent OSD: background layer creation failed");
+                built = false;
+            }
+            if (built) {
+                state.backgroundLayerCards.push_back(layer);
+                valid = true;
+            } else {
+                // A bad upper layer must not hide lower, valid layers.
+                try { layer.Background(nullptr); } catch (...) {}
+                children.RemoveAt(children.Size() - 2);
+                Wh_Log(L"Fluent OSD: invalid background layer skipped");
+            }
         }
-        catch (const winrt::hresult_error& ex) {
-            Wh_Log(L"Custom background brush unavailable: 0x%08lX",
-                   static_cast<unsigned long>(ex.code()));
-        } catch (...) {
-            Wh_Log(L"Custom background brush creation failed");
-        }
-        if (!valid)
-            Wh_Log(L"Custom background brush invalid; using solid fallback");
+        Wh_Log(L"Fluent OSD/XAML: layer render configured=%u built=%u",
+               static_cast<unsigned>(snapshot.backgroundLayers.size()),
+               static_cast<unsigned>(state.backgroundLayerCards.size()));
     }
-    if (!valid) brush = Brush(snapshot.background, snapshot.backgroundAlpha);
-    state.card.Background(brush);
+    if (!valid)
+        state.card.Background(Brush(snapshot.background, snapshot.backgroundAlpha));
     state.backgroundCached = true;
-    state.cachedCustomBackground = snapshot.customBackground;
+    state.cachedLayeredBackground = snapshot.layeredBackground;
     state.cachedBackground = snapshot.background;
     state.cachedBackgroundAlpha = snapshot.backgroundAlpha;
     state.cachedAccent = snapshot.accent;
     state.cachedText = snapshot.text;
     state.cachedTrack = snapshot.track;
-    state.cachedBackgroundMarkup = snapshot.backgroundMarkup;
+    state.cachedBackgroundLayers = snapshot.backgroundLayers;
 }
 
 void DrawSnapshot(State&, const Snapshot&);
@@ -3157,7 +3325,8 @@ void HideSurface(State& state) {
     if (state.current.kind == LevelKind::Media && !g_stopping.load())
         SendMediaCommand(state, InputAction::CloseMedia);
     if ((state.current.kind == LevelKind::Media ||
-         state.current.kind == LevelKind::Mixer) && state.pairedVolume)
+         state.current.kind == LevelKind::Mixer ||
+         state.current.kind == LevelKind::NoticeDetails) && state.pairedVolume)
         HideSurface(*state.pairedVolume);
 }
 
@@ -3191,7 +3360,8 @@ void ArmInteractionTimer(State& state, bool active) {
         return;
     }
     if (!active && (state.current.kind == LevelKind::Mixer ||
-                    state.current.kind == LevelKind::Media) &&
+                    state.current.kind == LevelKind::Media ||
+                    state.current.kind == LevelKind::NoticeDetails) &&
         state.pairedVolume &&
         (PointerInsideHost(*state.pairedVolume) ||
          PointerInsideHost(state)))
@@ -3246,16 +3416,8 @@ void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
     const auto point = args.GetCurrentPoint(state.canvas);
     if (!point.Properties().IsLeftButtonPressed()) return;
     const auto pos = point.Position();
-    if (state.current.kind == LevelKind::NoticeStatus) {
-        if (state.current.noticeDetails.size() <= 1 ||
-            pos.Y < 0 || pos.Y >= state.noticeHeaderH) return;
-        state.pointerActive = true;
-        state.activePointerId = args.Pointer().PointerId();
-        state.canvas.CapturePointer(args.Pointer());
-        ArmInteractionTimer(state, true);
-        args.Handled(true);
-        return;
-    }
+    // Only the dedicated XAML Button owns the notice chevron hit region.
+    if (state.current.kind == LevelKind::NoticeStatus) return;
     const double halo = 8.0; // Fixed input halo for icon/fallback track.
     const bool icon = state.current.kind == LevelKind::Volume &&
         state.current.showIcon &&
@@ -3289,23 +3451,6 @@ void PointerReleased(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.pointerActive || !state.canvas ||
         args.Pointer().PointerId() != state.activePointerId) return;
     const auto pos = args.GetCurrentPoint(state.canvas).Position();
-    if (state.current.kind == LevelKind::NoticeStatus) {
-        const bool activate = pos.Y >= 0 && pos.Y < state.noticeHeaderH;
-        state.pointerActive = false;
-        state.canvas.ReleasePointerCapture(args.Pointer());
-        if (activate) {
-            try { ToggleNoticeDetails(state); }
-            catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML notice details HRESULT 0x%08lX",
-                    static_cast<unsigned long>(ex.code()));
-            } catch (...) {
-                Wh_Log(L"XAML notice details unexpected exception");
-            }
-        }
-        ArmInteractionTimer(state, PointerInsideHost(state));
-        args.Handled(true);
-        return;
-    }
     const bool click = state.iconPressed &&
         InHitRegion(pos.X, pos.Y, state.iconX, state.iconY,
                     state.iconW, state.iconH, 0.0);
@@ -3530,71 +3675,93 @@ void TransitionStatusUnderline(State& state, bool sameVisibleStatus,
 
 void UpdateNoticeDetails(State& state, const Snapshot& value,
                          double bodyW, double headerH, double pad,
-                         double insetY, double& totalBodyH) {
-    const bool clickable = osd_model::CanExpand(value);
+                         double, double& totalBodyH) {
+    const bool canExpand = osd_model::CanExpand(value);
     state.noticeHeaderH = headerH;
-    state.noticeChevron.Visibility(clickable
+    state.noticeChevron.Visibility(canExpand
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
-    state.noticeChevron.Text(state.noticeExpanded ? L"\u2303" : L"\u2304");
+    // Same XAML Button/glyph contract as the volume Mixer.
+    state.noticeChevron.Content(winrt::box_value(winrt::hstring(
+        osd_layout::MixerChevronGlyph(value.noticeDirection))));
     state.noticeChevron.Foreground(Brush(value.accent));
-    state.noticeChevron.FontSize(std::clamp(value.fontSize + 4, 14, 26));
-    const double arrowW = std::max(15.0, pad * 1.7);
-    state.noticeChevron.Width(arrowW);
+    const double size = std::clamp(headerH * .32, 20.0, 28.0);
+    state.noticeChevron.Width(size);
+    state.noticeChevron.Height(size);
     controls::Canvas::SetLeft(state.noticeChevron,
-        std::max(0.0, bodyW - pad - arrowW));
+        std::max(0.0, bodyW - pad - size));
     controls::Canvas::SetTop(state.noticeChevron,
-        std::max(0.0, (headerH - value.fontSize * 1.45) / 2.0));
-    const bool expanded = clickable && state.noticeExpanded;
-    state.noticeHeading.Visibility(expanded
-        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
-    state.noticeScroll.Visibility(expanded
-        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
-    if (!expanded) {
-        totalBodyH = headerH;
+        std::max(0.0, (headerH - size) * .5));
+    state.noticeHeading.Visibility(wx::Visibility::Collapsed);
+    state.noticeScroll.Visibility(wx::Visibility::Collapsed);
+    // Details occupy a sibling peer window; main card never changes size.
+    totalBodyH = headerH;
+}
+void ToggleNoticeDetails(State& state) {
+    if (!state.viewOnly && osd_model::CanExpand(state.current))
+        SendInput(state, InputAction::ToggleNoticeDetails, 0);
+}
+void DrawNoticeDetailsPanel(State& state, const Snapshot& value) {
+    if (!state.host || !state.card || !state.canvas ||
+        !state.noticeHeading || !state.noticeScroll || !state.noticeRows)
         return;
-    }
-    MONITORINFO mi{sizeof(mi)};
-    const HMONITOR monitor = MonitorFromRect(&value.anchor,
-                                            MONITOR_DEFAULTTONEAREST);
-    const double scale = std::clamp(
-        static_cast<double>(value.scale), 0.5, 6.0);
-    const double workH = GetMonitorInfoW(monitor, &mi)
-        ? (mi.rcWork.bottom - mi.rcWork.top) / scale : 640.0;
-    const auto layout = osd_layout::DetailsGeometry(
-        value.noticeDetails.size(), value.fontSize,
-        workH, headerH, insetY, pad);
-    const double rowH = layout.rowH, headingH = layout.headingH;
-    const double viewportH = layout.viewportH;
-    totalBodyH = layout.totalH;
+    state.current = value;
+    state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
+    const auto frame = osd_layout::CardFrame(value, 8.0 / 296.0, 7.0 / 210.0);
+    const double w = frame.width, h = frame.height;
+    const double pad = std::clamp(
+        static_cast<double>(value.innerPadding), 6.0, 22.0) * .68;
+    state.canvas.IsHitTestVisible(true);
+    state.canvas.Width(w);
+    state.canvas.Height(h);
+    ApplyBackground(state, value);
+    const double radius = std::clamp(
+        static_cast<double>(value.cornerRadius), 0.0, 34.0);
+    state.card.CornerRadius(wx::CornerRadius{
+        radius, radius, radius, radius});
+    state.card.BorderBrush(Brush(value.track));
+    const double border = value.borderless ? 0.0 : 1.0;
+    state.card.BorderThickness(wx::Thickness{
+        border, border, border, border});
+    state.icon.Visibility(wx::Visibility::Collapsed);
+    state.value.Visibility(wx::Visibility::Collapsed);
+    state.track.Visibility(wx::Visibility::Collapsed);
+    state.fill.Visibility(wx::Visibility::Collapsed);
+    state.statusTile.Visibility(wx::Visibility::Collapsed);
+    state.statusTitle.Visibility(wx::Visibility::Collapsed);
+    state.statusDetail.Visibility(wx::Visibility::Collapsed);
+    state.statusUnderline.Visibility(wx::Visibility::Collapsed);
+    state.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerSurface.Visibility(wx::Visibility::Collapsed);
+    state.mediaSurface.Visibility(wx::Visibility::Collapsed);
+    state.clipboardFrame.Visibility(wx::Visibility::Collapsed);
+    state.clipboardCaption.Visibility(wx::Visibility::Collapsed);
+    state.noticeHeading.Visibility(wx::Visibility::Visible);
+    state.noticeScroll.Visibility(wx::Visibility::Visible);
+    const double headingH = std::max(20.0, value.fontSize * 1.5);
+    const double rowH = std::max(26.0, value.fontSize * 1.8);
     state.noticeHeading.Text(winrt::hstring(value.noticeDetailsHeading));
     state.noticeHeading.FontSize(std::clamp(value.fontSize, 11, 22));
     state.noticeHeading.Foreground(Brush(value.text));
-    state.noticeHeading.Width(std::max(1.0, bodyW - 2.0 * pad));
+    state.noticeHeading.Width(std::max(1.0, w - 2.0 * pad));
     controls::Canvas::SetLeft(state.noticeHeading, pad);
-    controls::Canvas::SetTop(state.noticeHeading, headerH + pad * .5);
-    state.noticeScroll.Width(std::max(1.0, bodyW - 2.0 * pad));
-    state.noticeScroll.Height(viewportH);
+    controls::Canvas::SetTop(state.noticeHeading, pad);
+    state.noticeScroll.Width(std::max(1.0, w - 2.0 * pad));
+    state.noticeScroll.Height(std::max(1.0, h - headingH - 2.5 * pad));
     controls::Canvas::SetLeft(state.noticeScroll, pad);
-    controls::Canvas::SetTop(state.noticeScroll,
-        headerH + pad + headingH);
+    controls::Canvas::SetTop(state.noticeScroll, pad * 1.5 + headingH);
     state.noticeRows.Children().Clear();
     for (const auto& name : value.noticeDetails) {
         controls::TextBlock row;
         row.Text(winrt::hstring(name));
-        row.Width(std::max(1.0, bodyW - 3.0 * pad));
+        row.Width(std::max(1.0, w - 3.0 * pad));
         row.Height(rowH);
         row.FontSize(std::clamp(value.fontSize - 2, 10, 18));
         row.Foreground(Brush(value.text));
         row.TextTrimming(wx::TextTrimming::CharacterEllipsis);
         state.noticeRows.Children().Append(row);
     }
-}
-
-void ToggleNoticeDetails(State& state) {
-    if (!osd_model::CanExpand(state.current)) return;
-    state.noticeExpanded = !state.noticeExpanded;
-    const Snapshot snapshot = state.current;
-    DrawStatusSnapshot(state, snapshot);
+    ShowPositionedSurface(state, value, frame.insetX, frame.insetY, w, h);
 }
 
 void DrawStatusSnapshot(State& state, const Snapshot& value) {
@@ -3633,6 +3800,7 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     ApplyBackground(state, value);
     const double radius = layout.radius;
     state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
+    SetBackgroundLayerRadius(state, radius);
     state.card.BorderBrush(Brush(value.track));
     const double border = value.borderless ? 0.0 : 1.0;
     state.card.BorderThickness(wx::Thickness{border, border, border, border});
@@ -3735,6 +3903,7 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
     state.canvas.Height(bodyH);
     ApplyBackground(state, data);
     state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
+    SetBackgroundLayerRadius(state, radius);
     state.card.BorderBrush(Brush(data.track));
     const double border = data.borderless ? 0.0 : 1.0;
     state.card.BorderThickness(wx::Thickness{border, border, border, border});
@@ -3992,8 +4161,9 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         state.current.vertical==snap.vertical&&
         state.current.background==snap.background&&
         state.current.backgroundAlpha==snap.backgroundAlpha&&
-        state.current.customBackground==snap.customBackground&&
-        state.current.backgroundMarkup==snap.backgroundMarkup&&
+        state.current.layeredBackground==snap.layeredBackground&&
+        osd_model::SameBrushLayers(
+            state.current.backgroundLayers, snap.backgroundLayers)&&
         state.current.accent==snap.accent&&
         state.current.text==snap.text&&
         state.current.track==snap.track&&
@@ -4021,6 +4191,7 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
     const double radius=std::clamp(double(snap.cornerRadius),0.0,34.0);
     state.card.CornerRadius(wx::CornerRadius{
         radius,radius,radius,radius});
+    SetBackgroundLayerRadius(state, radius);
     state.card.BorderBrush(Brush(snap.track));
     const double border=snap.borderless?0.0:1.0;
     state.card.BorderThickness(wx::Thickness{border,border,border,border});
@@ -4226,6 +4397,7 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     state.canvas.Height(h);
     ApplyBackground(state, data);
     state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
+    SetBackgroundLayerRadius(state, radius);
     state.card.BorderBrush(Brush(data.track));
     const double border = data.borderless ? 0.0 : 1.0;
     state.card.BorderThickness(wx::Thickness{border, border, border, border});
@@ -4479,6 +4651,10 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         DrawMediaSnapshot(state, value);
         return;
     }
+    if (view == osd_model::View::Details) {
+        DrawNoticeDetailsPanel(state, value);
+        return;
+    }
     if (state.mixerChevron)
         state.mixerChevron.Visibility(wx::Visibility::Collapsed);
     if (state.mixerSurface)
@@ -4533,6 +4709,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         std::clamp(value.cornerRadius, 0, 34));
     state.card.CornerRadius(wx::CornerRadius{
         radius, radius, radius, radius});
+    SetBackgroundLayerRadius(state, radius);
     state.card.BorderBrush(Brush(value.track));
     const double border = value.borderless ? 0.0 : 1.0;
     state.card.BorderThickness(wx::Thickness{
@@ -4933,9 +5110,19 @@ void CreateContent(State& state) {
     statusUnderline.Visibility(wx::Visibility::Collapsed);
     canvas.Children().Append(statusUnderline);
 
-    controls::TextBlock noticeChevron;
+    controls::Button noticeChevron;
     noticeChevron.Visibility(wx::Visibility::Collapsed);
-    noticeChevron.TextAlignment(wx::TextAlignment::Center);
+    noticeChevron.Content(winrt::box_value(winrt::hstring(L"\uE70D")));
+    noticeChevron.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+    noticeChevron.MinWidth(0.0);
+    noticeChevron.MinHeight(0.0);
+    noticeChevron.Padding(wx::Thickness{0.0, 0.0, 0.0, 0.0});
+    noticeChevron.HorizontalContentAlignment(wx::HorizontalAlignment::Center);
+    noticeChevron.VerticalContentAlignment(wx::VerticalAlignment::Center);
+    noticeChevron.Click([&state](auto const&, auto const&) {
+        if (state.current.kind == LevelKind::NoticeStatus)
+            ToggleNoticeDetails(state);
+    });
     canvas.Children().Append(noticeChevron);
     controls::TextBlock noticeHeading;
     noticeHeading.Visibility(wx::Visibility::Collapsed);
@@ -5010,9 +5197,13 @@ void CreateContent(State& state) {
     controls::Viewbox viewbox;
     viewbox.Stretch(media::Stretch::Fill);
     viewbox.Child(canvas);
-    card.Child(viewbox);
+    // XAML Grid shares the card geometry; brushes are behind the Viewbox.
+    controls::Grid backgroundStack;
+    backgroundStack.Children().Append(viewbox);
+    card.Child(backgroundStack);
     state.source.Content(card);
     state.card = card;
+    state.backgroundStack = backgroundStack;
     state.canvas = canvas;
     state.viewbox = viewbox;
     state.icon = icon;
@@ -5112,6 +5303,11 @@ void CreateSurface(State& state, HINSTANCE instance) {
 
 void CloseSurface(State& state) {
     HideSurface(state);
+    // Detach Composition callbacks from all user-defined layers before
+    // tearing down the XAML Island and its owning STA.
+    try { ClearBackgroundLayers(state); }
+    catch (...) { Wh_Log(L"Fluent OSD/XAML: layer detach failed"); }
+    state.cachedBackgroundLayers.clear();
     // Detach module-owned Composition callbacks before Island destruction.
     if (state.card) {
         try { state.card.Background(nullptr); }
@@ -5151,6 +5347,7 @@ void CloseSurface(State& state) {
     state.icon = nullptr;
     state.canvas = nullptr;
     state.viewbox = nullptr;
+    state.backgroundStack = nullptr;
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
@@ -5173,11 +5370,14 @@ void DeliverPending(State& root) {
     if (batch.empty()) return;
     const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
     const bool attached = batch.size() >= 2 &&
-        batch[0].kind == LevelKind::Volume &&
-        (batch[1].kind == LevelKind::Media ||
-         batch[1].kind == LevelKind::Mixer);
+        ((batch[0].kind == LevelKind::Volume &&
+          (batch[1].kind == LevelKind::Media ||
+           batch[1].kind == LevelKind::Mixer)) ||
+         (batch[0].kind == LevelKind::NoticeStatus &&
+          batch[1].kind == LevelKind::NoticeDetails));
     const std::wstring panelKey = !attached ? L"" :
-        batch[1].kind == LevelKind::Media ? L"media" : L"mixer";
+        batch[1].kind == LevelKind::Media ? L"media" :
+        batch[1].kind == LevelKind::NoticeDetails ? L"notice-details" : L"mixer";
     const size_t extraStart = attached ? 2 : (ddc ? 0 : 1);
     std::unordered_set<std::wstring> active;
     if (attached) active.insert(panelKey);
@@ -5377,6 +5577,9 @@ constexpr WCHAR kWindowClass[] = L"WH.NativeOSD.DDC.01E7AFB2";
 constexpr ULONG_PTR kCopyDataTag = 0x1E7AFB2;
 constexpr UINT_PTR kEventBatchTimer = 322;
 constexpr UINT_PTR kDdcBatchTimer = 324;
+constexpr UINT_PTR kNetworkRefreshTimer = 325;
+constexpr UINT kNetworkDebounceMs = 320;
+constexpr UINT kNetworkSettleMs = 640;
 // Shell startup is signaled by the InputSite creation hook, not polled.
 constexpr UINT kDdcBatchDelayMs = 90;
 constexpr UINT_PTR kMediaAnimationTimer = 323;
@@ -5394,6 +5597,7 @@ constexpr UINT kAudioRefreshMessage = WM_APP + 323;
 constexpr UINT kNetworkNoticeMessage = WM_APP + 324;
 constexpr UINT kNativeExtraMessage = WM_APP + 325;
 constexpr UINT kShellInputSiteReadyMessage = WM_APP + 329;
+constexpr UINT kNetworkConfigMessage = WM_APP + 330;
 constexpr DWORD kEventMagic = 0x54434444; // 'DDCT', private wire format
 
 enum class Kind : int {
@@ -5406,8 +5610,10 @@ enum class DurationKind : int {
     Clipboard, Devices, Network, Interactive, Count
 };
 enum class NoticeCategory { Usb, Bluetooth, Network };
-enum class NoticeIcon { Clipboard, Usb, Bluetooth, Network };
-enum class NoticeAction { Connected, Disconnected, Removed, NetworkChanged };
+enum class NoticeIcon { Clipboard, ClipboardFile, ClipboardText, Usb, Bluetooth, Network, Wifi,
+                        Keyboard, Mouse, Headset, Speaker };
+enum class NoticeAction { Connected, Disconnected, Removed, NetworkChanged,
+                          WifiEnabled, WifiDisabled };
 enum class PopupKind { DdcBrightness, NativeBrightness, NativeVolume, NativeEvent, LockStatus, Notification };
 enum class FlyoutDirection { Left, Right, Up, Down };
 
@@ -5736,9 +5942,9 @@ std::atomic<int> g_trackMode{0};
 std::atomic<DWORD> g_customTrack{0};
 std::atomic<bool> g_validCustomTrack{false};
 std::atomic<int> g_backgroundOpacity{96};
-std::atomic<bool> g_useCustomBackgroundBrush{false};
-std::mutex g_backgroundMarkupMutex;
-std::wstring g_backgroundMarkup;
+std::atomic<bool> g_useLayeredBackground{false};
+std::mutex g_backgroundLayersMutex;
+std::vector<osd_model::BrushLayer> g_backgroundLayers;
 std::atomic<int> g_cornerRadius{17};
 std::atomic<int> g_fontSize{15};
 std::atomic<int> g_iconSize{16};
@@ -5766,7 +5972,16 @@ bool g_clipboardListener = false;
 HDEVNOTIFY g_usbNotification = nullptr;
 HMODULE g_networkDll = nullptr;
 HANDLE g_networkNotification = nullptr;
+HANDLE g_networkIpNotification = nullptr;
+HANDLE g_networkAddressNotification = nullptr;
 std::atomic<int> g_networkPreviousLevel{-1};
+// The following coalescing state is owned only by the OSD receiver thread.
+bool g_networkRefreshPending = false;
+bool g_networkRefreshSecondPass = false;
+bool g_networkSawInterfaceTransition = false;
+bool g_networkHintPending = false;
+int g_networkHintLevel = -1;
+bool g_networkUiSettingEnabled = false;
 std::atomic<HWND> g_networkReceiver{nullptr};
 std::atomic<bool> g_closing{false};
 // Only the OSD controller thread writes this one-shot startup state.
@@ -5774,17 +5989,29 @@ bool g_shellXamlStarted = false;
 std::wstring g_noticeTitle;
 std::wstring g_noticeBody;
 NoticeIcon g_noticeIcon = NoticeIcon::Clipboard; // UI thread only.
+bool g_noticePanelOpen = false;
+uint32_t g_noticeGeneration = 1;
+DurationKind g_noticeDuration = DurationKind::Devices;
 struct NoticeBatch {
     NoticeCategory category = NoticeCategory::Usb;
     NoticeAction action = NoticeAction::Connected;
     std::vector<std::wstring> names;
     std::unordered_set<std::wstring> identities;
+    NoticeIcon icon = NoticeIcon::Bluetooth;
+    bool iconKnown = false, mixedIcons = false;
     bool pending = false;
 };
 NoticeBatch g_noticeBatch;
 std::vector<std::wstring> g_noticeDetails;
 std::unordered_map<std::wstring, std::wstring> g_usbNames;
-struct NetInterfaceState { std::wstring name; bool connected = false; };
+struct NetInterfaceState {
+    std::wstring name;
+    bool connected = false;
+    NoticeIcon icon = NoticeIcon::Network; // Captured with interface identity.
+    std::wstring wlanProfile; // Last/current Native Wi-Fi profile, not IP adapter name.
+    bool wlanRadioKnown = false; // Independent of association/connected.
+    bool wlanRadioOn = false;
+};
 std::unordered_map<std::string, NetInterfaceState> g_networkInterfaces;
 
 // Owned thumbnail, created only when the user enables clipboard previews.
@@ -6009,6 +6236,8 @@ PCWSTR NoticeActionLabel(NoticeAction action) {
         case NoticeAction::Disconnected: return Tr(OsdText::Disconnected);
         case NoticeAction::Removed: return Tr(OsdText::Removed);
         case NoticeAction::NetworkChanged: return Tr(OsdText::NetworkChanged);
+        case NoticeAction::WifiEnabled: return Tr(OsdText::Enabled);
+        case NoticeAction::WifiDisabled: return Tr(OsdText::Disabled);
     }
     return L"";
 }
@@ -6165,7 +6394,8 @@ void ResetXamlMixerController();
 void ResetXamlMediaController();
 bool BuildMixerPanelAnchors(RECT& main, RECT& panel, float scale);
 bool ShowXamlMediaPanel(bool passiveRefresh = false);
-std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot();
+std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot(
+    bool* succeeded = nullptr);
 namespace bt_monitor {
     void Start();
     void Stop();
@@ -6252,17 +6482,35 @@ void LoadSettings() {
     g_backgroundOpacity.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBackgroundOpacity"), 0, 100));
     {
         PCWSTR effect = Wh_GetStringSetting(L"CustomOSD.Appearance.ddcBackgroundEffect");
-        const bool custom = effect && _wcsicmp(effect, L"custom") == 0;
+        const bool layered = effect && _wcsicmp(effect, L"layers") == 0;
         Wh_FreeStringSetting(effect);
-        PCWSTR configured = Wh_GetStringSetting(L"CustomOSD.Appearance.ddcCustomBrush");
-        std::wstring markup = configured ? configured : L"";
-        Wh_FreeStringSetting(configured);
-        // Settings callbacks and OSD snapshots may run on separate threads.
-        // Publish the markup under the lock before publishing the mode flag.
+        std::vector<osd_model::BrushLayer> layers;
+        if (layered) {
+            // Windhawk array ordering is controlled by Add item / reorder.
+            // Limit the loaded layers to five to bound Explorer GPU resources.
+            for (int i = 0; i < 5; ++i) {
+                PCWSTR value = Wh_GetStringSetting(
+                    L"CustomOSD.Appearance.ddcBrushLayers[%d].markup", i);
+                std::wstring def = value ? value : L"";
+                Wh_FreeStringSetting(value);
+                if (def.empty()) continue;
+                osd_model::BrushLayer layer;
+                layer.markup = std::move(def);
+                layer.enabled = Wh_GetIntSetting(
+                    L"CustomOSD.Appearance.ddcBrushLayers[%d].enabled", i) != 0;
+                layer.opacity = std::clamp(Wh_GetIntSetting(
+                    L"CustomOSD.Appearance.ddcBrushLayers[%d].opacity", i), 0, 100);
+                layers.push_back(std::move(layer));
+            }
+        }
+        if (layered)
+            Wh_Log(L"Fluent OSD/XAML: layered settings loaded=%u",
+                   static_cast<unsigned>(layers.size()));
+        // Publish the entire array as one snapshot for the OSD controller.
         {
-            std::lock_guard<std::mutex> lock(g_backgroundMarkupMutex);
-            g_backgroundMarkup = std::move(markup);
-            g_useCustomBackgroundBrush.store(custom, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(g_backgroundLayersMutex);
+            g_backgroundLayers = std::move(layers);
+            g_useLayeredBackground.store(layered, std::memory_order_release);
         }
     }
     g_cornerRadius.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcCornerRadius"), 0, 34));
@@ -6926,7 +7174,8 @@ void ClearClipboardThumbnail() {
 // geometry. A separate, image-first clipboard layout intentionally uses its
 // own canvas so image previews can preserve their aspect ratio.
 void AddNoticeEvent(NoticeCategory category, NoticeAction action,
-                    std::wstring identity, std::wstring label) {
+                    std::wstring identity, std::wstring label,
+                    NoticeIcon deviceIcon = NoticeIcon::Bluetooth) {
     if (!g_receiveWnd || g_closing.load()) return;
     if (identity.empty()) identity = label;
     if (label.empty()) label = std::wstring(NoticeCategoryLabel(category)) +
@@ -6943,8 +7192,18 @@ void AddNoticeEvent(NoticeCategory category, NoticeAction action,
     if (label.size() > 120) label.resize(120);
     if (identity.size() > 2048) identity.resize(2048);
     if (g_noticeBatch.identities.insert(identity).second &&
-        g_noticeBatch.names.size() < 64)
+        g_noticeBatch.names.size() < 64) {
+        if (category == NoticeCategory::Bluetooth ||
+            category == NoticeCategory::Network) {
+            if (!g_noticeBatch.iconKnown) {
+                g_noticeBatch.icon = deviceIcon;
+                g_noticeBatch.iconKnown = true;
+            } else if (g_noticeBatch.icon != deviceIcon) {
+                g_noticeBatch.mixedIcons = true;
+            }
+        }
         g_noticeBatch.names.push_back(std::move(label));
+    }
     // 320 ms debounce; repeated device-interface announcements coalesce.
     SetTimer(g_receiveWnd, kEventBatchTimer, 320, nullptr);
 }
@@ -6968,8 +7227,14 @@ void FlushNoticeBatch() {
         body = Tr(OsdText::ViewDetails);
     }
     const NoticeIcon icon = batch.category == NoticeCategory::Bluetooth
-        ? NoticeIcon::Bluetooth : batch.category == NoticeCategory::Network
-        ? NoticeIcon::Network : NoticeIcon::Usb;
+        ? (batch.mixedIcons ? NoticeIcon::Bluetooth : batch.icon)
+        : batch.category == NoticeCategory::Network
+        ? (batch.mixedIcons ? NoticeIcon::Network : batch.icon)
+        : NoticeIcon::Usb;
+    // Diagnostics identify origin without logging device names or WLAN profiles.
+    Wh_Log(L"Fluent OSD/notice: category=%d action=%d icon=%d items=%lu",
+           static_cast<int>(batch.category), static_cast<int>(batch.action),
+           static_cast<int>(icon), static_cast<unsigned long>(batch.names.size()));
     ShowNotice(std::move(title), std::move(body),
         batch.category == NoticeCategory::Network ? DurationKind::Network : DurationKind::Devices,
         icon);
@@ -6980,12 +7245,15 @@ void ShowNotice(std::wstring title, std::wstring body, DurationKind kind,
     if (g_closing.load() || !g_receiveWnd) return;
     if (kind != DurationKind::Clipboard) ClearClipboardThumbnail();
     g_popupKind = PopupKind::Notification;
+    g_noticePanelOpen = false;
+    ++g_noticeGeneration;
+    g_noticeDuration = kind;
     g_noticeTitle = std::move(title);
     g_noticeBody = std::move(body);
     g_noticeIcon = icon;
     BrightnessEvent event{};
     MovePopupToDisplay(event);
-    if (icon == NoticeIcon::Clipboard)
+    if (kind == DurationKind::Clipboard)
         ShowMigratedXamlClipboardNotice();
     else
         ShowMigratedXamlDeviceNotice(kind);
@@ -7000,9 +7268,16 @@ void ProcessClipboard() {
     if (!OpenClipboard(g_receiveWnd)) return;
     std::wstring title = Tr(OsdText::Clipboard), body = Tr(OsdText::ContentCopied);
     HBITMAP newThumbnail = nullptr;
-    if (IsClipboardFormatAvailable(CF_BITMAP) ||
-        IsClipboardFormatAvailable(CF_DIB) ||
-        IsClipboardFormatAvailable(CF_DIBV5)) {
+    NoticeIcon icon = NoticeIcon::Clipboard;
+    // Explorer file selections may also advertise a text or image format.
+    // Prefer the semantic CF_HDROP file selection over its representations.
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        title = Tr(OsdText::FilesCopied);
+        body = Tr(OsdText::ClipboardFiles);
+        icon = NoticeIcon::ClipboardFile;
+    } else if (IsClipboardFormatAvailable(CF_BITMAP) ||
+               IsClipboardFormatAvailable(CF_DIB) ||
+               IsClipboardFormatAvailable(CF_DIBV5)) {
         title = Tr(OsdText::ImageCopied);
         body = Tr(OsdText::ClipboardImage);
         if (g_clipboardImagePreview.load()) {
@@ -7029,6 +7304,7 @@ void ProcessClipboard() {
     } else if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
         title = Tr(OsdText::TextCopied);
         body = Tr(OsdText::ClipboardText);
+        icon = NoticeIcon::ClipboardText;
         if (g_clipboardTextPreview.load()) {
             HANDLE handle = GetClipboardData(CF_UNICODETEXT);
             SIZE_T cb = handle ? GlobalSize(handle) : 0;
@@ -7050,16 +7326,13 @@ void ProcessClipboard() {
             }
             if (body.empty()) body = Tr(OsdText::EmptyText);
         }
-    } else if (IsClipboardFormatAvailable(CF_HDROP)) {
-        title = Tr(OsdText::FilesCopied);
-        body = Tr(OsdText::ClipboardFiles);
     }
     CloseClipboard();
     ClearClipboardThumbnail();
     g_noticeDetails.clear();
     g_clipboardThumbnail = newThumbnail;
     ShowNotice(std::move(title), std::move(body), DurationKind::Clipboard,
-               NoticeIcon::Clipboard);
+               icon);
 }
 
 // ============================================================
@@ -7068,8 +7341,9 @@ void ProcessClipboard() {
 // Event-based USB interface notifications and OS connectivity hints.
 // Bluetooth uses typed Windows DeviceWatcher projections below.
 
-// The network APIs were introduced in Windows 10 2004. Win32 ABI avoids
-// depending on newer MinGW header definitions on an older Windhawk compiler.
+// Keep the modern network hint API dynamically resolved for older SDKs.
+// Hint callbacks report only aggregate connectivity, not individual NIC
+// state. IP-interface and address callbacks supply per-adapter triggers.
 struct NetworkHintAbi {
     LONG connectivityLevel;
     LONG connectivityCost;
@@ -7083,35 +7357,152 @@ using RegisterNetworkHint = DWORD (WINAPI*)(NetworkCallback, void*, BOOLEAN, HAN
 using GetNetworkHint = DWORD (WINAPI*)(NetworkHintAbi*);
 using CancelNetworkHint = DWORD (WINAPI*)(HANDLE);
 
+// Native Wi-Fi callbacks expose association changes even when the physical
+// adapter stays enabled and GetAdaptersAddresses reports the same OperStatus.
+// The old Windhawk MinGW SDK lacks newer WLAN declarations, so use a strict,
+// read-only ABI prefix with dynamic exports from System32 wlanapi.dll.
+struct WlanNotificationCompat {
+    DWORD source, code;
+    GUID interfaceGuid;
+    DWORD dataSize;
+    void* data;
+};
+using WlanNotificationCallback = void (WINAPI*)(WlanNotificationCompat*, void*);
+using WlanRegisterNotify = DWORD (WINAPI*)(
+    HANDLE, DWORD, BOOL, WlanNotificationCallback, void*, void*, DWORD*);
+using WlanClose = DWORD (WINAPI*)(HANDLE, void*);
+HMODULE g_wlanDll = nullptr;
+HANDLE g_wlanClient = nullptr;
+bool g_wlanNotifyRegistered = false; // UI thread only.
+constexpr DWORD kWlanAcmSource = 0x00000008;
+constexpr DWORD kWlanMsmSource = 0x00000010;
+constexpr DWORD kWlanRadioStateChanged = 7; // wlan_notification_msm_radio_state_change
+
+struct WlanLiveState {
+    bool connected = false;
+    std::wstring profile;
+    bool radioKnown = false;
+    bool radioOn = false;
+};
+std::unordered_map<ULONGLONG, WlanLiveState> g_liveWlan; // UI thread only.
+bool g_wlanInventoryValid = false; // Only true after a successful enumeration.
+
+void QueueNetworkRefreshEvent(WPARAM source, LPARAM hintLevel);
+void WINAPI WlanChanged(WlanNotificationCompat* notice, void*) {
+    if (!notice) return;
+    const DWORD code = notice->code;
+    // ACM reports WLAN profile and interface events. MSM radio notifications
+    // are a separate source; no SSID association is implied by a radio toggle.
+    if ((notice->source == kWlanAcmSource &&
+         (code == 9 || code == 10 || code == 13 || code == 14 ||
+          code == 20 || code == 21)) ||
+        (notice->source == kWlanMsmSource &&
+         code == kWlanRadioStateChanged))
+        QueueNetworkRefreshEvent(3, 0);
+}
+
+// Both IP Helper notification callbacks share the same ABI:
+// PVOID context, pointer to a short-lived MIB row, 32-bit notification type.
+// We do not inspect or retain the row from the callback thread.
+using NetworkMibCallback = void (WINAPI*)(void*, void*, int);
+using RegisterNetworkMib = DWORD (WINAPI*)(
+    ADDRESS_FAMILY, NetworkMibCallback, void*, BOOLEAN, HANDLE*);
+
+void QueueNetworkRefreshEvent(WPARAM source, LPARAM hintLevel) {
+    if (!g_showNetworkEvents.load() || g_closing.load()) return;
+    const HWND receiver = g_networkReceiver.load(std::memory_order_acquire);
+    if (receiver) (void)PostMessageW(
+        receiver, kNetworkNoticeMessage, source, hintLevel);
+}
+
 void WINAPI NetworkChanged(void*, NetworkHintAbi hint) {
     const int prior = g_networkPreviousLevel.exchange(hint.connectivityLevel);
-    if (!g_showNetworkEvents.load() || g_closing ||
-        prior == hint.connectivityLevel || prior < 0) return;
-    HWND receiver = g_networkReceiver.load(std::memory_order_relaxed);
-    if (receiver) PostMessageW(receiver, kNetworkNoticeMessage,
-                               static_cast<WPARAM>(hint.connectivityLevel), 0);
+    if (prior < 0 || prior == hint.connectivityLevel) return;
+    QueueNetworkRefreshEvent(1, static_cast<LPARAM>(hint.connectivityLevel));
+}
+
+void WINAPI NetworkMibChanged(void*, void*, int) {
+    // No GetAdaptersAddresses or XAML work on Windows' callback thread.
+    QueueNetworkRefreshEvent(2, 0);
 }
 
 void CaptureNetworkBaseline() {
+    bool succeeded = false;
+    auto current = GetNetworkSnapshot(&succeeded);
+    if (!succeeded) {
+        Wh_Log(L"Fluent OSD/network: adapter baseline unavailable");
+        return;
+    }
     g_networkInterfaces.clear();
-    for (auto& item : GetNetworkSnapshot())
-        g_networkInterfaces.emplace(item.first, std::move(item.second));
+    for (auto& item : current)
+        g_networkInterfaces.emplace(std::move(item.first),
+                                    std::move(item.second));
 }
-void InitNetworkEvents() {
-    g_networkDll = LoadLibraryExW(L"iphlpapi.dll", nullptr,
-                                  LOAD_LIBRARY_SEARCH_SYSTEM32);
+
+void RefreshNetworkHintBaseline() {
     if (!g_networkDll) return;
-    const auto getHint = reinterpret_cast<GetNetworkHint>(
+    const auto hint = reinterpret_cast<GetNetworkHint>(
         GetProcAddress(g_networkDll, "GetNetworkConnectivityHint"));
-    const auto subscribe = reinterpret_cast<RegisterNetworkHint>(
-        GetProcAddress(g_networkDll, "NotifyNetworkConnectivityHintChange"));
-    if (!getHint || !subscribe) return;
-    CaptureNetworkBaseline();
     NetworkHintAbi state{};
-    if (getHint(&state) == NO_ERROR)
+    if (hint && hint(&state) == NO_ERROR)
         g_networkPreviousLevel.store(state.connectivityLevel);
-    if (subscribe(NetworkChanged, nullptr, FALSE, &g_networkNotification) != NO_ERROR)
-        g_networkNotification = nullptr;
+}
+
+void InitNetworkEvents() {
+    g_networkDll = LoadLibraryExW(
+        L"iphlpapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    CaptureNetworkBaseline();
+    g_networkUiSettingEnabled = g_showNetworkEvents.load();
+    if (!g_networkDll) {
+        Wh_Log(L"Fluent OSD/network: iphlpapi unavailable (%lu)",
+               GetLastError());
+        return;
+    }
+
+    RefreshNetworkHintBaseline();
+    const auto subscribeHint = reinterpret_cast<RegisterNetworkHint>(
+        GetProcAddress(g_networkDll, "NotifyNetworkConnectivityHintChange"));
+    if (subscribeHint) {
+        const DWORD err = subscribeHint(NetworkChanged, nullptr, FALSE,
+                                       &g_networkNotification);
+        if (err != NO_ERROR) {
+            g_networkNotification = nullptr;
+            Wh_Log(L"Fluent OSD/network: hint registration failed (%lu)", err);
+        }
+    }
+
+    // Unlike aggregate hints, these events occur even when another adapter
+    // still provides Internet access. Both are needed for interface and IP
+    // transitions on Wi-Fi, Ethernet, and virtual adapters.
+    const auto subscribeInterface = reinterpret_cast<RegisterNetworkMib>(
+        GetProcAddress(g_networkDll, "NotifyIpInterfaceChange"));
+    if (subscribeInterface) {
+        const DWORD err = subscribeInterface(AF_UNSPEC, NetworkMibChanged,
+            nullptr, FALSE, &g_networkIpNotification);
+        if (err != NO_ERROR) {
+            g_networkIpNotification = nullptr;
+            Wh_Log(L"Fluent OSD/network: interface registration failed (%lu)", err);
+        }
+    } else {
+        Wh_Log(L"Fluent OSD/network: interface notification API unavailable");
+    }
+
+    const auto subscribeAddress = reinterpret_cast<RegisterNetworkMib>(
+        GetProcAddress(g_networkDll, "NotifyUnicastIpAddressChange"));
+    if (subscribeAddress) {
+        const DWORD err = subscribeAddress(AF_UNSPEC, NetworkMibChanged,
+            nullptr, FALSE, &g_networkAddressNotification);
+        if (err != NO_ERROR) {
+            g_networkAddressNotification = nullptr;
+            Wh_Log(L"Fluent OSD/network: address registration failed (%lu)", err);
+        }
+    } else {
+        Wh_Log(L"Fluent OSD/network: address notification API unavailable");
+    }
+    Wh_Log(L"Fluent OSD/network: subscriptions hint=%d interface=%d address=%d",
+           g_networkNotification != nullptr,
+           g_networkIpNotification != nullptr,
+           g_networkAddressNotification != nullptr);
 }
 
 void InitDeviceEvents() {
@@ -7129,12 +7520,39 @@ void StopDeviceEvents() {
     bt_monitor::Stop();
     if (g_usbNotification) UnregisterDeviceNotification(g_usbNotification);
     g_usbNotification = nullptr;
-    if (g_networkNotification && g_networkDll) {
+    if (g_networkDll) {
         const auto cancel = reinterpret_cast<CancelNetworkHint>(
             GetProcAddress(g_networkDll, "CancelMibChangeNotify2"));
-        if (cancel) cancel(g_networkNotification);
+        if (cancel) {
+            if (g_networkAddressNotification)
+                (void)cancel(g_networkAddressNotification);
+            if (g_networkIpNotification)
+                (void)cancel(g_networkIpNotification);
+            if (g_networkNotification)
+                (void)cancel(g_networkNotification);
+        }
     }
     g_networkNotification = nullptr;
+    g_networkIpNotification = nullptr;
+    g_networkAddressNotification = nullptr;
+    if (g_wlanClient && g_wlanDll) {
+        const auto registerNotify = reinterpret_cast<WlanRegisterNotify>(
+            GetProcAddress(g_wlanDll, "WlanRegisterNotification"));
+        // Unregister synchronously before releasing client/module. Windows
+        // waits for any in-flight notification callback to finish.
+        if (g_wlanNotifyRegistered && registerNotify)
+            (void)registerNotify(g_wlanClient, 0, FALSE, nullptr,
+                                 nullptr, nullptr, nullptr);
+        const auto closeWlan = reinterpret_cast<WlanClose>(
+            GetProcAddress(g_wlanDll, "WlanCloseHandle"));
+        if (closeWlan) (void)closeWlan(g_wlanClient, nullptr);
+    }
+    g_wlanClient = nullptr;
+    g_wlanNotifyRegistered = false;
+    if (g_wlanDll) FreeLibrary(g_wlanDll);
+    g_wlanDll = nullptr;
+    g_liveWlan.clear();
+    g_wlanInventoryValid = false;
     if (g_networkDll) FreeLibrary(g_networkDll);
     g_networkDll = nullptr;
 }
@@ -7165,30 +7583,310 @@ std::wstring UsbDeviceLabel(const std::wstring& path) {
     return label;
 }
 
+// Dynamic Native Wi-Fi enumeration works with Windhawk's older MinGW SDK:
+// it does not require a MIB_IF_ROW2 declaration or wlanapi.h. WLAN interface
+// GUIDs are mapped to the same LUIDs returned by GetAdaptersAddresses.
+// Keep known LUIDs across WLAN radio disable (WlanEnumInterfaces may then
+// omit the interface); no polling, GATT scanning or name matching is used.
+struct WlanInterfaceInfoCompat {
+    GUID guid;
+    WCHAR description[256];
+    DWORD state;
+};
+struct WlanInterfaceListCompat {
+    DWORD count, index;
+    WlanInterfaceInfoCompat interfaces[1];
+};
+static_assert(sizeof(WlanInterfaceInfoCompat) == 532);
+static_assert(offsetof(WlanInterfaceListCompat, interfaces) == 8);
+std::unordered_set<ULONGLONG> g_physicalWlanLuids; // Receiver thread only.
+
+// Only the beginning of WLAN_CONNECTION_ATTRIBUTES is needed to read the
+// current connection's exact configured profile name. It is not an SSID guess.
+struct WlanConnectionPrefix {
+    DWORD state;
+    DWORD mode;
+    WCHAR profile[256];
+};
+static_assert(sizeof(WlanConnectionPrefix) == 520);
+
+// Minimal Windows Native Wi-Fi radio-state ABI for Windhawk's older SDK.
+// A PHY is usable only if both its software and hardware switches are on.
+// Unknown query results never become a fabricated toggle notification.
+struct WlanPhyRadioCompat {
+    DWORD phyIndex;
+    DWORD softwareState;
+    DWORD hardwareState;
+};
+struct WlanRadioCompat {
+    DWORD phyCount;
+    WlanPhyRadioCompat phys[1];
+};
+static_assert(sizeof(WlanPhyRadioCompat) == 12);
+static_assert(offsetof(WlanRadioCompat, phys) == sizeof(DWORD));
+
+bool EnsureWlanClient() {
+    if (!g_wlanDll) {
+        g_wlanDll = LoadLibraryExW(
+            L"wlanapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!g_wlanDll) return false;
+    }
+    if (!g_wlanClient) {
+        using Open = DWORD (WINAPI*)(DWORD, PVOID, PDWORD, PHANDLE);
+        const auto open = reinterpret_cast<Open>(
+            GetProcAddress(g_wlanDll, "WlanOpenHandle"));
+        DWORD negotiated = 0;
+        if (!open || open(2, nullptr, &negotiated, &g_wlanClient) !=
+                ERROR_SUCCESS || !g_wlanClient)
+            return false; // WLAN AutoConfig unavailable; retry next refresh.
+    }
+    if (!g_wlanNotifyRegistered) {
+        const auto subscribe = reinterpret_cast<WlanRegisterNotify>(
+            GetProcAddress(g_wlanDll, "WlanRegisterNotification"));
+        if (subscribe && subscribe(g_wlanClient,
+                kWlanAcmSource | kWlanMsmSource, FALSE,
+                WlanChanged, nullptr, nullptr, nullptr) == ERROR_SUCCESS)
+            g_wlanNotifyRegistered = true;
+    }
+    return true;
+}
+
+void RefreshPhysicalWlanLuids() {
+    g_wlanInventoryValid = false;
+    if (!g_networkDll || !EnsureWlanClient()) return;
+    using Enumerate = DWORD (WINAPI*)(
+        HANDLE, PVOID, WlanInterfaceListCompat**);
+    using Query = DWORD (WINAPI*)(
+        HANDLE, const GUID*, DWORD, void*, DWORD*, void**, DWORD*);
+    using Free = void (WINAPI*)(void*);
+    using GuidToLuid = DWORD (WINAPI*)(const GUID*, void*);
+    const auto convert = reinterpret_cast<GuidToLuid>(
+        GetProcAddress(g_networkDll, "ConvertInterfaceGuidToLuid"));
+    const auto enumerate = reinterpret_cast<Enumerate>(
+        GetProcAddress(g_wlanDll, "WlanEnumInterfaces"));
+    const auto query = reinterpret_cast<Query>(
+        GetProcAddress(g_wlanDll, "WlanQueryInterface"));
+    const auto freeMemory = reinterpret_cast<Free>(
+        GetProcAddress(g_wlanDll, "WlanFreeMemory"));
+    if (!convert || !enumerate || !freeMemory) return;
+    WlanInterfaceListCompat* list = nullptr;
+    if (enumerate(g_wlanClient, nullptr, &list) != ERROR_SUCCESS ||
+        !list) {
+        if (list) freeMemory(list);
+        return;
+    }
+    g_wlanInventoryValid = true;
+    std::unordered_map<ULONGLONG, WlanLiveState> live;
+    for (DWORD i = 0; i < std::min<DWORD>(list->count, 64); ++i) {
+        ULONGLONG luid = 0;
+        if (convert(&list->interfaces[i].guid, &luid) != NO_ERROR ||
+            !luid) continue;
+        if (g_physicalWlanLuids.size() < 64)
+            g_physicalWlanLuids.insert(luid);
+        WlanLiveState entry;
+        // The Native Wi-Fi interface state reflects 802.11 association,
+        // independently of NDIS OperStatus and IPv4/IPv6 addressing.
+        entry.connected = list->interfaces[i].state == 1;
+        if (query) {
+            DWORD dataSize = 0, opcodeType = 0;
+            void* data = nullptr;
+            // wlan_intf_opcode_radio_state == 4; not a profile query.
+            if (query(g_wlanClient, &list->interfaces[i].guid, 4, nullptr,
+                    &dataSize, &data, &opcodeType) == ERROR_SUCCESS &&
+                data && dataSize >= offsetof(WlanRadioCompat, phys)) {
+                const auto* radio = reinterpret_cast<const WlanRadioCompat*>(data);
+                const DWORD count = radio->phyCount;
+                if (count && count <= 64 &&
+                    dataSize >= offsetof(WlanRadioCompat, phys) +
+                                count * sizeof(WlanPhyRadioCompat)) {
+                    bool anyOn = false, allOff = true;
+                    for (DWORD phy = 0; phy < count; ++phy) {
+                        const auto& state = radio->phys[phy];
+                        if (state.softwareState == 1 && state.hardwareState == 1)
+                            anyOn = true;
+                        if (state.softwareState != 2 && state.hardwareState != 2)
+                            allOff = false;
+                    }
+                    if (anyOn || allOff) {
+                        entry.radioKnown = true;
+                        entry.radioOn = anyOn;
+                    }
+                }
+            }
+            if (data) freeMemory(data);
+        }
+        // A genuinely associated WLAN must have at least one powered PHY;
+        // use this as a conservative fallback if radio-state query fails.
+        if (entry.connected && !entry.radioKnown) {
+            entry.radioKnown = true;
+            entry.radioOn = true;
+        }
+        if (entry.connected && query) {
+            DWORD dataSize = 0, opcodeType = 0;
+            void* data = nullptr;
+            // wlan_intf_opcode_current_connection == 7.
+            if (query(g_wlanClient, &list->interfaces[i].guid, 7, nullptr,
+                    &dataSize, &data, &opcodeType) == ERROR_SUCCESS &&
+                data && dataSize >= sizeof(WlanConnectionPrefix)) {
+                const auto* info =
+                    reinterpret_cast<const WlanConnectionPrefix*>(data);
+                if (info->state == 1) {
+                    size_t count = 0;
+                    while (count < 256 && info->profile[count]) ++count;
+                    entry.profile.assign(info->profile, count);
+                    if (entry.profile.size() > 120)
+                        entry.profile.resize(120);
+                }
+            }
+            if (data) freeMemory(data);
+        }
+        live.emplace(luid, std::move(entry));
+    }
+    freeMemory(list);
+    g_liveWlan = std::move(live);
+}
+
+// Bluetooth PAN is an IP/Ethernet-like adapter (often IfType 6), not an
+// 802.11 profile. Match its PnP service BthPan to the exact NetCfgInstanceId;
+// neither the friendly name nor the interface type can identify it reliably.
+// Enumerate installed network devices on the controller thread only.
+std::vector<GUID> GetBluetoothPanAdapterGuids() {
+    // GUID_DEVCLASS_NET; literal avoids adding a newer SDK header dependency.
+    const GUID networkClass = {0x4d36e972, 0xe325, 0x11ce,
+                               {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+    std::vector<GUID> panGuids;
+    HDEVINFO devices = SetupDiGetClassDevsW(&networkClass, nullptr, nullptr, 0);
+    if (devices == INVALID_HANDLE_VALUE) return panGuids;
+    for (DWORD i = 0; i < 256; ++i) {
+        SP_DEVINFO_DATA info{};
+        info.cbSize = sizeof(info);
+        if (!SetupDiEnumDeviceInfo(devices, i, &info)) break;
+        WCHAR service[96]{};
+        DWORD type = 0, required = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(
+                devices, &info, SPDRP_SERVICE, &type,
+                reinterpret_cast<PBYTE>(service), sizeof(service), &required) ||
+            type != REG_SZ || _wcsicmp(service, L"BthPan") != 0)
+            continue;
+        HKEY key = SetupDiOpenDevRegKey(
+            devices, &info, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_QUERY_VALUE);
+        if (key == INVALID_HANDLE_VALUE) continue;
+        WCHAR instanceId[64]{};
+        DWORD bytes = sizeof(instanceId);
+        const LONG result = RegGetValueW(
+            key, nullptr, L"NetCfgInstanceId", RRF_RT_REG_SZ, nullptr,
+            instanceId, &bytes);
+        RegCloseKey(key);
+        if (result != ERROR_SUCCESS || !instanceId[0]) continue;
+        // CLSIDFromString requires a brace-enclosed GUID, not a ProgID.
+        std::wstring guidText(instanceId);
+        if (guidText.size() == 36)
+            guidText = L"{" + guidText + L"}";
+        GUID guid{};
+        if (guidText.size() == 38 && guidText.front() == L'{' &&
+            guidText.back() == L'}' &&
+            SUCCEEDED(CLSIDFromString(guidText.c_str(), &guid)))
+            panGuids.push_back(guid);
+    }
+    SetupDiDestroyDeviceInfoList(devices);
+    return panGuids;
+}
+
 // Capture interface transitions on network-hint events. A connectivity hint
 // alone does not expose an SSID or a VPN connection's authenticated status.
-std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot() {
+std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot(
+        bool* succeeded) {
+    if (succeeded) *succeeded = false;
     std::vector<std::pair<std::string, NetInterfaceState>> out;
     ULONG size = 16 * 1024;
     std::vector<BYTE> buffer(size);
-    ULONG err = GetAdaptersAddresses(AF_UNSPEC,
-        GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-        GAA_FLAG_SKIP_DNS_SERVER, nullptr,
+    // Include adapters with no assigned IPv4/IPv6 address (often disabled).
+    constexpr ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+        GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_ALL_INTERFACES;
+    ULONG err = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr,
         reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data()), &size);
     if (err == ERROR_BUFFER_OVERFLOW && size <= 256 * 1024) {
         buffer.resize(size);
-        err = GetAdaptersAddresses(AF_UNSPEC,
-            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-            GAA_FLAG_SKIP_DNS_SERVER, nullptr,
+        err = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr,
             reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data()), &size);
     }
-    if (err != NO_ERROR) return out;
+    // No adapters is a valid disconnected state, not an API failure.
+    if (err == ERROR_NO_DATA) {
+        if (succeeded) *succeeded = true;
+        return out;
+    }
+    if (err != NO_ERROR) {
+        Wh_Log(L"Fluent OSD/network: GetAdaptersAddresses failed (%lu)", err);
+        return out;
+    }
+    if (succeeded) *succeeded = true;
+    RefreshPhysicalWlanLuids();
+    const auto bluetoothPanGuids = GetBluetoothPanAdapterGuids();
     const auto* adapter = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
     for (int count = 0; adapter && count < 128;
          adapter = adapter->Next, ++count) {
-        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+            adapter->IfType == 248 /* IF_TYPE_BLUETOOTH */)
+            continue;
+        // Bluetooth PAN may instead report as Ethernet (IfType 6).
+        // Match PnP NetCfgInstanceId, not a localized adapter/phone name.
+        if (adapter->AdapterName && !bluetoothPanGuids.empty()) {
+            const size_t len = strlen(adapter->AdapterName);
+            if (len > 0 && len < 64) {
+                std::wstring adapterGuid(
+                    adapter->AdapterName, adapter->AdapterName + len);
+                if (adapterGuid.size() == 36)
+                    adapterGuid = L"{" + adapterGuid + L"}";
+                GUID guid{};
+                if (adapterGuid.size() == 38 &&
+                    adapterGuid.front() == L'{' &&
+                    adapterGuid.back() == L'}' &&
+                    SUCCEEDED(CLSIDFromString(adapterGuid.c_str(), &guid))) {
+                    bool isBluetoothPan = false;
+                    for (const auto& pan : bluetoothPanGuids) {
+                        if (IsEqualGUID(pan, guid)) {
+                            isBluetoothPan = true;
+                            break;
+                        }
+                    }
+                    if (isBluetoothPan) continue;
+                }
+            }
+        }
+        // Native WLAN inventory omits virtual SoftAP interfaces. When we
+        // have identified a physical WLAN LUID, suppress other 802.11 child
+        // interfaces; leave Ethernet, VPN and TUN adapters untouched.
+        bool physicalWifi = false;
+        if (adapter->IfType == IF_TYPE_IEEE80211 &&
+            !g_physicalWlanLuids.empty()) {
+            ULONGLONG luid = 0;
+            static_assert(sizeof(luid) == sizeof(adapter->Luid));
+            memcpy(&luid, &adapter->Luid, sizeof(luid));
+            physicalWifi = g_physicalWlanLuids.count(luid) != 0;
+            if (!physicalWifi) continue;
+        }
         NetInterfaceState state;
+        state.icon = physicalWifi ? NoticeIcon::Wifi : NoticeIcon::Network;
         state.connected = adapter->OperStatus == IfOperStatusUp;
+        if (physicalWifi) {
+            ULONGLONG luid = 0;
+            memcpy(&luid, &adapter->Luid, sizeof(luid));
+            const auto wlan = g_liveWlan.find(luid);
+            if (wlan != g_liveWlan.end()) {
+                state.connected = wlan->second.connected;
+                state.wlanProfile = wlan->second.profile;
+                state.wlanRadioKnown = wlan->second.radioKnown;
+                state.wlanRadioOn = wlan->second.radioOn;
+            } else if (g_wlanInventoryValid) {
+                // The physical adapter remains in IP Helper's inventory but
+                // disappeared from a *successful* Native WLAN enumeration.
+                // That means its WLAN interface is disabled/unavailable,
+                // not merely disconnected from an SSID profile.
+                state.connected = false;
+                state.wlanRadioKnown = true;
+                state.wlanRadioOn = false;
+            }
+        }
         state.name = adapter->FriendlyName ? adapter->FriendlyName : Tr(OsdText::NetworkInterface);
         if (state.name.size() > 80) state.name.resize(80);
         out.emplace_back(adapter->AdapterName ? adapter->AdapterName : "",
@@ -7198,22 +7896,138 @@ std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot() {
 }
 
 bool CaptureNetworkEvents() {
-    auto current = GetNetworkSnapshot();
-    if (current.empty()) return false;
+    bool succeeded = false;
+    auto current = GetNetworkSnapshot(&succeeded);
+    if (!succeeded) return false;
     bool changed = false;
-    for (const auto& item : current) {
-        auto previous = g_networkInterfaces.find(item.first);
-        if (previous != g_networkInterfaces.end() &&
-            previous->second.connected != item.second.connected) {
-            AddNoticeEvent(NoticeCategory::Network, item.second.connected ?
-                NoticeAction::Connected : NoticeAction::Disconnected,
-                std::wstring(item.first.begin(), item.first.end()), item.second.name);
+    std::unordered_map<std::string, NetInterfaceState> next;
+    next.reserve(current.size() + g_networkInterfaces.size());
+
+    for (auto& item : current) {
+        if (item.first.empty()) continue;
+        const auto previous = g_networkInterfaces.find(item.first);
+        // A new active adapter is also a connection event. Initial adapters
+        // were captured at registration and are not announced at startup.
+        const bool wasConnected = previous != g_networkInterfaces.end()
+            && previous->second.connected;
+        // On a WLAN disconnect, WlanQueryInterface no longer returns the
+        // previous profile. Use our snapshot from when it was connected.
+        const bool wifi = item.second.icon == NoticeIcon::Wifi;
+        const std::wstring currentLabel = wifi &&
+            !item.second.wlanProfile.empty()
+            ? item.second.wlanProfile : item.second.name;
+        const std::wstring previousLabel = wifi &&
+            previous != g_networkInterfaces.end() &&
+            !previous->second.wlanProfile.empty()
+            ? previous->second.wlanProfile : item.second.name;
+        const bool radioChanged = wifi &&
+            previous != g_networkInterfaces.end() &&
+            previous->second.wlanRadioKnown &&
+            item.second.wlanRadioKnown &&
+            previous->second.wlanRadioOn != item.second.wlanRadioOn;
+        if (radioChanged) {
+            // Radio power != association to a Wi-Fi profile. Report only a
+            // *known* PHY radio transition, not an IP link-status inference.
+            AddNoticeEvent(NoticeCategory::Network,
+                item.second.wlanRadioOn ? NoticeAction::WifiEnabled :
+                                          NoticeAction::WifiDisabled,
+                std::wstring(item.first.begin(), item.first.end()) + L":radio",
+                L"Wi-Fi", NoticeIcon::Wifi);
             changed = true;
         }
+        const bool switchedProfile = wifi && wasConnected &&
+            item.second.connected &&
+            previous != g_networkInterfaces.end() &&
+            !previous->second.wlanProfile.empty() &&
+            !item.second.wlanProfile.empty() &&
+            previous->second.wlanProfile != item.second.wlanProfile;
+        if (switchedProfile && !radioChanged) {
+            // A -> B with no lasting down state is a single final connected
+            // transition. Publishing A-disconnected and B-connected on the
+            // same OSD caused an unnecessary flash of the intermediate state.
+            AddNoticeEvent(NoticeCategory::Network, NoticeAction::Connected,
+                std::wstring(item.first.begin(), item.first.end()),
+                currentLabel, NoticeIcon::Wifi);
+            changed = true;
+        } else if (item.second.connected != wasConnected &&
+                   !(radioChanged && !item.second.wlanRadioOn)) {
+            // Turning Wi-Fi radio off already has an explicit power event;
+            // do not mislabel that same transition as a profile disconnect.
+            AddNoticeEvent(NoticeCategory::Network, item.second.connected ?
+                NoticeAction::Connected : NoticeAction::Disconnected,
+                std::wstring(item.first.begin(), item.first.end()),
+                item.second.connected ? currentLabel : previousLabel,
+                item.second.icon);
+            changed = true;
+        }
+        // Retain the last connected WLAN profile while disconnected, so an
+        // eventual adapter removal can still identify the old connection.
+        if (wifi && !item.second.connected &&
+            item.second.wlanProfile.empty() &&
+            previous != g_networkInterfaces.end())
+            item.second.wlanProfile = previous->second.wlanProfile;
+        // A temporary radio-query failure is not evidence that the radio
+        // changed state; preserve the last known radio state.
+        if (wifi && !item.second.wlanRadioKnown &&
+            previous != g_networkInterfaces.end() &&
+            previous->second.wlanRadioKnown) {
+            item.second.wlanRadioKnown = true;
+            item.second.wlanRadioOn = previous->second.wlanRadioOn;
+        }
+        next.emplace(std::move(item.first), std::move(item.second));
     }
-    g_networkInterfaces.clear();
-    for (auto& item : current) g_networkInterfaces.emplace(item.first, std::move(item.second));
+
+    // Disabled adapters can disappear from the returned list altogether.
+    // Preserve their last identity as "down" so re-enabling is reported.
+    for (const auto& prior : g_networkInterfaces) {
+        if (next.find(prior.first) != next.end()) continue;
+        if (prior.second.icon == NoticeIcon::Wifi &&
+            prior.second.wlanRadioKnown && prior.second.wlanRadioOn) {
+            // A previously known physical WLAN interface disappeared. This
+            // covers Device Manager disables that remove the IP interface.
+            AddNoticeEvent(NoticeCategory::Network, NoticeAction::WifiDisabled,
+                std::wstring(prior.first.begin(), prior.first.end()) + L":radio",
+                L"Wi-Fi", NoticeIcon::Wifi);
+            changed = true;
+        } else if (prior.second.connected &&
+                   prior.second.icon != NoticeIcon::Wifi) {
+            AddNoticeEvent(NoticeCategory::Network, NoticeAction::Disconnected,
+                std::wstring(prior.first.begin(), prior.first.end()),
+                prior.second.name, prior.second.icon);
+            changed = true;
+        }
+        if (next.size() < 256) {
+            NetInterfaceState down = prior.second;
+            down.connected = false;
+            if (down.icon == NoticeIcon::Wifi) {
+                down.wlanRadioKnown = true;
+                down.wlanRadioOn = false;
+            }
+            next.emplace(prior.first, std::move(down));
+        }
+    }
+    g_networkInterfaces = std::move(next);
     return changed;
+}
+
+void ResetNetworkRefreshState() {
+    g_networkRefreshPending = false;
+    g_networkRefreshSecondPass = false;
+    g_networkSawInterfaceTransition = false;
+    g_networkHintPending = false;
+    g_networkHintLevel = -1;
+}
+
+void FinishNetworkRefresh() {
+    if (g_networkHintPending && !g_networkSawInterfaceTransition) {
+        // A genuine aggregate change without any observed NIC transition.
+        // A level hint is not proof that any specific interface changed.
+        AddNoticeEvent(NoticeCategory::Network, g_networkHintLevel == 1 ?
+            NoticeAction::Disconnected : NoticeAction::NetworkChanged,
+            L"aggregate-connectivity", Tr(OsdText::WindowsNetwork),
+            NoticeIcon::Network);
+    }
+    ResetNetworkRefreshState();
 }
 
 bool HandleDeviceChange(WPARAM type, LPARAM value) {
@@ -7269,10 +8083,12 @@ struct Event {
     Change change = Change::Added;
     std::wstring id, name;
     bool connectionPresent = false, connected = false;
+    NoticeIcon icon = NoticeIcon::Bluetooth;
 };
 struct DeviceState {
     std::wstring name;
     bool connectionKnown = false, connected = false;
+    NoticeIcon icon = NoticeIcon::Bluetooth;
 };
 struct CallbackGate {
     std::atomic<bool> enabled{true};
@@ -7296,6 +8112,51 @@ std::atomic<bool> accepting{false};
 
 std::wstring Limited(winrt::hstring const& input, size_t maxChars) {
     return {input.c_str(), std::min<size_t>(input.size(), maxChars)};
+}
+
+bool TryCode(fc::IMapView<winrt::hstring,
+    winrt::Windows::Foundation::IInspectable> const& properties,
+    wchar_t const* key, uint16_t& code) {
+    if (!properties || !properties.HasKey(key)) return false;
+    try {
+        const auto value = properties.Lookup(key);
+        if (!value) return false;
+        code = winrt::unbox_value<uint16_t>(value);
+        return true;
+    } catch (...) { return false; } // Optional class data is not fatal.
+}
+// CoD and LE Appearance are system metadata, not device-name heuristics.
+NoticeIcon Classify(fc::IMapView<winrt::hstring,
+    winrt::Windows::Foundation::IInspectable> const& properties,
+    int transport) {
+    uint16_t major = 0, minor = 0;
+    if (transport == 0 &&
+        TryCode(properties, L"System.Devices.Aep.Bluetooth.Cod.Major", major) &&
+        TryCode(properties, L"System.Devices.Aep.Bluetooth.Cod.Minor", minor)) {
+        if (major == 5) { // SIG peripheral: minor keyboard/mouse bits.
+            if (minor >= 64) minor >>= 2;
+            switch (minor & 0x30) {
+                case 0x10: return NoticeIcon::Keyboard;
+                case 0x20: return NoticeIcon::Mouse;
+                default: break; // Composite keyboard+mouse is ambiguous.
+            }
+        } else if (major == 4) { // SIG audio/video minor classes.
+            if (minor == 1 || minor == 2 || minor == 6)
+                return NoticeIcon::Headset;
+            if (minor == 5 || minor == 7 || minor == 10)
+                return NoticeIcon::Speaker;
+        }
+    } else if (transport == 1 &&
+        TryCode(properties,
+            L"System.Devices.Aep.Bluetooth.Le.Appearance.Category", major) &&
+        TryCode(properties,
+            L"System.Devices.Aep.Bluetooth.Le.Appearance.Subcategory", minor)) {
+        if (major == 15) { // SIG LE human-interface appearance.
+            if (minor == 1) return NoticeIcon::Keyboard;
+            if (minor == 2) return NoticeIcon::Mouse;
+        }
+    }
+    return NoticeIcon::Bluetooth;
 }
 
 bool TryConnected(fc::IMapView<winrt::hstring, winrt::Windows::Foundation::IInspectable>
@@ -7379,7 +8240,11 @@ void StartOne(int transport, winrt::hstring const& selector) {
     item->gate = std::make_shared<CallbackGate>();
     auto weak = std::weak_ptr<CallbackGate>(item->gate);
     auto properties = winrt::single_threaded_vector<winrt::hstring>(
-        std::vector<winrt::hstring>{kConnectedProperty});
+        std::vector<winrt::hstring>{kConnectedProperty,
+            L"System.Devices.Aep.Bluetooth.Cod.Major",
+            L"System.Devices.Aep.Bluetooth.Cod.Minor",
+            L"System.Devices.Aep.Bluetooth.Le.Appearance.Category",
+            L"System.Devices.Aep.Bluetooth.Le.Appearance.Subcategory"});
     item->value = de::DeviceInformation::CreateWatcher(
         selector, properties, de::DeviceInformationKind::AssociationEndpoint);
 
@@ -7392,6 +8257,7 @@ void StartOne(int transport, winrt::hstring const& selector) {
             event.id = Limited(info.Id(), 512);
             if (event.id.empty()) return;
             event.name = Limited(info.Name(), 80);
+            event.icon = Classify(info.Properties(), transport);
             event.connectionPresent = TryConnected(info.Properties(), event.connected);
             Post(std::move(event));
         });
@@ -7407,7 +8273,10 @@ void StartOne(int transport, winrt::hstring const& selector) {
             // Updated is a partial property bag: missing IsConnected must
             // never be interpreted as a disconnection.
             event.connectionPresent = TryConnected(info.Properties(), event.connected);
-            if (event.connectionPresent) Post(std::move(event));
+            if (event.connectionPresent) {
+                event.icon = Classify(info.Properties(), transport);
+                Post(std::move(event));
+            }
         });
     });
     item->removed = item->value.Removed([weak, transport](
@@ -7476,16 +8345,9 @@ void Drain() {
         const std::wstring id = (transport ? L"ble:" : L"classic:") + event.id;
         auto previous = known.find(id);
         if (event.change == Change::Removed) {
-            if (previous != known.end()) {
-                if (enumerationComplete[transport] &&
-                    previous->second.connectionKnown && previous->second.connected &&
-                    g_showBluetoothEvents.load())
-                    AddNoticeEvent(NoticeCategory::Bluetooth,
-                        NoticeAction::Disconnected, id,
-                        previous->second.name.empty() ? Tr(OsdText::BluetoothDevice)
-                                                      : previous->second.name);
-                known.erase(previous);
-            }
+            // DeviceWatcher collection removal is not proof of a transport
+            // disconnect. Discard the baseline and do not notify.
+            if (previous != known.end()) known.erase(previous);
             continue;
         }
         if (previous == known.end()) {
@@ -7494,22 +8356,27 @@ void Drain() {
         }
         auto& current = previous->second;
         if (!event.name.empty()) current.name = std::move(event.name);
+        // Partial updates without classification cannot erase a known icon.
+        if (event.icon != NoticeIcon::Bluetooth) current.icon = event.icon;
         if (!event.connectionPresent) continue;
-        const bool changed = !current.connectionKnown ||
-                             current.connected != event.connected;
-        // A first Updated state may be a late initial snapshot. Report only
-        // known-state changes, or a newly Added connected device after scan.
-        // A first false observation is never a disconnection transition.
-        const bool shouldNotify = enumerationComplete[transport] && changed &&
-                                  (current.connectionKnown ||
-                                   (event.change == Change::Added && event.connected));
+        // Added means an AEP entered the enumeration, not that it just
+        // connected. The first explicit IsConnected value is a baseline.
+        // Only a subsequent Updated with a known changed value can notify.
+        const bool shouldNotify = enumerationComplete[transport] &&
+            event.change == Change::Updated && current.connectionKnown &&
+            current.connected != event.connected;
+        const bool wasConnected = current.connected;
         current.connected = event.connected;
         current.connectionKnown = true;
-        if (shouldNotify && g_showBluetoothEvents.load())
+        if (shouldNotify && g_showBluetoothEvents.load()) {
+            Wh_Log(L"Fluent OSD/Bluetooth: AEP update transport=%d old=%d new=%d",
+                   event.transport, static_cast<int>(wasConnected),
+                   static_cast<int>(event.connected));
             AddNoticeEvent(NoticeCategory::Bluetooth,
                 event.connected ? NoticeAction::Connected : NoticeAction::Disconnected,
                 id, current.name.empty() ? Tr(OsdText::BluetoothDevice)
-                                         : current.name);
+                                         : current.name, current.icon);
+        }
     }
 }
 } // namespace bt_monitor
@@ -7672,10 +8539,10 @@ xaml_osd::Snapshot MakeXamlSnapshot(
     data.background = OsdBackgroundRgb(light);
     data.backgroundAlpha = OsdBackgroundAlpha();
     {
-        std::lock_guard<std::mutex> lock(g_backgroundMarkupMutex);
-        data.customBackground =
-            g_useCustomBackgroundBrush.load(std::memory_order_acquire);
-        if (data.customBackground) data.backgroundMarkup = g_backgroundMarkup;
+        std::lock_guard<std::mutex> lock(g_backgroundLayersMutex);
+        data.layeredBackground =
+            g_useLayeredBackground.load(std::memory_order_acquire);
+        if (data.layeredBackground) data.backgroundLayers = g_backgroundLayers;
     }
     data.borderless = g_ddcBorderless.load();
     data.cornerRadius = g_cornerRadius.load();
@@ -7706,9 +8573,11 @@ bool ShowXamlMirroredBatch(std::vector<xaml_osd::Snapshot> batch) {
     if (g_displayOutputMode.load(std::memory_order_relaxed) == 3 &&
         batch.front().kind != xaml_osd::LevelKind::DdcBrightness) {
         const bool attached = batch.size() == 2 &&
-            batch.front().kind == xaml_osd::LevelKind::Volume &&
-            (batch[1].kind == xaml_osd::LevelKind::Media ||
-             batch[1].kind == xaml_osd::LevelKind::Mixer);
+            ((batch.front().kind == xaml_osd::LevelKind::Volume &&
+              (batch[1].kind == xaml_osd::LevelKind::Media ||
+               batch[1].kind == xaml_osd::LevelKind::Mixer)) ||
+             (batch.front().kind == xaml_osd::LevelKind::NoticeStatus &&
+              batch[1].kind == xaml_osd::LevelKind::NoticeDetails));
         const xaml_osd::Snapshot master = batch.front();
         MirrorScan scan{MonitorFromRect(&master.anchor,
             MONITOR_DEFAULTTONEAREST), {}};
@@ -8935,20 +9804,66 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     }
     auto snapshot = MakeXamlStatusSnapshot(
         xaml_osd::LevelKind::NoticeStatus, target, duration, true);
+    snapshot.vertical = false; // Status notices are horizontal regardless of level settings.
     snapshot.statusTitle = g_noticeTitle;
     snapshot.statusDetail = g_noticeBody;
     snapshot.noticeDetails = g_noticeDetails;
     snapshot.noticeDetailsHeading = Tr(OsdText::EventDetails);
-    snapshot.noticeInteractiveDurationMs =
-        OsdDuration(DurationKind::Interactive);
+    snapshot.noticeInteractiveDurationMs = OsdDuration(DurationKind::Interactive);
+    snapshot.noticeGeneration = g_noticeGeneration;
     switch (g_noticeIcon) {
         case NoticeIcon::Bluetooth: snapshot.statusGlyph = L"\uE702"; break;
         case NoticeIcon::Usb:       snapshot.statusGlyph = L"\uE88E"; break;
         case NoticeIcon::Network:   snapshot.statusGlyph = L"\uE968"; break;
+        case NoticeIcon::Wifi:      snapshot.statusGlyph = L"\uE701"; break;
+        case NoticeIcon::Keyboard:  snapshot.statusGlyph = L"\uE92E"; break;
+        case NoticeIcon::Mouse:     snapshot.statusGlyph = L"\uE962"; break;
+        case NoticeIcon::Headset:   snapshot.statusGlyph = L"\uE95B"; break;
+        case NoticeIcon::Speaker:   snapshot.statusGlyph = L"\uE995"; break;
         default: return;
     }
-    if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"Fluent OSD/XAML: device notice unavailable; NO GDI+ fallback");
+    RECT detailsRect{};
+    bool canPlace = false;
+    if (g_noticeDetails.size() > 1) {
+        MONITORINFO monitor{sizeof(monitor)};
+        if (GetMonitorInfoW(MonitorFromRect(
+                &target, MONITOR_DEFAULTTONEAREST), &monitor)) {
+            const int width = target.right - target.left;
+            const int height = target.bottom - target.top;
+            const int preferredHeight = std::max(84, static_cast<int>(std::lround(
+                (48.0 + std::min<size_t>(6, g_noticeDetails.size()) *
+                 std::max(26.0, snapshot.fontSize * 1.8)) *
+                std::max(0.5f, snapshot.scale))));
+            const int panelHeight = std::clamp(preferredHeight, 64,
+                std::max(64, static_cast<int>(
+                    monitor.rcWork.bottom - monitor.rcWork.top - 16)));
+            const FlyoutDirection direction = DirectionForPopup(
+                target, monitor.rcWork, g_position.load(), false);
+            const auto offset = GetPanelAttachment(
+                false, direction, snapshot.scale,
+                width, height, width, panelHeight);
+            const int x = ClampPopupAxis(
+                target.left + offset.x, width, monitor.rcWork, true);
+            const int y = ClampPopupAxis(
+                target.top + offset.y, panelHeight, monitor.rcWork, false);
+            detailsRect = RECT{x, y, x + width, y + panelHeight};
+            snapshot.noticeDirection = osd_layout::MixerChevronDirection(
+                target, detailsRect, false, g_noticePanelOpen);
+            canPlace = true;
+        }
+    }
+    if (g_noticePanelOpen && canPlace) {
+        auto details = MakeXamlStatusSnapshot(
+            xaml_osd::LevelKind::NoticeDetails, detailsRect,
+            DurationKind::Interactive, false);
+        details.vertical = false;
+        details.noticeDetails = g_noticeDetails;
+        details.noticeDetailsHeading = Tr(OsdText::EventDetails);
+        if (!ShowXamlMirroredBatch({snapshot, details}))
+            Wh_Log(L"Fluent OSD/XAML: notice-details pair unavailable");
+    } else if (!ShowXamlMirrored(std::move(snapshot))) {
+        Wh_Log(L"Fluent OSD/XAML: device notice unavailable");
+    }
 }
 
 // A native system event already has one immutable display payload; use
@@ -9072,7 +9987,10 @@ void ShowMigratedXamlClipboardNotice() {
         DurationKind::Clipboard, true);
     snapshot.statusTitle = g_noticeTitle;
     snapshot.statusDetail = g_noticeBody;
-    snapshot.statusGlyph = L"\uE8C8"; // Segoe Fluent Icons Copy
+    // TextBulletListSquare and KnowledgeArticle (Segoe Fluent Icons).
+    snapshot.statusGlyph = g_noticeIcon == NoticeIcon::ClipboardFile
+        ? L"\uF000" : g_noticeIcon == NoticeIcon::ClipboardText
+        ? L"\uE9A4" : L"\uE8C8";
     const bool image = CopyClipboardThumbnailPixels(
         g_clipboardThumbnail, snapshot);
     if (image)
@@ -9344,13 +10262,26 @@ struct PendingDdcWrite {
 std::vector<PendingDdcWrite> g_pendingDdcWrites; // UI thread only.
 struct ControlEffects {
     bool volume = false, nativeBrightness = false, ddc = false;
-    bool mixer = false;
+    bool mixer = false, notice = false;
 };
 ControlEffects ApplyOsdCommands(
         const std::vector<osd_control::Command>& commands) {
     ControlEffects effects;
     if (g_closing.load()) return effects;
     for (const auto& cmd : commands) {
+        if (cmd.target == osd_control::Target::Notice) {
+            if (cmd.action == osd_control::Action::ToggleNoticeDetails &&
+                g_popupKind == PopupKind::Notification &&
+                g_noticeIcon != NoticeIcon::Clipboard &&
+                g_noticeIcon != NoticeIcon::ClipboardFile &&
+                g_noticeIcon != NoticeIcon::ClipboardText &&
+                g_noticeDetails.size() > 1 &&
+                cmd.generation == g_noticeGeneration) {
+                g_noticePanelOpen = !g_noticePanelOpen;
+                effects.notice = true;
+            }
+            continue;
+        }
         if(cmd.target==osd_control::Target::Media) {
             if(!g_xamlMediaOpen||
                cmd.generation!=g_xamlMediaGeneration) continue;
@@ -9621,6 +10552,8 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ShowMigratedXamlLevel(PopupKind::NativeBrightness);
             if (effects.ddc)
                 (void)ShowXamlDdcTargets(g_visible);
+            if (effects.notice)
+                ShowMigratedXamlDeviceNotice(g_noticeDuration);
         }
         return 0;
     }
@@ -9663,18 +10596,51 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (hwnd == g_receiveWnd && msg == kNetworkNoticeMessage) {
-        if (g_showNetworkEvents.load()) {
-            const bool changed = CaptureNetworkEvents();
-            // An aggregate connectivity hint is not proof of which SSID or VPN
-            // changed. Use a generic notice only when no NIC transition was found.
-            if (!changed) {
-                const int level = static_cast<int>(wp);
-                const bool online = level >= 2;
-                AddNoticeEvent(NoticeCategory::Network, online ?
-                               NoticeAction::NetworkChanged : NoticeAction::Disconnected,
-                               L"aggregate-connectivity", Tr(OsdText::WindowsNetwork));
-            }
+        if (!g_showNetworkEvents.load()) return 0;
+        if (!g_networkRefreshPending) {
+            ResetNetworkRefreshState();
+            g_networkRefreshPending = true;
         }
+        if (wp == 1) {
+            g_networkHintPending = true;
+            g_networkHintLevel = static_cast<int>(lp);
+        }
+        g_networkRefreshSecondPass = false;
+        if (!SetTimer(hwnd, kNetworkRefreshTimer, kNetworkDebounceMs, nullptr)) {
+            Wh_Log(L"Fluent OSD/network: debounce timer unavailable (%lu)",
+                   GetLastError());
+            g_networkSawInterfaceTransition |= CaptureNetworkEvents();
+            FinishNetworkRefresh();
+        }
+        return 0;
+    }
+    if (hwnd == g_receiveWnd && msg == WM_TIMER &&
+        wp == kNetworkRefreshTimer) {
+        KillTimer(hwnd, kNetworkRefreshTimer);
+        if (!g_showNetworkEvents.load()) {
+            ResetNetworkRefreshState();
+            return 0;
+        }
+        g_networkSawInterfaceTransition |= CaptureNetworkEvents();
+        if (!g_networkRefreshSecondPass) {
+            g_networkRefreshSecondPass = true;
+            if (SetTimer(hwnd, kNetworkRefreshTimer, kNetworkSettleMs, nullptr))
+                return 0;
+        }
+        FinishNetworkRefresh();
+        return 0;
+    }
+    if (hwnd == g_receiveWnd && msg == kNetworkConfigMessage) {
+        const bool enabled = g_showNetworkEvents.load();
+        if (enabled && !g_networkUiSettingEnabled) {
+            CaptureNetworkBaseline();
+            RefreshNetworkHintBaseline();
+        }
+        if (!enabled) {
+            KillTimer(hwnd, kNetworkRefreshTimer);
+            ResetNetworkRefreshState();
+        }
+        g_networkUiSettingEnabled = enabled;
         return 0;
     }
     if (msg == kNativeExtraMessage && hwnd == g_receiveWnd) {
@@ -9920,12 +10886,14 @@ DWORD WINAPI UiThreadProc(void*) {
         KillTimer(g_receiveWnd, kEventBatchTimer);
         KillTimer(g_receiveWnd, kDdcBatchTimer);
         KillTimer(g_receiveWnd, kMediaAnimationTimer);
+        KillTimer(g_receiveWnd, kNetworkRefreshTimer);
     }
     g_ddcBatchPending = false;
     g_ddcBatchEvents.clear();
     g_ddcTargets.clear();
     g_noticeBatch = NoticeBatch{};
     g_usbNames.clear();
+    ResetNetworkRefreshState();
     g_networkInterfaces.clear();
     StopDeviceEvents();
     ClearClipboardThumbnail();
@@ -10016,6 +10984,8 @@ void Wh_ModSettingsChanged() {
         (void)PostMessageW(target, kShellInputSiteReadyMessage, 0, 0);
     if (g_isExplorer && target && !g_closing.load())
         (void)PostMessageW(target, kBluetoothConfigMessage, 0, 0);
+    if (g_isExplorer && target && !g_closing.load())
+        (void)PostMessageW(target, kNetworkConfigMessage, 0, 0);
     // Refresh the next OSD using the newly selected theme. Settings never
     // force an unexpected brightness write or background monitor read.
 }
