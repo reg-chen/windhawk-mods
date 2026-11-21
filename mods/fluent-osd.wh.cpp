@@ -764,6 +764,7 @@ struct MixerRow {
     std::wstring title;
     int percent = 0;
     bool muted = false, enabled = true;
+    std::vector<uint8_t> iconPixels; // Optional 20x20 BGRA; owned bytes.
 };
 struct MixerOutput {
     std::wstring title;
@@ -9228,8 +9229,50 @@ void ShowMigratedXamlClipboardNotice() {
 }
 
 
-// Build a complete owned Mixer display model from the existing UI-thread
-// Core Audio state. The STA receives only strings, flags and percentages.
+// Bounded one-time HICON conversion in the original UI thread; the Island
+// receives copied pixels, never the native icon or a live device context.
+std::vector<uint8_t> MixerIconPixels(HICON icon) {
+    constexpr int side = 20;
+    constexpr size_t bytes = side * side * 4;
+    if (!icon) return {};
+    HDC screen = GetDC(nullptr);
+    if (!screen) return {};
+    HDC dc = CreateCompatibleDC(screen);
+    if (!dc) { ReleaseDC(nullptr, screen); return {}; }
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = side;
+    info.bmiHeader.biHeight = -side;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS,
+                                     &pixels, nullptr, 0);
+    std::vector<uint8_t> result;
+    if (bitmap && pixels) {
+        const HGDIOBJ previous = SelectObject(dc, bitmap);
+        memset(pixels, 0, bytes);
+        if (DrawIconEx(dc, 0, 0, icon, side, side, 0, nullptr, DI_NORMAL)) {
+            const auto* data = static_cast<const uint8_t*>(pixels);
+            // If a legacy masked icon lacks valid alpha, use the Fluent
+            // fallback rather than an opaque black tile.
+            for (size_t i = 3; i < bytes; i += 4) {
+                if (data[i]) {
+                    result.assign(data, data + bytes);
+                    break;
+                }
+            }
+        }
+        if (previous) SelectObject(dc, previous);
+    }
+    if (bitmap) DeleteObject(bitmap);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+    return result;
+}
+
+// Build an owned Mixer display model from Core Audio UI-thread values.
 osd_model::MixerModel BuildMixerModel() {
     osd_model::MixerModel model;
     model.title = Tr(OsdText::VolumeMixer);
@@ -9251,11 +9294,14 @@ osd_model::MixerModel BuildMixerModel() {
         g_mixerMasterMuted, static_cast<bool>(g_mixerMaster)});
     for (const auto& item : g_mixerEntries) {
         if (model.rows.size() >= 129) break;
-        model.rows.push_back({
-            item.title,
-            std::clamp(static_cast<int>(
-                std::lround(item.scalar * 100.0f)), 0, 100),
-            item.muted, static_cast<bool>(item.volume)});
+        osd_model::MixerRow row;
+        row.title = item.title;
+        row.percent = std::clamp(static_cast<int>(
+            std::lround(item.scalar * 100.0f)), 0, 100);
+        row.muted = item.muted;
+        row.enabled = item.volume.Get() != nullptr;
+        row.iconPixels = MixerIconPixels(item.appIcon);
+        model.rows.push_back(std::move(row));
     }
     return model;
 }
