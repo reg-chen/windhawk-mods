@@ -1675,6 +1675,8 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.fill.Visibility(wx::Visibility::Collapsed);
     state.thumb.Visibility(wx::Visibility::Collapsed);
 
+    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerSurface.Visibility(wx::Visibility::Collapsed);
     state.statusTile.Visibility(wx::Visibility::Visible);
     state.statusGlyph.Visibility(wx::Visibility::Visible);
     state.statusTitle.Visibility(wx::Visibility::Visible);
@@ -1788,6 +1790,8 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
 
     // Do not retain an old image when a new snapshot is malformed.
     state.clipboardImage.Source(nullptr);
+    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerSurface.Visibility(wx::Visibility::Collapsed);
     state.clipboardFrame.Visibility(wx::Visibility::Visible);
     state.clipboardCaption.Visibility(wx::Visibility::Visible);
     state.clipboardFrame.Background(Brush(data.track, 72));
@@ -1838,8 +1842,205 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
     ShowPositionedSurface(state, data, insetX, insetY, bodyW, bodyH);
 }
 
+// Native, scrollable Mixer panel. All controls are constructed on the XAML
+// STA from a copied view-model; no Core Audio pointers are shared with it.
+void DrawMixerSnapshot(State& state, const Snapshot& data) {
+    if (!state.host || !state.canvas || !state.card ||
+        !state.mixerSurface || !state.mixerColumn ||
+        !state.mixerRows || !state.mixerRowsScroll ||
+        !state.mixerOutputs || !state.mixerOutputsScroll) return;
+    state.mixerPopulating = true;
+    state.current = data;
+    const auto frame = osd_layout::CardFrame(data, 4.0 / 380.0, 4.0 / 200.0);
+    const double w = frame.width, h = frame.height;
+    const double pad = std::clamp(
+        static_cast<double>(data.innerPadding), 6.0, 22.0) * .68;
+    const double contentW = std::max(40.0, w - 2.0 * pad);
+    const double radius = std::clamp(
+        static_cast<double>(data.cornerRadius), 0.0, 34.0);
+
+    state.canvas.IsHitTestVisible(true);
+    state.canvas.Width(w);
+    state.canvas.Height(h);
+    state.card.Background(Brush(data.background, data.backgroundAlpha));
+    state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
+    state.card.BorderBrush(Brush(data.track));
+    const double border = data.borderless ? 0.0 : 1.0;
+    state.card.BorderThickness(wx::Thickness{border, border, border, border});
+    state.icon.Visibility(wx::Visibility::Collapsed);
+    state.value.Visibility(wx::Visibility::Collapsed);
+    state.track.Visibility(wx::Visibility::Collapsed);
+    state.fill.Visibility(wx::Visibility::Collapsed);
+    state.thumb.Visibility(wx::Visibility::Collapsed);
+    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.statusTile.Visibility(wx::Visibility::Collapsed);
+    state.statusTitle.Visibility(wx::Visibility::Collapsed);
+    state.statusDetail.Visibility(wx::Visibility::Collapsed);
+    state.statusUnderline.Visibility(wx::Visibility::Collapsed);
+    state.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.noticeHeading.Visibility(wx::Visibility::Collapsed);
+    state.noticeScroll.Visibility(wx::Visibility::Collapsed);
+    state.clipboardFrame.Visibility(wx::Visibility::Collapsed);
+    state.clipboardCaption.Visibility(wx::Visibility::Collapsed);
+    state.clipboardImage.Source(nullptr);
+    if (state.statusLineAnimating) KillTimer(state.host, kStatusLineTimer);
+    state.statusLineAnimating = false;
+    state.noticeExpanded = false;
+
+    state.mixerSurface.Visibility(wx::Visibility::Visible);
+    state.mixerSurface.Background(Brush(data.background, 0));
+    state.mixerSurface.Width(w);
+    state.mixerSurface.Height(h);
+    controls::Canvas::SetLeft(state.mixerSurface, 0.0);
+    controls::Canvas::SetTop(state.mixerSurface, 0.0);
+    state.mixerColumn.Width(contentW);
+    state.mixerColumn.Margin(wx::Thickness{pad, pad * .4, pad, pad * .4});
+    state.mixerColumn.Children().Clear();
+
+    auto makeButton = [&](const std::wstring& title, double width,
+                          double height) {
+        controls::Button result;
+        result.Content(winrt::box_value(winrt::hstring(title)));
+        result.Width(std::max(16.0, width));
+        result.Height(height);
+        result.FontSize(std::clamp(data.fontSize - 1, 10, 18));
+        result.Foreground(Brush(data.text));
+        return result;
+    };
+    // Header: title and a real, hit-tested close command.
+    controls::StackPanel header;
+    header.Orientation(controls::Orientation::Horizontal);
+    header.Height(36.0);
+    controls::TextBlock title;
+    title.Text(winrt::hstring(data.mixer.title));
+    title.Width(std::max(1.0, contentW - 38.0));
+    title.FontSize(std::clamp(data.fontSize + 1, 12, 22));
+    title.Foreground(Brush(data.text));
+    title.VerticalAlignment(wx::VerticalAlignment::Center);
+    title.TextTrimming(wx::TextTrimming::CharacterEllipsis);
+    header.Children().Append(title);
+    auto close = makeButton(L"\uE8BB", 34.0, 32.0);
+    close.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+    close.Click([&state](auto const&, auto const&) {
+        SendMixerInput(state, InputAction::CloseMixer, -1);
+    });
+    header.Children().Append(close);
+    state.mixerColumn.Children().Append(header);
+
+    const auto& model = data.mixer;
+    auto output = makeButton(
+        model.outputHeading + L": " + model.selectedOutput +
+        (model.outputFailed ? L" !" : L"  \uE70D"),
+        contentW, 32.0);
+    output.HorizontalAlignment(wx::HorizontalAlignment::Left);
+    output.Click([&state](auto const&, auto const&) {
+        SendMixerInput(state, InputAction::MixerToggleOutput, -1);
+    });
+    state.mixerColumn.Children().Append(output);
+
+    const double outputRowsH = model.outputExpanded
+        ? std::min<size_t>(model.outputs.size(), 4) * 32.0 : 0.0;
+    state.mixerOutputsScroll.Visibility(model.outputExpanded
+        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+    if (model.outputExpanded) {
+        state.mixerOutputs.Children().Clear();
+        for (size_t i = 0; i < model.outputs.size(); ++i) {
+            const auto& item = model.outputs[i];
+            auto option = makeButton(
+                (item.selected ? L"\u2713 " : L"   ") + item.title,
+                contentW, 32.0);
+            const int index = static_cast<int>(i);
+            option.Click([&state, index](auto const&, auto const&) {
+                SendMixerInput(state, InputAction::MixerSelectOutput, index);
+            });
+            state.mixerOutputs.Children().Append(option);
+        }
+        state.mixerOutputsScroll.Width(contentW);
+        state.mixerOutputsScroll.Height(std::max(30.0, outputRowsH));
+        state.mixerColumn.Children().Append(state.mixerOutputsScroll);
+    }
+
+    // The host size is a setting; the scrollbar uses the remaining space.
+    // The number of visible audio sessions is bounded independently.
+    const double rowH = std::max(38.0, data.fontSize * 2.5);
+    const double availableH = std::max(32.0,
+        h - 2.0 * pad - 36.0 - 32.0 - outputRowsH);
+    const double maxH = std::max(rowH, model.maxVisibleRows * rowH);
+    const double viewportH = std::min(availableH, maxH);
+    state.mixerRowsScroll.Width(contentW);
+    state.mixerRowsScroll.Height(viewportH);
+    state.mixerRows.Children().Clear();
+    const double muteW = 34.0, percentW = 43.0;
+    const double nameW = std::clamp(contentW * .28, 58.0, 144.0);
+    const double sliderW = std::max(40.0,
+        contentW - muteW - nameW - percentW - 6.0);
+    for (size_t i = 0; i < model.rows.size(); ++i) {
+        const auto& item = model.rows[i];
+        const int index = static_cast<int>(i);
+        controls::StackPanel row;
+        row.Orientation(controls::Orientation::Horizontal);
+        row.Height(rowH);
+        auto mute = makeButton(item.muted ? L"\uE74F" : L"\uE767",
+                               muteW, 32.0);
+        mute.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+        mute.IsEnabled(item.enabled);
+        mute.Click([&state, index](auto const&, auto const&) {
+            SendMixerInput(state, InputAction::MixerToggleMute, index);
+        });
+        row.Children().Append(mute);
+        controls::TextBlock name;
+        name.Width(nameW);
+        name.Text(winrt::hstring(item.title));
+        name.FontSize(std::clamp(data.fontSize - 2, 10, 17));
+        name.Foreground(Brush(data.text));
+        name.TextTrimming(wx::TextTrimming::CharacterEllipsis);
+        name.VerticalAlignment(wx::VerticalAlignment::Center);
+        row.Children().Append(name);
+        controls::Slider slider;
+        slider.Width(sliderW);
+        slider.Height(rowH);
+        slider.Minimum(0.0);
+        slider.Maximum(100.0);
+        slider.SmallChange(1.0);
+        slider.StepFrequency(1.0);
+        slider.IsEnabled(item.enabled);
+        slider.Value(std::clamp(item.percent, 0, 100));
+        slider.ValueChanged(
+            [&state, index](auto const&, auto const& args) {
+                if (state.mixerPopulating ||
+                    state.current.kind != LevelKind::Mixer) return;
+                const int percent = static_cast<int>(std::lround(
+                    std::clamp(args.NewValue(), 0.0, 100.0)));
+                SendMixerInput(state, InputAction::MixerSetPercent,
+                               index, percent);
+                ArmInteractionTimer(state, true);
+            });
+        row.Children().Append(slider);
+        controls::TextBlock label;
+        label.Width(percentW);
+        label.FontSize(std::clamp(data.fontSize - 2, 10, 17));
+        label.Text(winrt::hstring(
+            std::to_wstring(std::clamp(item.percent, 0, 100)) + L"%"));
+        label.TextAlignment(wx::TextAlignment::Right);
+        label.VerticalAlignment(wx::VerticalAlignment::Center);
+        label.Foreground(Brush(data.text));
+        row.Children().Append(label);
+        state.mixerRows.Children().Append(row);
+    }
+    state.mixerColumn.Children().Append(state.mixerRowsScroll);
+    state.mixerPopulating = false;
+    ShowPositionedSurface(state, data, frame.insetX, frame.insetY, w, h);
+}
 void DrawSnapshot(State& state, const Snapshot& value) {
     const auto view = osd_model::SelectView(value.kind);
+    if (view == osd_model::View::Mixer) {
+        DrawMixerSnapshot(state, value);
+        return;
+    }
+    if (state.mixerChevron)
+        state.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    if (state.mixerSurface)
+        state.mixerSurface.Visibility(wx::Visibility::Collapsed);
     if (view == osd_model::View::ClipboardImage) {
         DrawClipboardImageSnapshot(state, value);
         return;
