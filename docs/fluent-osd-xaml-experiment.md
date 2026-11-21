@@ -2,7 +2,7 @@
 
 **Branch:** `fluent-osd-xaml`  
 **Baseline:** `fluent-osd` v1.0.1 (`8ff2d4352d8c081e78208266ff1561b5e5bfe31b`)  
-**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.18** now includes XAML volume, native brightness, per-target DDC/CI, background-opacity settings and a shared input layer. **v1.0.18 has not yet been compiled or runtime-tested in Windhawk.**
+**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.20** adds native XAML Caps/Num/Scroll/Insert status cards to volume, native brightness and per-target DDC/CI. The earlier v1.0.19 build received compiler feedback for `Windows.UI.Input` projection and the missing include was added; **v1.0.20 still requires a fresh Windhawk compilation and runtime test.**
 
 ## Goal / non-goals
 
@@ -528,6 +528,32 @@ each OSD type.
 5. Disable/re-enable Windhawk, check Explorer teardown, and examine
    `XAML v1.0.18` logs. Compilation and runtime behavior are still
    **unverified** in this editing environment.
+
+## v1.0.19–v1.0.20 — Native pointer input and first compact status card
+
+- **v1.0.19:** Replace detached, near-transparent Win32 mouse overlays with
+  XAML Canvas PointerPressed/PointerMoved/PointerReleased/PointerWheelChanged,
+  keeping the existing audio and DDC command workers. Route inherited corner
+  radius, borderless mode and fade settings into the same XAML visual tree.
+  DDC writes and failure rollbacks are now keyed per physical display, not
+  globally coalesced across monitors. Include the complete
+  `winrt/Windows.UI.Input.h` projection for PointerPoint member definitions.
+- **v1.0.20:** Route Caps Lock, Num Lock, Scroll Lock and Insert notifications
+  to a single noninteractive native XAML card with their dedicated
+  glyphs and on/off states. Keep the existing keyboard hook, display selection,
+  language strings and duration. Derive tile/text/glyph placement from the
+  available XAML canvas rather than fixed per-key popup dimensions. Reuse
+  the migrated volume/brightness background alpha, corner, fade and placement
+  implementation; cancel outstanding pointer capture when switching views.
+- The legacy GDI+ implementation remains selectable by turning off
+  `experimentalXamlVolume`. USB, Bluetooth, network, clipboard, native
+  non-level events, Mixer and SMTC are **not** migrated in this increment.
+  A status card does **not** imply those other notification categories use XAML.
+- **Validation pending:** compile v1.0.20 in Windhawk and toggle each of
+  Caps/Num/Scroll/Insert ON then OFF. Check all four symbols, even spacing,
+  opacity 20/60/96%, theme and font changes, fade and position at multiple
+  DPI values, and transitions to/from volume and DDC. Also verify no leftover
+  HWND or Explorer shutdown blocker on mod disable/reload.
 
 ## Migration gates
 
