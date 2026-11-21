@@ -46,8 +46,14 @@ Windows indicators to hide and which custom OSDs to show.
 ## Custom background brushes
 
 Under **Fluent appearance > Background effect**, choose **Transparency**
-for a solid color with adjustable opacity, or **Custom brush** to enter
-a single-line brush definition (without `Fill:=`).
+for the original solid background, or **Brush layers** for one to five
+custom brushes. The same renderer handles a single enabled layer and a
+stack of multiple brushes; the separate single-brush setting is removed.
+Windhawk's Add item, Remove, and reorder commands manage the layer list.
+Each layer accepts one single-line brush definition (without `Fill:=`),
+an Enabled flag, and an independent layer opacity (0–100%).
+Layers are painted bottom to top. Empty or invalid stacks use solid fallback.
+More than one Acrylic or WindhawkBlur can increase GPU memory use.
 
 | Brush | Example |
 | --- | --- |
@@ -327,14 +333,14 @@ External project and product names/trademarks belong to their owners.
         - ddcBackgroundEffect: opacity
           $name: Background effect
           $name:zh-TW: 背景效果
-          $description: Preserve the existing solid opacity, or use one restricted custom brush definition.
-          $description:zh-TW: 保留原有純色不透明度，或改用單一受限制的自訂筆刷定義。
+          $description: Use the original solid background or a list of one to five composited brushes.
+          $description:zh-TW: 使用原有純色背景，或以 1 至 5 個筆刷圖層疊加；單層也使用相同功能。
           $options:
           - opacity: Transparency
-          - custom: Custom brush
+          - layers: Brush layers
           $options:zh-TW:
           - opacity: 透明度
-          - custom: 自訂筆刷
+          - layers: 筆刷圖層
         - ddcBackgroundOpacity: 96
           $name: Background opacity (%)
           $name:zh-TW: 背景不透明度（%）
@@ -342,12 +348,27 @@ External project and product names/trademarks belong to their owners.
           #! $min: 0
           #! $max: 100
           #! $format: slider
-        - ddcCustomBrush: '<AcrylicBrush BackgroundSource="Backdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />'
-          $name: Custom background brush (single-line)
-          $name:zh-TW: 自訂背景筆刷（單行）
-          $description: Supports AcrylicBrush, SolidColorBrush, LinearGradientBrush, local ImageBrush and WindhawkBlur. Invalid definitions fall back to solid.
-          $description:zh-TW: 支援 AcrylicBrush、SolidColorBrush、LinearGradientBrush、ImageBrush（本機圖片）和 WindhawkBlur；無效時回退純色。
-          #! $showIf: {ddcBackgroundEffect: custom}
+        - ddcBrushLayers:
+            - - enabled: true
+                $name: Enable layer
+                $name:zh-TW: 啟用圖層
+              - opacity: 100
+                $name: Layer opacity (%)
+                $name:zh-TW: 圖層不透明度（%）
+                #! $min: 0
+                #! $max: 100
+                #! $format: slider
+              - markup: '<AcrylicBrush BackgroundSource="Backdrop" TintColor="$mainColor" TintOpacity="0.1" TintLuminosityOpacity="0" />'
+                $name: Brush markup (single line)
+                $name:zh-TW: 筆刷語法（單行）
+            - - enabled: true
+              - opacity: 100
+              - markup: '<LinearGradientBrush StartPoint="0,0" EndPoint="1,1"><GradientStop Color="#30FF0000" Offset="0" /><GradientStop Color="#300000FF" Offset="1" /></LinearGradientBrush>'
+          $name: Background brush layers (bottom to top, maximum 5)
+          $name:zh-TW: 背景筆刷圖層（由下至上，最多 5 層）
+          $description: Add, remove and reorder brush entries in Windhawk. Each layer uses the existing bounded brush parser.
+          $description:zh-TW: 使用 Windhawk 新增、移除和排序圖層；每層沿用現有受限筆刷解析器。
+          #! $showIf: {ddcBackgroundEffect: layers}
         - ddcAccentMode: system
           $name: Progress bar color source
           $name:zh-TW: 進度條顏色來源
@@ -906,6 +927,21 @@ struct MixerModel {
     bool outputExpanded = false, outputFailed = false;
     int maxVisibleRows = 6;
 };
+struct BrushLayer {
+    bool enabled = true;
+    int opacity = 100;
+    std::wstring markup;
+};
+bool SameBrushLayers(const std::vector<BrushLayer>& a,
+                     const std::vector<BrushLayer>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].enabled != b[i].enabled ||
+            a[i].opacity != b[i].opacity ||
+            a[i].markup != b[i].markup)
+            return false;
+    return true;
+}
 struct Snapshot {
     Kind kind = Kind::Volume;
     std::wstring key;       // Nonempty for a physical DDC display/window.
@@ -933,8 +969,10 @@ struct Snapshot {
     bool brightness = false;
     bool showIcon = true;
     BYTE backgroundAlpha = 255;
-    bool customBackground = false;
+    bool layeredBackground = false;
+    // Internal, parser-only field. Each configured layer supplies its markup.
     std::wstring backgroundMarkup;
+    std::vector<BrushLayer> backgroundLayers;
     bool borderless = true, fadeEnabled = false;
     int cornerRadius = 17;
     DWORD fadeDurationMs = 160;
@@ -1581,6 +1619,8 @@ struct State {
     hosting::WindowsXamlManager manager{nullptr};
     hosting::DesktopWindowXamlSource source{nullptr};
     controls::Border card{nullptr};
+    controls::Grid backgroundStack{nullptr};
+    std::vector<controls::Border> backgroundLayerCards;
     controls::Canvas canvas{nullptr};
     controls::Viewbox viewbox{nullptr};
     controls::TextBlock icon{nullptr};
@@ -1639,11 +1679,12 @@ struct State {
     double iconSlotWidth = 0.0, iconSlotHeight = 0.0;
     double valueSlotWidth = 0.0, valueSlotHeight = 0.0;
     double rawSlotWidth = 0.0, rawSlotHeight = 0.0;
-    bool backgroundCached = false, cachedCustomBackground = false;
+    bool backgroundCached = false;
+    bool cachedLayeredBackground = false;
     DWORD cachedBackground = 0, cachedAccent = 0,
           cachedText = 0, cachedTrack = 0;
     BYTE cachedBackgroundAlpha = 0;
-    std::wstring cachedBackgroundMarkup;
+    std::vector<osd_model::BrushLayer> cachedBackgroundLayers;
 };
 media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
     return media::SolidColorBrush(winrt::Windows::UI::Color{
@@ -3020,41 +3061,95 @@ bool TryBuildBackgroundBrush(const Snapshot& state,
     output = brush;
     return true;
 }
+// The Viewbox remains last; all brush layers belong below it in the Grid.
+// Disconnect custom Composition brushes before removing the XAML visuals.
+void ClearBackgroundLayers(State& state) {
+    if (!state.backgroundStack) return;
+    auto children = state.backgroundStack.Children();
+    for (auto& layer : state.backgroundLayerCards) {
+        try { layer.Background(nullptr); } catch (...) {}
+    }
+    const size_t count = state.backgroundLayerCards.size();
+    for (size_t i = 0; i < count && children.Size() > 1; ++i)
+        children.RemoveAt(0);
+    state.backgroundLayerCards.clear();
+}
+void SetBackgroundLayerRadius(State& state, double radius) {
+    radius = std::clamp(radius, 0.0, 34.0);
+    for (auto& layer : state.backgroundLayerCards)
+        layer.CornerRadius(wx::CornerRadius{
+            radius, radius, radius, radius});
+}
 void ApplyBackground(State& state, const Snapshot& snapshot) {
     if (state.backgroundCached &&
-        state.cachedCustomBackground == snapshot.customBackground &&
+        state.cachedLayeredBackground == snapshot.layeredBackground &&
         state.cachedBackground == snapshot.background &&
         state.cachedBackgroundAlpha == snapshot.backgroundAlpha &&
         state.cachedAccent == snapshot.accent &&
         state.cachedText == snapshot.text &&
         state.cachedTrack == snapshot.track &&
-        state.cachedBackgroundMarkup == snapshot.backgroundMarkup)
+        osd_model::SameBrushLayers(
+            state.cachedBackgroundLayers, snapshot.backgroundLayers))
         return;
-    media::Brush brush{nullptr};
+    ClearBackgroundLayers(state);
     bool valid = false;
-    if (snapshot.customBackground) {
-        try {
-            valid = TryBuildBackgroundBrush(snapshot, state.card, brush);
+    if (snapshot.layeredBackground && state.backgroundStack) {
+        state.card.Background(Brush(0, 0));
+        auto children = state.backgroundStack.Children();
+        for (const auto& spec : snapshot.backgroundLayers) {
+            if (!spec.enabled || spec.markup.empty()) continue;
+            controls::Border layer;
+            layer.IsHitTestVisible(false);
+            layer.HorizontalAlignment(wx::HorizontalAlignment::Stretch);
+            layer.VerticalAlignment(wx::VerticalAlignment::Stretch);
+            layer.Opacity(std::clamp(spec.opacity, 0, 100) / 100.0);
+            const double radius =
+                std::clamp(static_cast<double>(snapshot.cornerRadius),
+                           0.0, 34.0);
+            layer.CornerRadius(wx::CornerRadius{
+                radius, radius, radius, radius});
+            // Attach before Composition creation so ElementCompositionPreview
+            // can resolve the correct XAML Island compositor.
+            children.InsertAt(children.Size() - 1, layer);
+            Snapshot single = snapshot;
+            single.backgroundMarkup = spec.markup;
+            media::Brush layerBrush{nullptr};
+            bool built = false;
+            try {
+                built = TryBuildBackgroundBrush(single, layer, layerBrush);
+                if (built) layer.Background(layerBrush);
+            } catch (const winrt::hresult_error& ex) {
+                Wh_Log(L"Fluent OSD: background layer failed: 0x%08lX",
+                       static_cast<unsigned long>(ex.code()));
+                built = false;
+            } catch (...) {
+                Wh_Log(L"Fluent OSD: background layer creation failed");
+                built = false;
+            }
+            if (built) {
+                state.backgroundLayerCards.push_back(layer);
+                valid = true;
+            } else {
+                // A bad upper layer must not hide lower, valid layers.
+                try { layer.Background(nullptr); } catch (...) {}
+                children.RemoveAt(children.Size() - 2);
+                Wh_Log(L"Fluent OSD: invalid background layer skipped");
+            }
         }
-        catch (const winrt::hresult_error& ex) {
-            Wh_Log(L"Custom background brush unavailable: 0x%08lX",
-                   static_cast<unsigned long>(ex.code()));
-        } catch (...) {
-            Wh_Log(L"Custom background brush creation failed");
-        }
-        if (!valid)
-            Wh_Log(L"Custom background brush invalid; using solid fallback");
+        Wh_Log(L"Fluent OSD/XAML: layer render configured=%u built=%u",
+               static_cast<unsigned>(snapshot.backgroundLayers.size()),
+               static_cast<unsigned>(state.backgroundLayerCards.size()));
     }
-    if (!valid) brush = Brush(snapshot.background, snapshot.backgroundAlpha);
-    state.card.Background(brush);
+    if (!valid)
+        state.card.Background(Brush(snapshot.background, snapshot.backgroundAlpha));
     state.backgroundCached = true;
-    state.cachedCustomBackground = snapshot.customBackground;
+    state.cachedLayeredBackground = snapshot.layeredBackground;
     state.cachedBackground = snapshot.background;
     state.cachedBackgroundAlpha = snapshot.backgroundAlpha;
     state.cachedAccent = snapshot.accent;
     state.cachedText = snapshot.text;
     state.cachedTrack = snapshot.track;
-    state.cachedBackgroundMarkup = snapshot.backgroundMarkup;
+    state.cachedBackgroundLayers = snapshot.backgroundLayers;
 }
 
 void DrawSnapshot(State&, const Snapshot&);
@@ -3633,6 +3728,7 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     ApplyBackground(state, value);
     const double radius = layout.radius;
     state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
+    SetBackgroundLayerRadius(state, radius);
     state.card.BorderBrush(Brush(value.track));
     const double border = value.borderless ? 0.0 : 1.0;
     state.card.BorderThickness(wx::Thickness{border, border, border, border});
@@ -3735,6 +3831,7 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
     state.canvas.Height(bodyH);
     ApplyBackground(state, data);
     state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
+    SetBackgroundLayerRadius(state, radius);
     state.card.BorderBrush(Brush(data.track));
     const double border = data.borderless ? 0.0 : 1.0;
     state.card.BorderThickness(wx::Thickness{border, border, border, border});
@@ -3992,8 +4089,9 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         state.current.vertical==snap.vertical&&
         state.current.background==snap.background&&
         state.current.backgroundAlpha==snap.backgroundAlpha&&
-        state.current.customBackground==snap.customBackground&&
-        state.current.backgroundMarkup==snap.backgroundMarkup&&
+        state.current.layeredBackground==snap.layeredBackground&&
+        osd_model::SameBrushLayers(
+            state.current.backgroundLayers, snap.backgroundLayers)&&
         state.current.accent==snap.accent&&
         state.current.text==snap.text&&
         state.current.track==snap.track&&
@@ -4021,6 +4119,7 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
     const double radius=std::clamp(double(snap.cornerRadius),0.0,34.0);
     state.card.CornerRadius(wx::CornerRadius{
         radius,radius,radius,radius});
+    SetBackgroundLayerRadius(state, radius);
     state.card.BorderBrush(Brush(snap.track));
     const double border=snap.borderless?0.0:1.0;
     state.card.BorderThickness(wx::Thickness{border,border,border,border});
@@ -4226,6 +4325,7 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     state.canvas.Height(h);
     ApplyBackground(state, data);
     state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
+    SetBackgroundLayerRadius(state, radius);
     state.card.BorderBrush(Brush(data.track));
     const double border = data.borderless ? 0.0 : 1.0;
     state.card.BorderThickness(wx::Thickness{border, border, border, border});
@@ -4533,6 +4633,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         std::clamp(value.cornerRadius, 0, 34));
     state.card.CornerRadius(wx::CornerRadius{
         radius, radius, radius, radius});
+    SetBackgroundLayerRadius(state, radius);
     state.card.BorderBrush(Brush(value.track));
     const double border = value.borderless ? 0.0 : 1.0;
     state.card.BorderThickness(wx::Thickness{
@@ -5010,9 +5111,13 @@ void CreateContent(State& state) {
     controls::Viewbox viewbox;
     viewbox.Stretch(media::Stretch::Fill);
     viewbox.Child(canvas);
-    card.Child(viewbox);
+    // XAML Grid shares the card geometry; brushes are behind the Viewbox.
+    controls::Grid backgroundStack;
+    backgroundStack.Children().Append(viewbox);
+    card.Child(backgroundStack);
     state.source.Content(card);
     state.card = card;
+    state.backgroundStack = backgroundStack;
     state.canvas = canvas;
     state.viewbox = viewbox;
     state.icon = icon;
@@ -5112,6 +5217,11 @@ void CreateSurface(State& state, HINSTANCE instance) {
 
 void CloseSurface(State& state) {
     HideSurface(state);
+    // Detach Composition callbacks from all user-defined layers before
+    // tearing down the XAML Island and its owning STA.
+    try { ClearBackgroundLayers(state); }
+    catch (...) { Wh_Log(L"Fluent OSD/XAML: layer detach failed"); }
+    state.cachedBackgroundLayers.clear();
     // Detach module-owned Composition callbacks before Island destruction.
     if (state.card) {
         try { state.card.Background(nullptr); }
@@ -5151,6 +5261,7 @@ void CloseSurface(State& state) {
     state.icon = nullptr;
     state.canvas = nullptr;
     state.viewbox = nullptr;
+    state.backgroundStack = nullptr;
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
@@ -5736,9 +5847,9 @@ std::atomic<int> g_trackMode{0};
 std::atomic<DWORD> g_customTrack{0};
 std::atomic<bool> g_validCustomTrack{false};
 std::atomic<int> g_backgroundOpacity{96};
-std::atomic<bool> g_useCustomBackgroundBrush{false};
-std::mutex g_backgroundMarkupMutex;
-std::wstring g_backgroundMarkup;
+std::atomic<bool> g_useLayeredBackground{false};
+std::mutex g_backgroundLayersMutex;
+std::vector<osd_model::BrushLayer> g_backgroundLayers;
 std::atomic<int> g_cornerRadius{17};
 std::atomic<int> g_fontSize{15};
 std::atomic<int> g_iconSize{16};
@@ -6252,17 +6363,35 @@ void LoadSettings() {
     g_backgroundOpacity.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBackgroundOpacity"), 0, 100));
     {
         PCWSTR effect = Wh_GetStringSetting(L"CustomOSD.Appearance.ddcBackgroundEffect");
-        const bool custom = effect && _wcsicmp(effect, L"custom") == 0;
+        const bool layered = effect && _wcsicmp(effect, L"layers") == 0;
         Wh_FreeStringSetting(effect);
-        PCWSTR configured = Wh_GetStringSetting(L"CustomOSD.Appearance.ddcCustomBrush");
-        std::wstring markup = configured ? configured : L"";
-        Wh_FreeStringSetting(configured);
-        // Settings callbacks and OSD snapshots may run on separate threads.
-        // Publish the markup under the lock before publishing the mode flag.
+        std::vector<osd_model::BrushLayer> layers;
+        if (layered) {
+            // Windhawk array ordering is controlled by Add item / reorder.
+            // Limit the loaded layers to five to bound Explorer GPU resources.
+            for (int i = 0; i < 5; ++i) {
+                PCWSTR value = Wh_GetStringSetting(
+                    L"CustomOSD.Appearance.ddcBrushLayers[%d].markup", i);
+                std::wstring def = value ? value : L"";
+                Wh_FreeStringSetting(value);
+                if (def.empty()) continue;
+                osd_model::BrushLayer layer;
+                layer.markup = std::move(def);
+                layer.enabled = Wh_GetIntSetting(
+                    L"CustomOSD.Appearance.ddcBrushLayers[%d].enabled", i) != 0;
+                layer.opacity = std::clamp(Wh_GetIntSetting(
+                    L"CustomOSD.Appearance.ddcBrushLayers[%d].opacity", i), 0, 100);
+                layers.push_back(std::move(layer));
+            }
+        }
+        if (layered)
+            Wh_Log(L"Fluent OSD/XAML: layered settings loaded=%u",
+                   static_cast<unsigned>(layers.size()));
+        // Publish the entire array as one snapshot for the OSD controller.
         {
-            std::lock_guard<std::mutex> lock(g_backgroundMarkupMutex);
-            g_backgroundMarkup = std::move(markup);
-            g_useCustomBackgroundBrush.store(custom, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(g_backgroundLayersMutex);
+            g_backgroundLayers = std::move(layers);
+            g_useLayeredBackground.store(layered, std::memory_order_release);
         }
     }
     g_cornerRadius.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcCornerRadius"), 0, 34));
@@ -7672,10 +7801,10 @@ xaml_osd::Snapshot MakeXamlSnapshot(
     data.background = OsdBackgroundRgb(light);
     data.backgroundAlpha = OsdBackgroundAlpha();
     {
-        std::lock_guard<std::mutex> lock(g_backgroundMarkupMutex);
-        data.customBackground =
-            g_useCustomBackgroundBrush.load(std::memory_order_acquire);
-        if (data.customBackground) data.backgroundMarkup = g_backgroundMarkup;
+        std::lock_guard<std::mutex> lock(g_backgroundLayersMutex);
+        data.layeredBackground =
+            g_useLayeredBackground.load(std::memory_order_acquire);
+        if (data.layeredBackground) data.backgroundLayers = g_backgroundLayers;
     }
     data.borderless = g_ddcBorderless.load();
     data.cornerRadius = g_cornerRadius.load();
