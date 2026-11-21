@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.17
+// @version         1.0.18
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.17)
+## XAML migration experiment (v1.0.18)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -709,6 +709,34 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 
 namespace {
 
+// Presentation-independent input arithmetic. Both the legacy GDI+
+// controls and migrated XAML controls use these same normalized units.
+namespace osd_input {
+int TrackPercent(double pointer, double origin, double span, bool reverse) {
+    if (!std::isfinite(pointer) || !std::isfinite(origin) ||
+        !std::isfinite(span) || span <= 0.0) return 0;
+    const double ratio = reverse
+        ? (origin + span - pointer) / span
+        : (pointer - origin) / span;
+    return std::clamp(static_cast<int>(std::lround(
+        std::clamp(ratio, 0.0, 1.0) * 100.0)), 0, 100);
+}
+
+int ConsumeWheelSteps(int delta, int& remainder) {
+    remainder += delta;
+    const int steps = remainder / WHEEL_DELTA;
+    remainder %= WHEEL_DELTA;
+    return steps;
+}
+
+DWORD PercentToRaw(DWORD minimum, DWORD maximum, int percent) {
+    if (maximum <= minimum) return minimum;
+    const double fraction = std::clamp(percent, 0, 100) / 100.0;
+    return minimum + static_cast<DWORD>(std::lround(
+        static_cast<double>(maximum - minimum) * fraction));
+}
+} // namespace osd_input
+
 // Optional native XAML volume renderer. WinRT and HWND ownership stay entirely
 // on a dedicated STA. The existing Hook/UI threads exchange only value data.
 namespace xaml_volume {
@@ -850,7 +878,7 @@ void SendInput(State& state, InputAction action, int value) {
     g_inputQueue.push_back(command);
     ReleaseSRWLockExclusive(&g_inputLock);
     if (!PostMessageW(state.current.receiver, kInputMessage, 0, 0)) {
-        Wh_Log(L"XAML v1.0.17: input post failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.18: input post failed (%lu)", GetLastError());
     }
 }
 
@@ -907,19 +935,19 @@ void DragTrack(State& state, HWND hwnd, LPARAM lp) {
     if (!GetWindowRect(state.host, &rect)) return;
     const double x = (pt.x - rect.left) / state.scale;
     const double y = (pt.y - rect.top) / state.scale;
-    const double fraction = state.current.vertical
-        ? (state.trackY + state.trackH - y) / state.trackH
-        : (x - state.trackX) / state.trackW;
-    const int percent = std::clamp(static_cast<int>(std::lround(
-        std::clamp(fraction, 0.0, 1.0) * 100.0)), 0, 100);
+    const bool vertical = state.current.vertical;
+    const int percent = osd_input::TrackPercent(
+        vertical ? y : x,
+        vertical ? state.trackY : state.trackX,
+        vertical ? state.trackH : state.trackW,
+        vertical);
     if (percent == state.current.percent) return;
     state.current.percent = percent;
     if (state.current.kind == LevelKind::DdcBrightness) {
         const auto min = state.current.minimum;
         const auto max = state.current.maximum;
-        state.current.rawValue = static_cast<int>(min +
-            static_cast<DWORD>(std::lround(
-                static_cast<double>(max - min) * percent / 100.0)));
+        state.current.rawValue = static_cast<int>(
+            osd_input::PercentToRaw(min, max, percent));
     } else state.current.rawValue = percent;
     SendInput(state, InputAction::SetPercent, percent);
     // Keep the preview responsive even when a DDC/CI write is pending.
@@ -974,9 +1002,8 @@ bool HandleInputWindow(State& state, HWND hwnd, UINT message,
         }
         case WM_MOUSEWHEEL:
             if (bar) {
-                state.wheelRemainder += GET_WHEEL_DELTA_WPARAM(wp);
-                const int steps = state.wheelRemainder / WHEEL_DELTA;
-                state.wheelRemainder %= WHEEL_DELTA;
+                const int steps = osd_input::ConsumeWheelSteps(
+                    GET_WHEEL_DELTA_WPARAM(wp), state.wheelRemainder);
                 if (steps)
                     SendInput(state, InputAction::Wheel, steps * WHEEL_DELTA);
                 if (state.host) {
@@ -1283,7 +1310,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
 
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.17: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.18: show failed (%lu)", GetLastError());
         return;
     }
     PositionInputs(state, x, y);
@@ -1311,13 +1338,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.17: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.18: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.17: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.18: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
@@ -1433,7 +1460,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     // remains non-layered so its compositor-anti-aliased corners work.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
-    Wh_Log(L"XAML v1.0.17: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+    Wh_Log(L"XAML v1.0.18: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
         static_cast<unsigned long>(rounded),
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
@@ -1470,7 +1497,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     state.barInput = makeInput();
     state.iconInput = makeInput();
     if (!state.barInput || !state.iconInput)
-        Wh_Log(L"XAML v1.0.17: an input overlay could not be created");
+        Wh_Log(L"XAML v1.0.18: an input overlay could not be created");
 }
 
 void CloseSurface(State& state) {
@@ -1492,7 +1519,7 @@ void CloseSurface(State& state) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.17: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.18: island close failed"); }
         state.source = nullptr;
     }
     state.island = nullptr;
@@ -1527,7 +1554,7 @@ void DeliverPending(State& root) {
             try {
                 CreateSurface(*fresh, GetModuleHandleW(nullptr));
             } catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.17: DDC target create failed 0x%08lX",
+                Wh_Log(L"XAML v1.0.18: DDC target create failed 0x%08lX",
                     static_cast<unsigned long>(ex.code()));
                 CloseSurface(*fresh);
                 continue;
@@ -1552,7 +1579,7 @@ void TryEnableIslandTransparency() {
     try {
         auto currentWindow = wx::Window::Current();
         if (!currentWindow) {
-            Wh_Log(L"XAML v1.0.17: Window.Current unavailable for transparency");
+            Wh_Log(L"XAML v1.0.18: Window.Current unavailable for transparency");
             return;
         }
         ComPtr<IXamlSourceTransparency> transparency;
@@ -1561,10 +1588,10 @@ void TryEnableIslandTransparency() {
             reinterpret_cast<void**>(transparency.GetAddressOf()));
         if (SUCCEEDED(hr) && transparency)
             hr = transparency->put_IsBackgroundTransparent(1);
-        Wh_Log(L"XAML v1.0.17: Island transparency HRESULT=0x%08lX",
+        Wh_Log(L"XAML v1.0.18: Island transparency HRESULT=0x%08lX",
             static_cast<unsigned long>(hr));
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.17: transparency initialization exception 0x%08lX",
+        Wh_Log(L"XAML v1.0.18: transparency initialization exception 0x%08lX",
             static_cast<unsigned long>(ex.code()));
     }
 }
@@ -1597,7 +1624,7 @@ DWORD WINAPI ThreadProc(void*) {
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.17: renderer ready (per-display DDC)");
+                Wh_Log(L"XAML v1.0.18: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -1606,11 +1633,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.17: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.18: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.17: unexpected startup exception");
+        Wh_Log(L"XAML v1.0.18: unexpected startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -1619,7 +1646,7 @@ DWORD WINAPI ThreadProc(void*) {
     CloseSurface(root);
     if (root.manager) {
         try { root.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.17: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.18: manager close failed"); }
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
@@ -1633,7 +1660,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.17: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.18: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -5305,7 +5332,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
                 FindMonitorByDeviceName(target.event.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
-                Wh_Log(L"XAML v1.0.17: unresolved DDC display '%s'",
+                Wh_Log(L"XAML v1.0.18: unresolved DDC display '%s'",
                        target.event.device);
                 continue;
             }
@@ -5318,13 +5345,13 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
             push(master, anchor, g_scale);
     }
     if (batch.empty()) {
-        Wh_Log(L"XAML v1.0.17: no resolvable DDC snapshots");
+        Wh_Log(L"XAML v1.0.18: no resolvable DDC snapshots");
         xaml_volume::Hide();
         return false;
     }
     const bool ok = xaml_volume::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.17: DDC batch not delivered; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.18: DDC batch not delivered; NO GDI+ fallback");
     return ok;
 }
 
@@ -5670,8 +5697,8 @@ void SetBrightnessBarPercent(int percent) {
     } else if (g_popupKind == PopupKind::DdcBrightness) {
         if (g_visible.maximum <= g_visible.minimum) return;
         const DWORD range = g_visible.maximum - g_visible.minimum;
-        const DWORD next = g_visible.minimum + static_cast<DWORD>(
-            std::lround(static_cast<double>(range) * percent / 100.0));
+        const DWORD next = osd_input::PercentToRaw(
+            g_visible.minimum, g_visible.maximum, percent);
         if (next == g_visible.value) return;
         if (!g_lastConfirmedDdcBrightness)
             g_lastConfirmedDdcBrightness = g_visible.value;
@@ -5697,11 +5724,12 @@ void SetMainBarFromPointer(HWND hwnd, LPARAM lp) {
     if (!GetWindowRect(g_popupWnd, &popup)) return;
     const float x = (screenPoint.x - popup.left) / g_scale;
     const float y = (screenPoint.y - popup.top) / g_scale;
-    const float fraction = g_verticalVolumeBrightness.load()
-        ? (track.y + track.h - y) / track.h
-        : (x - track.x) / track.w;
-    const int percent = std::clamp(static_cast<int>(std::lround(
-        std::clamp(fraction, 0.0f, 1.0f) * 100.0f)), 0, 100);
+    const bool vertical = g_verticalVolumeBrightness.load();
+    const int percent = osd_input::TrackPercent(
+        vertical ? y : x,
+        vertical ? track.y : track.x,
+        vertical ? track.h : track.w,
+        vertical);
     if (g_popupKind == PopupKind::NativeVolume)
         SetDefaultAudioBarPercent(percent);
     else
@@ -5714,9 +5742,8 @@ void HandleMainBarWheel(int delta) {
         g_barWheelKind = static_cast<int>(g_popupKind);
         g_barWheelRemainder = 0;
     }
-    g_barWheelRemainder += delta;
-    const int steps = g_barWheelRemainder / WHEEL_DELTA;
-    g_barWheelRemainder %= WHEEL_DELTA;
+    const int steps = osd_input::ConsumeWheelSteps(
+        delta, g_barWheelRemainder);
     if (!steps) return;
     if (g_popupKind == PopupKind::NativeVolume)
         AdjustDefaultAudioWheel(steps);
@@ -7700,7 +7727,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     HideGdiLevelForXaml();
     RECT target{};
     if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-        Wh_Log(L"Fluent OSD v1.0.17: XAML %s missing anchor",
+        Wh_Log(L"Fluent OSD v1.0.18: XAML %s missing anchor",
                brightness ? L"brightness" : L"volume");
         return;
     }
@@ -7710,13 +7737,13 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     const int index = brightness ? 1 : 0;
     if (xaml_volume::Show(snapshot)) {
         if (!routeLogged[index]) {
-            Wh_Log(L"Fluent OSD v1.0.17: native %s -> XAML only",
+            Wh_Log(L"Fluent OSD v1.0.18: native %s -> XAML only",
                    brightness ? L"brightness" : L"volume");
             routeLogged[index] = true;
         }
         unavailableLogged[index] = false;
     } else if (!unavailableLogged[index]) {
-        Wh_Log(L"Fluent OSD v1.0.17: XAML %s unavailable; NO GDI+ fallback",
+        Wh_Log(L"Fluent OSD v1.0.18: XAML %s unavailable; NO GDI+ fallback",
                brightness ? L"brightness" : L"volume");
         unavailableLogged[index] = true;
     }
@@ -7835,8 +7862,8 @@ void ProcessXamlInputs() {
                 (cmd.value / WHEEL_DELTA) * kWheelStepPercent;
         } else percent = cmd.value;
         percent = std::clamp(percent, 0, 100);
-        const DWORD raw = event.minimum + static_cast<DWORD>(
-            std::lround(static_cast<double>(range) * percent / 100.0));
+        const DWORD raw = osd_input::PercentToRaw(
+            event.minimum, event.maximum, percent);
         if (raw == event.value) continue;
 
         BrightnessWheelTask task{};
@@ -8042,7 +8069,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     _wcsicmp(g_visible.device,
                               g_xamlPendingDdcWrite.device) == 0)
                     g_visible.value = g_xamlPendingDdcPrevious;
-                Wh_Log(L"XAML v1.0.17: DDC write failed for '%s' index %lu",
+                Wh_Log(L"XAML v1.0.18: DDC write failed for '%s' index %lu",
                     g_xamlPendingDdcWrite.device,
                     g_xamlPendingDdcWrite.physicalIndex);
                 if (g_popupKind == PopupKind::DdcBrightness)
@@ -8800,7 +8827,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.17 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.18 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
