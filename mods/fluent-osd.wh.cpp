@@ -2663,9 +2663,39 @@ void DeliverPending(State& root) {
     ReleaseSRWLockExclusive(&g_snapshotLock);
     if (batch.empty()) return;
 
+    // Composite Mixer: primary volume card plus a second native XAML
+    // panel Island, both updated from a single owned snapshot batch.
+    if (batch.size() == 2 && batch.front().kind == LevelKind::Volume &&
+        batch.back().kind == LevelKind::Mixer) {
+        for (auto& peer : root.peers)
+            if (peer.first != L"mixer") HideSurface(*peer.second);
+        DrawSnapshot(root, batch.front());
+        auto found = root.peers.find(L"mixer");
+        if (found == root.peers.end()) {
+            auto fresh = std::make_unique<State>();
+            try { CreateSurface(*fresh, GetModuleHandleW(nullptr)); }
+            catch (const winrt::hresult_error& ex) {
+                Wh_Log(L"XAML Mixer host create failed: 0x%08lX",
+                    static_cast<unsigned long>(ex.code()));
+                CloseSurface(*fresh);
+                return;
+            }
+            found = root.peers.emplace(L"mixer", std::move(fresh)).first;
+        }
+        DrawSnapshot(*found->second, batch.back());
+        return;
+    }
     const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
     if (!ddc) {
-        for (auto& peer : root.peers) HideSurface(*peer.second);
+        for (auto it = root.peers.begin(); it != root.peers.end();) {
+            if (it->first == L"mixer") {
+                CloseSurface(*it->second);
+                it = root.peers.erase(it);
+            } else {
+                HideSurface(*it->second);
+                ++it;
+            }
+        }
         DrawSnapshot(root, batch.back());
         return;
     }
