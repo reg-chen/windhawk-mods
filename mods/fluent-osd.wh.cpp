@@ -3835,6 +3835,7 @@ void ShowPanel();
 void ShowNotice(std::wstring, std::wstring, DurationKind, NoticeIcon);
 void ShowMigratedXamlDeviceNotice(DurationKind);
 void ShowMigratedXamlClipboardNotice();
+void ResetXamlMixerController();
 std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot();
 namespace bt_monitor {
     void Start();
@@ -6530,6 +6531,8 @@ xaml_osd::Snapshot MakeXamlStatusSnapshot(
 }
 
 void HideGdiLevelForXaml() {
+    if (g_popupKind != PopupKind::NativeVolume && g_xamlMixerOpen)
+        ResetXamlMixerController();
     if (g_popupWnd) {
         KillTimer(g_popupWnd, kHideTimer);
         KillTimer(g_popupWnd, kFadeTimer);
@@ -7414,6 +7417,19 @@ void StopMixerOutputNotifications() {
     }
     g_mixerNotify.Reset();
     g_mixerNotifyEnumerator.Reset();
+}
+
+void ResetXamlMixerController() {
+    if (!g_xamlMixerOpen) return;
+    g_xamlMixerOpen = false;
+    g_xamlMixerOutputExpanded = false;
+    StopMixerOutputNotifications();
+    CleanupMixerIcons();
+    g_mixerEntries.clear();
+    g_mixerMaster.Reset();
+    g_mixerOutputOptions.clear();
+    ++g_xamlMixerGeneration; // Discard commands from the old Mixer Island.
+    if (!g_xamlMixerGeneration) ++g_xamlMixerGeneration;
 }
 
 void StartMixerOutputNotifications() {
@@ -9376,12 +9392,7 @@ ControlEffects ApplyOsdCommands(
         if (cmd.target == osd_control::Target::Mixer) {
             if (cmd.action == osd_control::Action::OpenMixer) {
                 if (g_xamlMixerOpen) {
-                    g_xamlMixerOpen = false;
-                    g_xamlMixerOutputExpanded = false;
-                    StopMixerOutputNotifications();
-                    CleanupMixerIcons();
-                    g_mixerEntries.clear();
-                    g_mixerMaster.Reset();
+                    ResetXamlMixerController();
                 } else if (g_showMixerArrow.load() &&
                            g_popupKind == PopupKind::NativeVolume) {
                     ClosePanel();
@@ -9396,12 +9407,7 @@ ControlEffects ApplyOsdCommands(
             if (cmd.action == osd_control::Action::CloseMixer) {
                 if (g_xamlMixerOpen &&
                     cmd.generation == g_xamlMixerGeneration) {
-                    g_xamlMixerOpen = false;
-                    g_xamlMixerOutputExpanded = false;
-                    StopMixerOutputNotifications();
-                    CleanupMixerIcons();
-                    g_mixerEntries.clear();
-                    g_mixerMaster.Reset();
+                    ResetXamlMixerController();
                     effects.mixer = true;
                 }
                 continue;
