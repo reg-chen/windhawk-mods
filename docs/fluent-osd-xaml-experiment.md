@@ -642,8 +642,7 @@ each OSD type.
   and writes via `PixelBuffer`/IBufferByteAccess, using the system
   `Image` control with uniform (non-distorting) scaling. The source
   thumbnail `HBITMAP` is immediately deleted after conversion.
-  See [Microsoft's WriteableBitmap pixel-buffer API]
-  (https://learn.microsoft.com/en-us/uwp/api/windows.ui.xaml.media.imaging.writeablebitmap.pixelbuffer).
+  See [Microsoft's WriteableBitmap pixel-buffer API](https://learn.microsoft.com/en-us/uwp/api/windows.ui.xaml.media.imaging.writeablebitmap.pixelbuffer).
 - The image-first XAML card inherits configured background opacity,
   corner radius, monitor placement, font size, fade and expiry duration.
   Its image area and caption derive from card dimensions and padding.
@@ -660,6 +659,12 @@ each OSD type.
   ratio, long-title truncation, clipboard privacy, DPI, multiple
   displays, and Explorer unload/reload. No Windows visual tests were
   performed in the GitHub editing environment.
+- The shared `RefreshMirrorOutputs` path now skips creating old GDI+
+  replica windows for every migrated XAML popup (volume, brightness, lock
+  keys, native system events, USB/Bluetooth/network and clipboard).
+  Remaining GDI+ mirror code is temporary for unported media/mixer
+  paths; native XAML multi-display mirroring requires separate testing.
+
 - **Legacy cleanup:** this experimental build still retains GDI+
   rendering when the XAML toggle is explicitly disabled. Upon passing
   runtime regression, remove the migrated category's GDI+ draw path,
