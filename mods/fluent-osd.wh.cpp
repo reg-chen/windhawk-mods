@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.20
+// @version         1.0.21
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.20)
+## XAML migration experiment (v1.0.21)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -30,13 +30,14 @@ Explorer functions. Restore the official `@id fluent-osd` only when
 merging the renderer back into the production branch.
 
 Branch-only native XAML Island renderer for migrated categories:
-**system volume, native brightness, per-target DDC/CI brightness and lock-key status**.
+**system volume, native brightness, per-target DDC/CI brightness, lock-key status and passive USB/Bluetooth/network notices**.
 The existing XAML toggle selects the migrated renderer (no GDI+ fallback).
 Opacity inherits the original background-opacity setting; Native XAML pointer gestures
 relay clicks/drags/wheels to the existing audio and brightness
 workers. DDC targets have independent XAML hosts and their original
 monitor identity. Caps/Num/Scroll/Insert now use a shared XAML status card.
-Media/mixer/USB/Bluetooth/network/clipboard notices remain GDI+ until migrated.
+Single-item USB/Bluetooth/network notices use system Fluent glyphs on XAML;
+aggregated clickable notices, media/mixer/clipboard remain GDI+ until migrated.
 
 ## Features
 
@@ -787,7 +788,7 @@ std::mutex g_startLock;
 SRWLOCK g_snapshotLock = SRWLOCK_INIT;
 HANDLE g_thread = nullptr;
 
-enum class LevelKind { Volume, NativeBrightness, DdcBrightness, LockStatus };
+enum class LevelKind { Volume, NativeBrightness, DdcBrightness, LockStatus, NoticeStatus };
 struct Snapshot {
     LevelKind kind = LevelKind::Volume;
     std::wstring key;       // Nonempty for a physical DDC display/window.
@@ -799,6 +800,7 @@ struct Snapshot {
     bool valueKnown = true;
     bool muted = false;
     bool statusActive = false;
+    bool statusFontIcon = false;
     std::wstring statusTitle, statusDetail, statusGlyph;
     bool brightness = false;
     bool showIcon = true;
@@ -908,7 +910,7 @@ void SendInput(State& state, InputAction action, int value) {
     g_inputQueue.push_back(command);
     ReleaseSRWLockExclusive(&g_inputLock);
     if (!PostMessageW(state.current.receiver, kInputMessage, 0, 0)) {
-        Wh_Log(L"XAML v1.0.20: input post failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.21: input post failed (%lu)", GetLastError());
     }
 }
 
@@ -980,7 +982,8 @@ void DragTrack(State& state, double x, double y) {
 
 void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.canvas || !state.host ||
-        state.current.kind == LevelKind::LockStatus) return;
+        (state.current.kind == LevelKind::LockStatus ||
+         state.current.kind == LevelKind::NoticeStatus)) return;
     const auto point = args.GetCurrentPoint(state.canvas);
     if (!point.Properties().IsLeftButtonPressed()) return;
     const auto pos = point.Position();
@@ -1034,7 +1037,8 @@ void PointerCancelled(State& state) {
 
 void PointerWheel(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.current.valueKnown ||
-        state.current.kind == LevelKind::LockStatus) return;
+        (state.current.kind == LevelKind::LockStatus ||
+         state.current.kind == LevelKind::NoticeStatus)) return;
     const int delta = args.GetCurrentPoint(state.canvas)
         .Properties().MouseWheelDelta();
     const int steps = osd_input::ConsumeWheelSteps(delta, state.wheelRemainder);
@@ -1126,7 +1130,7 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
     }
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.20: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.21: show failed (%lu)", GetLastError());
         return;
     }
     if (!wasVisible) {
@@ -1270,7 +1274,14 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.statusGlyph.Visibility(wx::Visibility::Visible);
     state.statusTitle.Visibility(wx::Visibility::Visible);
     state.statusDetail.Visibility(wx::Visibility::Visible);
-    state.statusUnderline.Visibility(wx::Visibility::Visible);
+    const bool lock = value.kind == LevelKind::LockStatus;
+    state.statusUnderline.Visibility(lock
+        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+    if (!lock) {
+        if (state.statusLineAnimating && state.host)
+            KillTimer(state.host, kStatusLineTimer);
+        state.statusLineAnimating = false;
+    }
 
     state.statusTile.Width(tileSize);
     state.statusTile.Height(tileSize);
@@ -1282,13 +1293,17 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     controls::Canvas::SetLeft(state.statusTile, tileX);
     controls::Canvas::SetTop(state.statusTile, tileY);
 
+    state.statusGlyph.FontFamily(media::FontFamily{
+        value.statusFontIcon ? L"Segoe Fluent Icons" : L"Segoe UI"});
     state.statusGlyph.Text(winrt::hstring(value.statusGlyph));
-    state.statusGlyph.FontSize(value.statusGlyph.size() > 1
-        ? std::clamp(value.fontSize, 12, 24)
-        : std::clamp(value.iconSize + 7, 16, 32));
-    state.statusGlyph.Foreground(Brush(value.statusActive
-        ? value.accent : value.text,
-        value.statusActive ? 255 : 195));
+    state.statusGlyph.FontSize(value.statusFontIcon
+        ? std::clamp(tileSize * .53, 15.0, 32.0)
+        : static_cast<double>(value.statusGlyph.size() > 1
+            ? std::clamp(value.fontSize, 12, 24)
+            : std::clamp(value.iconSize + 7, 16, 32)));
+    state.statusGlyph.Foreground(Brush(
+        value.statusFontIcon || value.statusActive ? value.accent : value.text,
+        value.statusFontIcon || value.statusActive ? 255 : 195));
     state.statusTitle.Text(winrt::hstring(value.statusTitle));
     state.statusDetail.Text(winrt::hstring(value.statusDetail));
     const int titleFont = std::clamp(value.fontSize, 10, 24);
@@ -1316,7 +1331,8 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     // its gap to the underline rather than overlapping either element.
     const double availableTextTop = std::max(0.0,
         underlineTop - lineGap - textBlockH);
-    const double top = std::min(centeredTextTop, availableTextTop);
+    const double top = lock ? std::min(centeredTextTop, availableTextTop)
+                            : centeredTextTop;
     controls::Canvas::SetLeft(state.statusTitle, textX);
     controls::Canvas::SetTop(state.statusTitle, top);
     controls::Canvas::SetLeft(state.statusDetail, textX);
@@ -1328,14 +1344,16 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.statusUnderline.RadiusY(lineHeight / 2.0);
     state.statusUnderline.Fill(Brush(value.accent));
     controls::Canvas::SetTop(state.statusUnderline, underlineTop);
-    TransitionStatusUnderline(state, sameVisibleStatus, value.statusActive,
-                              textX, textW);
+    if (lock)
+        TransitionStatusUnderline(state, sameVisibleStatus,
+                                  value.statusActive, textX, textW);
     state.current = value;
     ShowPositionedSurface(state, value, insetX, insetY, bodyW, bodyH);
 }
 
 void DrawSnapshot(State& state, const Snapshot& value) {
-    if (value.kind == LevelKind::LockStatus) {
+    if (value.kind == LevelKind::LockStatus ||
+        value.kind == LevelKind::NoticeStatus) {
         DrawStatusSnapshot(state, value);
         return;
     }
@@ -1579,13 +1597,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.20: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.21: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.20: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.21: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
@@ -1782,7 +1800,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     // Island; the XAML Border provides the only visible card background.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
-    Wh_Log(L"XAML v1.0.20: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+    Wh_Log(L"XAML v1.0.21: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
         static_cast<unsigned long>(rounded),
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
@@ -1819,7 +1837,7 @@ void CloseSurface(State& state) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.20: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.21: island close failed"); }
         state.source = nullptr;
     }
     state.island = nullptr;
@@ -1854,7 +1872,7 @@ void DeliverPending(State& root) {
             try {
                 CreateSurface(*fresh, GetModuleHandleW(nullptr));
             } catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.20: DDC target create failed 0x%08lX",
+                Wh_Log(L"XAML v1.0.21: DDC target create failed 0x%08lX",
                     static_cast<unsigned long>(ex.code()));
                 CloseSurface(*fresh);
                 continue;
@@ -1879,7 +1897,7 @@ void TryEnableIslandTransparency() {
     try {
         auto currentWindow = wx::Window::Current();
         if (!currentWindow) {
-            Wh_Log(L"XAML v1.0.20: Window.Current unavailable for transparency");
+            Wh_Log(L"XAML v1.0.21: Window.Current unavailable for transparency");
             return;
         }
         ComPtr<IXamlSourceTransparency> transparency;
@@ -1888,10 +1906,10 @@ void TryEnableIslandTransparency() {
             reinterpret_cast<void**>(transparency.GetAddressOf()));
         if (SUCCEEDED(hr) && transparency)
             hr = transparency->put_IsBackgroundTransparent(1);
-        Wh_Log(L"XAML v1.0.20: Island transparency HRESULT=0x%08lX",
+        Wh_Log(L"XAML v1.0.21: Island transparency HRESULT=0x%08lX",
             static_cast<unsigned long>(hr));
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.20: transparency initialization exception 0x%08lX",
+        Wh_Log(L"XAML v1.0.21: transparency initialization exception 0x%08lX",
             static_cast<unsigned long>(ex.code()));
     }
 }
@@ -1924,7 +1942,7 @@ DWORD WINAPI ThreadProc(void*) {
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.20: renderer ready (per-display DDC)");
+                Wh_Log(L"XAML v1.0.21: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -1933,11 +1951,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.20: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.21: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.20: unexpected startup exception");
+        Wh_Log(L"XAML v1.0.21: unexpected startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -1946,7 +1964,7 @@ DWORD WINAPI ThreadProc(void*) {
     CloseSurface(root);
     if (root.manager) {
         try { root.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.20: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.21: manager close failed"); }
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
@@ -1960,7 +1978,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.20: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.21: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -2963,6 +2981,7 @@ void UpdateSpeakerHitWindow();
 void FlushNoticeBatch();
 void ShowPanel();
 void ShowNotice(std::wstring, std::wstring, DurationKind, NoticeIcon);
+void ShowMigratedXamlDeviceNotice(DurationKind);
 std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot();
 namespace bt_monitor {
     void Start();
@@ -4445,6 +4464,14 @@ void ShowNotice(std::wstring title, std::wstring body, DurationKind kind,
     g_noticeIcon = icon;
     BrightnessEvent ev{};
     MovePopupToDisplay(ev);
+    // Keep multi-device detail cards on the existing interactive renderer.
+    // Only passive single-item hardware notices use the XAML status card.
+    if (g_xamlForMigrated.load() && !g_noticeClickable &&
+        (icon == NoticeIcon::Usb || icon == NoticeIcon::Bluetooth ||
+         icon == NoticeIcon::Network)) {
+        ShowMigratedXamlDeviceNotice(kind);
+        return;
+    }
     SetNoticeHitTesting(g_noticeClickable);
     ShowPopupAnimated();
     UpdateArrowHitWindow();
@@ -5647,7 +5674,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
                 FindMonitorByDeviceName(target.event.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
-                Wh_Log(L"XAML v1.0.20: unresolved DDC display '%s'",
+                Wh_Log(L"XAML v1.0.21: unresolved DDC display '%s'",
                        target.event.device);
                 continue;
             }
@@ -5660,13 +5687,13 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
             push(master, anchor, g_scale);
     }
     if (batch.empty()) {
-        Wh_Log(L"XAML v1.0.20: no resolvable DDC snapshots");
+        Wh_Log(L"XAML v1.0.21: no resolvable DDC snapshots");
         xaml_osd::Hide();
         return false;
     }
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.20: DDC batch not delivered; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.21: DDC batch not delivered; NO GDI+ fallback");
     return ok;
 }
 
@@ -8054,7 +8081,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     HideGdiLevelForXaml();
     RECT target{};
     if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-        Wh_Log(L"Fluent OSD v1.0.20: XAML %s missing anchor",
+        Wh_Log(L"Fluent OSD v1.0.21: XAML %s missing anchor",
                brightness ? L"brightness" : L"volume");
         return;
     }
@@ -8064,13 +8091,13 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     const int index = brightness ? 1 : 0;
     if (xaml_osd::Show(snapshot)) {
         if (!routeLogged[index]) {
-            Wh_Log(L"Fluent OSD v1.0.20: native %s -> XAML only",
+            Wh_Log(L"Fluent OSD v1.0.21: native %s -> XAML only",
                    brightness ? L"brightness" : L"volume");
             routeLogged[index] = true;
         }
         unavailableLogged[index] = false;
     } else if (!unavailableLogged[index]) {
-        Wh_Log(L"Fluent OSD v1.0.20: XAML %s unavailable; NO GDI+ fallback",
+        Wh_Log(L"Fluent OSD v1.0.21: XAML %s unavailable; NO GDI+ fallback",
                brightness ? L"brightness" : L"volume");
         unavailableLogged[index] = true;
     }
@@ -8083,7 +8110,7 @@ void ShowMigratedXamlLockStatus() {
     HideGdiLevelForXaml();
     RECT target{};
     if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-        Wh_Log(L"XAML v1.0.20: lock status missing placement anchor");
+        Wh_Log(L"XAML v1.0.21: lock status missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlSnapshot(
@@ -8097,7 +8124,37 @@ void ShowMigratedXamlLockStatus() {
     snapshot.statusActive = g_lastLockValue;
     snapshot.durationMs = OsdDuration(DurationKind::LockKeys);
     if (!xaml_osd::Show(snapshot))
-        Wh_Log(L"XAML v1.0.20: lock status unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.21: lock status unavailable; NO GDI+ fallback");
+}
+
+// Single-item USB/Bluetooth/network notices are noninteractive; their event
+// identity and debounce still belong to the existing notice engine. Native
+// XAML uses installed Segoe Fluent Icons instead of bundling icon assets.
+void ShowMigratedXamlDeviceNotice(DurationKind duration) {
+    HideGdiLevelForXaml();
+    RECT target{};
+    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
+        Wh_Log(L"XAML v1.0.21: device notice missing placement anchor");
+        return;
+    }
+    auto snapshot = MakeXamlSnapshot(
+        PopupKind::NativeBrightness, target, g_scale);
+    snapshot.kind = xaml_osd::LevelKind::NoticeStatus;
+    snapshot.brightness = false;
+    snapshot.valueKnown = false;
+    snapshot.showValue = false;
+    snapshot.statusFontIcon = true;
+    snapshot.statusTitle = g_noticeTitle;
+    snapshot.statusDetail = g_noticeBody;
+    snapshot.durationMs = OsdDuration(duration);
+    switch (g_noticeIcon) {
+        case NoticeIcon::Bluetooth: snapshot.statusGlyph = L"\uE702"; break;
+        case NoticeIcon::Usb:       snapshot.statusGlyph = L"\uE88E"; break;
+        case NoticeIcon::Network:   snapshot.statusGlyph = L"\uE968"; break;
+        default: return;
+    }
+    if (!xaml_osd::Show(snapshot))
+        Wh_Log(L"XAML v1.0.21: device notice unavailable; NO GDI+ fallback");
 }
 
 void ShowNativeVolumePopup() {
@@ -8431,7 +8488,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (target != g_ddcTargets.end())
                     target->event.value = write.previousValue;
                 if (master) g_visible.value = write.previousValue;
-                Wh_Log(L"XAML v1.0.20: DDC write failed for '%s' index %lu",
+                Wh_Log(L"XAML v1.0.21: DDC write failed for '%s' index %lu",
                     write.event.device, write.event.physicalIndex);
                 if (g_popupKind == PopupKind::DdcBrightness)
                     (void)ShowXamlDdcTargets(g_visible);
@@ -9197,7 +9254,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.20 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.21 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
