@@ -802,6 +802,9 @@ struct Snapshot {
     bool statusActive = false;
     bool statusFontIcon = false;
     std::wstring statusTitle, statusDetail, statusGlyph;
+    std::wstring noticeDetailsHeading;
+    std::vector<std::wstring> noticeDetails;
+    DWORD noticeInteractiveDurationMs = 8000;
     bool brightness = false;
     bool showIcon = true;
     BYTE backgroundAlpha = 255;
@@ -867,6 +870,12 @@ struct State {
     controls::TextBlock statusGlyph{nullptr}, statusTitle{nullptr},
                         statusDetail{nullptr};
     shapes::Rectangle statusUnderline{nullptr};
+    controls::TextBlock noticeChevron{nullptr}, noticeHeading{nullptr};
+    controls::ScrollViewer noticeScroll{nullptr};
+    controls::StackPanel noticeRows{nullptr};
+    bool noticeExpanded = false;
+    double noticeHeaderH = 0;
+    DWORD noticeNormalDurationMs = 3000;
     // Width is a ratio of the current text column; its center stays fixed.
     // The previous interpolated ratio is retained for interruption/reversal.
     bool statusLineAnimating = false;
@@ -892,6 +901,7 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
 
 void DrawSnapshot(State&, const Snapshot&);
 void DrawStatusSnapshot(State&, const Snapshot&);
+void ToggleNoticeDetails(State&);
 
 // All audio/WMI/DDC writes stay on the original Explorer OSD UI thread.
 // The STA handles pointer geometry and sends only bounded POD commands.
@@ -921,6 +931,7 @@ void HideSurface(State& state) {
         KillTimer(state.host, kStatusLineTimer);
     }
     state.statusLineAnimating = false;
+    state.noticeExpanded = false;
     if (state.canvas) state.canvas.ReleasePointerCaptures();
     // CaptureLost may invoke the shared interaction callback and restart
     // the inactivity timer. Cancel once more before hiding the HWND.
@@ -982,11 +993,20 @@ void DragTrack(State& state, double x, double y) {
 
 void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.canvas || !state.host ||
-        (state.current.kind == LevelKind::LockStatus ||
-         state.current.kind == LevelKind::NoticeStatus)) return;
+        state.current.kind == LevelKind::LockStatus) return;
     const auto point = args.GetCurrentPoint(state.canvas);
     if (!point.Properties().IsLeftButtonPressed()) return;
     const auto pos = point.Position();
+    if (state.current.kind == LevelKind::NoticeStatus) {
+        if (state.current.noticeDetails.size() <= 1 ||
+            pos.Y < 0 || pos.Y >= state.noticeHeaderH) return;
+        state.pointerActive = true;
+        state.activePointerId = args.Pointer().PointerId();
+        state.canvas.CapturePointer(args.Pointer());
+        ArmInteractionTimer(state, true);
+        args.Handled(true);
+        return;
+    }
     const double halo = std::max(6.0,
         static_cast<double>(state.current.thumbDiameter) / 2.0 + 3.0);
     const bool icon = state.current.kind == LevelKind::Volume &&
@@ -1019,6 +1039,23 @@ void PointerReleased(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.pointerActive || !state.canvas ||
         args.Pointer().PointerId() != state.activePointerId) return;
     const auto pos = args.GetCurrentPoint(state.canvas).Position();
+    if (state.current.kind == LevelKind::NoticeStatus) {
+        const bool activate = pos.Y >= 0 && pos.Y < state.noticeHeaderH;
+        state.pointerActive = false;
+        state.canvas.ReleasePointerCapture(args.Pointer());
+        if (activate) {
+            try { ToggleNoticeDetails(state); }
+            catch (const winrt::hresult_error& ex) {
+                Wh_Log(L"XAML notice details HRESULT 0x%08lX",
+                    static_cast<unsigned long>(ex.code()));
+            } catch (...) {
+                Wh_Log(L"XAML notice details unexpected exception");
+            }
+        }
+        ArmInteractionTimer(state, false);
+        args.Handled(true);
+        return;
+    }
     const bool click = state.iconPressed &&
         InHitRegion(pos.X, pos.Y, state.iconX, state.iconY,
                     state.iconW, state.iconH, 0.0);
@@ -1118,8 +1155,19 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
     const int hostH = std::max(28, static_cast<int>(std::lround(bodyH * scale)));
     const int x = value.anchor.left +
         static_cast<int>(std::lround(insetX * scale));
-    const int y = value.anchor.top +
+    int y = value.anchor.top +
         static_cast<int>(std::lround(insetY * scale));
+    if (value.kind == LevelKind::NoticeStatus && bodyH >
+        static_cast<double>(value.anchor.bottom - value.anchor.top) / scale -
+            2.0 * insetY + .5) {
+        MONITORINFO mi{sizeof(mi)};
+        if (GetMonitorInfoW(MonitorFromRect(&value.anchor,
+                MONITOR_DEFAULTTONEAREST), &mi)) {
+            const int top = static_cast<int>(mi.rcWork.top);
+            const int bottom = static_cast<int>(mi.rcWork.bottom);
+            y = std::clamp(y, top, std::max(top, bottom - hostH));
+        }
+    }
     const bool wasVisible = IsWindowVisible(state.host) != FALSE;
     if (!wasVisible)
         state.card.Opacity(value.fadeEnabled ? 0.0 : 1.0);
@@ -1220,17 +1268,103 @@ void TransitionStatusUnderline(State& state, bool sameVisibleStatus,
     }
 }
 
+
+void UpdateNoticeDetails(State& state, const Snapshot& value,
+                         double bodyW, double headerH, double pad,
+                         double insetY, double& totalBodyH) {
+    const bool clickable = value.kind == LevelKind::NoticeStatus &&
+        value.noticeDetails.size() > 1;
+    state.noticeHeaderH = headerH;
+    state.noticeChevron.Visibility(clickable
+        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+    state.noticeChevron.Text(state.noticeExpanded ? L"\u2303" : L"\u2304");
+    state.noticeChevron.Foreground(Brush(value.accent));
+    state.noticeChevron.FontSize(std::clamp(value.fontSize + 4, 14, 26));
+    const double arrowW = std::max(15.0, pad * 1.7);
+    state.noticeChevron.Width(arrowW);
+    controls::Canvas::SetLeft(state.noticeChevron,
+        std::max(0.0, bodyW - pad - arrowW));
+    controls::Canvas::SetTop(state.noticeChevron,
+        std::max(0.0, (headerH - value.fontSize * 1.45) / 2.0));
+    const bool expanded = clickable && state.noticeExpanded;
+    state.noticeHeading.Visibility(expanded
+        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+    state.noticeScroll.Visibility(expanded
+        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+    if (!expanded) {
+        totalBodyH = headerH;
+        return;
+    }
+    const double rowH = std::max(26.0, value.fontSize * 1.8);
+    const double headingH = std::max(20.0, value.fontSize * 1.5);
+    const double scale = std::clamp(
+        static_cast<double>(value.scale), 0.5, 6.0);
+    MONITORINFO mi{sizeof(mi)};
+    const HMONITOR monitor = MonitorFromRect(&value.anchor,
+                                            MONITOR_DEFAULTTONEAREST);
+    const double screenH = GetMonitorInfoW(monitor, &mi)
+        ? (mi.rcWork.bottom - mi.rcWork.top) / scale : 640.0;
+    const double maxExtra = std::max(rowH,
+        screenH - headerH - 2.0 * insetY - 3.0 * pad);
+    const double viewportH = std::min({
+        static_cast<double>(value.noticeDetails.size()) * rowH,
+        6.0 * rowH,
+        std::max(rowH, maxExtra - headingH - 2.0 * pad)});
+    totalBodyH = headerH + headingH + viewportH + 2.0 * pad;
+    state.noticeHeading.Text(winrt::hstring(value.noticeDetailsHeading));
+    state.noticeHeading.FontSize(std::clamp(value.fontSize, 11, 22));
+    state.noticeHeading.Foreground(Brush(value.text));
+    state.noticeHeading.Width(std::max(1.0, bodyW - 2.0 * pad));
+    controls::Canvas::SetLeft(state.noticeHeading, pad);
+    controls::Canvas::SetTop(state.noticeHeading, headerH + pad * .5);
+    state.noticeScroll.Width(std::max(1.0, bodyW - 2.0 * pad));
+    state.noticeScroll.Height(viewportH);
+    controls::Canvas::SetLeft(state.noticeScroll, pad);
+    controls::Canvas::SetTop(state.noticeScroll,
+        headerH + pad + headingH);
+    state.noticeRows.Children().Clear();
+    for (const auto& name : value.noticeDetails) {
+        controls::TextBlock row;
+        row.Text(winrt::hstring(name));
+        row.Width(std::max(1.0, bodyW - 3.0 * pad));
+        row.Height(rowH);
+        row.FontSize(std::clamp(value.fontSize - 2, 10, 18));
+        row.Foreground(Brush(value.text));
+        row.TextTrimming(wx::TextTrimming::CharacterEllipsis);
+        state.noticeRows.Children().Append(row);
+    }
+}
+
+void ToggleNoticeDetails(State& state) {
+    if (state.current.kind != LevelKind::NoticeStatus ||
+        state.current.noticeDetails.size() <= 1) return;
+    state.noticeExpanded = !state.noticeExpanded;
+    const Snapshot snapshot = state.current;
+    DrawStatusSnapshot(state, snapshot);
+}
+
 void DrawStatusSnapshot(State& state, const Snapshot& value) {
     if (!state.host || !state.card || !state.canvas ||
         !state.statusTile || !state.statusTitle || !state.statusGlyph ||
-        !state.statusDetail || !state.statusUnderline) return;
+        !state.statusDetail || !state.statusUnderline ||
+        !state.noticeScroll || !state.noticeRows ||
+        !state.noticeHeading || !state.noticeChevron) return;
     if (state.pointerActive && state.canvas)
         state.canvas.ReleasePointerCaptures();
     // Sample previous value before overwriting the key and toggle state.
+    const bool visible = IsWindowVisible(state.host) != FALSE;
     const bool sameVisibleStatus =
-        IsWindowVisible(state.host) &&
-        state.current.kind == LevelKind::LockStatus &&
+        visible && state.current.kind == LevelKind::LockStatus &&
         state.current.statusTitle == value.statusTitle;
+    const bool sameNotice =
+        visible && state.current.kind == LevelKind::NoticeStatus &&
+        value.kind == LevelKind::NoticeStatus &&
+        state.current.statusTitle == value.statusTitle &&
+        state.current.noticeDetails == value.noticeDetails;
+    if (!sameNotice) {
+        state.noticeExpanded = false;
+        state.noticeNormalDurationMs = value.durationMs;
+    }
     state.wheelRemainder = 0;
     state.dragging = state.iconPressed = state.pointerActive = false;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
@@ -1252,11 +1386,16 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
         std::min(bodyH - 2.0 * pad, bodyH * .69));
     const double tileX = pad, tileY = (bodyH - tileSize) / 2.0;
     const double textX = tileX + tileSize + pad;
-    const double textW = std::max(1.0, bodyW - textX - pad);
+    const bool clickableNotice =
+        value.kind == LevelKind::NoticeStatus &&
+        value.noticeDetails.size() > 1;
+    const double arrowSpace = clickableNotice
+        ? std::max(15.0, pad * 1.7) : 0.0;
+    const double textW = std::max(1.0,
+        bodyW - textX - pad - arrowSpace);
 
-    state.canvas.IsHitTestVisible(false);
+    state.canvas.IsHitTestVisible(clickableNotice);
     state.canvas.Width(bodyW);
-    state.canvas.Height(bodyH);
     state.card.Background(Brush(value.background, value.backgroundAlpha));
     const double radius = static_cast<double>(
         std::clamp(value.cornerRadius, 0, 34));
@@ -1347,8 +1486,17 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     if (lock)
         TransitionStatusUnderline(state, sameVisibleStatus,
                                   value.statusActive, textX, textW);
+    double totalBodyH = bodyH;
+    UpdateNoticeDetails(state, value, bodyW, bodyH, pad,
+                        insetY, totalBodyH);
+    state.canvas.Height(totalBodyH);
     state.current = value;
-    ShowPositionedSurface(state, value, insetX, insetY, bodyW, bodyH);
+    if (clickableNotice && state.noticeExpanded)
+        state.current.durationMs = value.noticeInteractiveDurationMs;
+    else if (value.kind == LevelKind::NoticeStatus)
+        state.current.durationMs = state.noticeNormalDurationMs;
+    ShowPositionedSurface(state, state.current, insetX, insetY,
+                          bodyW, totalBodyH);
 }
 
 void DrawSnapshot(State& state, const Snapshot& value) {
@@ -1367,6 +1515,10 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     if (state.statusLineAnimating && state.host)
         KillTimer(state.host, kStatusLineTimer);
     state.statusLineAnimating = false;
+    state.noticeExpanded = false;
+    state.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.noticeHeading.Visibility(wx::Visibility::Collapsed);
+    state.noticeScroll.Visibility(wx::Visibility::Collapsed);
     state.statusTile.Visibility(wx::Visibility::Collapsed);
     state.statusTitle.Visibility(wx::Visibility::Collapsed);
     state.statusDetail.Visibility(wx::Visibility::Collapsed);
@@ -1736,6 +1888,23 @@ void CreateContent(State& state) {
     statusUnderline.Visibility(wx::Visibility::Collapsed);
     canvas.Children().Append(statusUnderline);
 
+    controls::TextBlock noticeChevron;
+    noticeChevron.Visibility(wx::Visibility::Collapsed);
+    noticeChevron.TextAlignment(wx::TextAlignment::Center);
+    canvas.Children().Append(noticeChevron);
+    controls::TextBlock noticeHeading;
+    noticeHeading.Visibility(wx::Visibility::Collapsed);
+    canvas.Children().Append(noticeHeading);
+    controls::StackPanel noticeRows;
+    controls::ScrollViewer noticeScroll;
+    noticeScroll.Visibility(wx::Visibility::Collapsed);
+    noticeScroll.VerticalScrollBarVisibility(
+        controls::ScrollBarVisibility::Auto);
+    noticeScroll.HorizontalScrollBarVisibility(
+        controls::ScrollBarVisibility::Disabled);
+    noticeScroll.Content(noticeRows);
+    canvas.Children().Append(noticeScroll);
+
     controls::Viewbox viewbox;
     viewbox.Stretch(media::Stretch::Fill);
     viewbox.Child(canvas);
@@ -1755,6 +1924,10 @@ void CreateContent(State& state) {
     state.statusTitle = statusTitle;
     state.statusDetail = statusDetail;
     state.statusUnderline = statusUnderline;
+    state.noticeChevron = noticeChevron;
+    state.noticeHeading = noticeHeading;
+    state.noticeRows = noticeRows;
+    state.noticeScroll = noticeScroll;
     canvas.PointerPressed([&state](auto const&, const xinput::PointerRoutedEventArgs& e) {
         PointerPressed(state, e);
     });
@@ -1821,6 +1994,10 @@ void CreateSurface(State& state, HINSTANCE instance) {
 
 void CloseSurface(State& state) {
     HideSurface(state);
+    state.noticeScroll = nullptr;
+    state.noticeRows = nullptr;
+    state.noticeHeading = nullptr;
+    state.noticeChevron = nullptr;
     state.statusUnderline = nullptr;
     state.statusDetail = nullptr;
     state.statusTitle = nullptr;
