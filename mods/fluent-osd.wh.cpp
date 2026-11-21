@@ -3061,6 +3061,7 @@ enum class OsdText : size_t {
     AudioOutput,
     AudioSwitchFailed,
     NoAudioOutputs,
+    MasterVolume,
     Count
 };
 struct LocalizedText { PCWSTR en; PCWSTR zhTw; };
@@ -3114,6 +3115,7 @@ constexpr LocalizedText kLocalizedText[] = {
     {L"Output", L"輸出裝置"}, // AudioOutput
     {L"Switch failed", L"切換失敗"}, // AudioSwitchFailed
     {L"No playback devices", L"沒有可用的播放裝置"}, // NoAudioOutputs
+    {L"Master volume", L"主音量"}, // MasterVolume
 };
 static_assert(ARRAYSIZE(kLocalizedText) == static_cast<size_t>(OsdText::Count));
 // ============================================================
@@ -6479,6 +6481,8 @@ xaml_osd::Snapshot MakeXamlSnapshot(
     data.rawValue = g_nativePercent;
     data.valueKnown = g_nativePercentKnown;
     data.muted = !data.brightness && g_nativeMuted;
+    data.mixerChevron = kind == PopupKind::NativeVolume &&
+        g_showMixerArrow.load();
     data.durationMs = OsdDuration(kind == PopupKind::DdcBrightness
         ? DurationKind::DdcBrightness
         : kind == PopupKind::NativeBrightness
@@ -9198,11 +9202,112 @@ void ShowMigratedXamlClipboardNotice() {
         Wh_Log(L"XAML v1.0.24: clipboard notice unavailable; NO GDI+ fallback");
 }
 
+
+// Build a complete owned Mixer display model from the existing UI-thread
+// Core Audio state. The STA receives only strings, flags and percentages.
+osd_model::MixerModel BuildMixerModel() {
+    osd_model::MixerModel model;
+    model.title = Tr(OsdText::VolumeMixer);
+    model.outputHeading = Tr(OsdText::AudioOutput);
+    model.generation = g_xamlMixerGeneration;
+    model.outputExpanded = g_xamlMixerOutputExpanded;
+    model.outputFailed = g_mixerOutputSwitchFailed;
+    model.maxVisibleRows = std::clamp(g_mixerMaxRows.load(), 3, 16);
+    model.selectedOutput = Tr(OsdText::NoAudioOutputs);
+    for (const auto& item : g_mixerOutputOptions) {
+        const bool selected = item.id == g_mixerOutputId;
+        model.outputs.push_back({item.name, selected});
+        if (selected) model.selectedOutput = item.name;
+    }
+    model.rows.push_back({
+        Tr(OsdText::MasterVolume),
+        std::clamp(static_cast<int>(
+            std::lround(g_mixerMasterLevel * 100.0f)), 0, 100),
+        g_mixerMasterMuted, static_cast<bool>(g_mixerMaster)});
+    for (const auto& item : g_mixerEntries) {
+        if (model.rows.size() >= 129) break;
+        model.rows.push_back({
+            item.title,
+            std::clamp(static_cast<int>(
+                std::lround(item.scalar * 100.0f)), 0, 100),
+            item.muted, static_cast<bool>(item.volume)});
+    }
+    return model;
+}
+
+// Existing panel attachment/monitor geometry is shared with GDI+,
+// but neither XAML Island queries a GDI HWND for its position.
+bool BuildMixerPanelAnchors(RECT& main, RECT& panel, float scale) {
+    if (!osd_placement::CurrentAnchor(main)) return false;
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(MonitorFromRect(&main,
+            MONITOR_DEFAULTTONEAREST), &mi)) return false;
+    const bool vertical = g_verticalVolumeBrightness.load();
+    const int mw = main.right - main.left, mh = main.bottom - main.top;
+    const int pw = vertical ? static_cast<int>(std::lround(
+        g_verticalMixerWidth.load() * scale)) : mw;
+    const int ph = vertical ? mh : static_cast<int>(std::lround(
+        g_horizontalMixerHeight.load() * scale));
+    const int position = g_position.load();
+    const auto direction = DirectionForPopup(main, mi.rcWork,
+                                             position, vertical);
+    const auto attachment = GetPanelAttachment(vertical, direction, scale,
+                                              mw, mh, pw, ph);
+    // Center the composition as one unit on the relevant central axis,
+    // preserving the same attachment offset as the original panel.
+    if (vertical && PositionCentersX(position)) {
+        const int minX = std::min(0, attachment.x);
+        const int maxX = std::max(mw, attachment.x + pw);
+        const int shift = (mw - minX - maxX) / 2;
+        main.left += shift;
+        main.right += shift;
+    } else if (!vertical && PositionCentersY(position)) {
+        const int minY = std::min(0, attachment.y);
+        const int maxY = std::max(mh, attachment.y + ph);
+        const int shift = (mh - minY - maxY) / 2;
+        main.top += shift;
+        main.bottom += shift;
+    }
+    int px = main.left + attachment.x;
+    int py = main.top + attachment.y;
+    px = ClampPopupAxis(px, pw,
+        !vertical && PositionCentersX(position)
+            ? mi.rcMonitor : mi.rcWork, true);
+    py = ClampPopupAxis(py, ph,
+        vertical && PositionCentersY(position)
+            ? mi.rcMonitor : mi.rcWork, false);
+    panel = RECT{px, py, px + pw, py + ph};
+    return true;
+}
+
+void ShowXamlMixerPanel() {
+    if (!g_xamlMixerOpen) return;
+    RECT main{}, panel{};
+    if (!BuildMixerPanelAnchors(main, panel, g_scale)) {
+        Wh_Log(L"XAML Mixer: missing calculated placement");
+        return;
+    }
+    HideGdiLevelForXaml();
+    auto volume = MakeXamlSnapshot(
+        PopupKind::NativeVolume, main, g_scale);
+    volume.mixerChevron = g_showMixerArrow.load();
+    auto mixer = MakeXamlSnapshot(
+        PopupKind::NativeVolume, panel, g_scale);
+    mixer.kind = osd_model::Kind::Mixer;
+    mixer.anchor = panel;
+    mixer.durationMs = OsdDuration(DurationKind::Interactive);
+    mixer.mixerChevron = false;
+    mixer.mixer = BuildMixerModel();
+    if (!xaml_osd::ShowBatch({volume, mixer}))
+        Wh_Log(L"XAML Mixer: panel unavailable; no GDI+ fallback");
+}
+
 void ShowNativeVolumePopup() {
     BrightnessEvent ev{};
     MovePopupToDisplay(ev);
     if (g_xamlForMigrated.load()) {
-        ShowMigratedXamlLevel(PopupKind::NativeVolume);
+        if (g_xamlMixerOpen) ShowXamlMixerPanel();
+        else ShowMigratedXamlLevel(PopupKind::NativeVolume);
         return;
     }
     // Original volume GDI+ renderer is used ONLY when XAML was disabled.
