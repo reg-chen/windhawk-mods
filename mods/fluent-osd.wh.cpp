@@ -830,6 +830,8 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
         static_cast<BYTE>(rgb)});
 }
 
+void DrawSnapshot(State&, const Snapshot&);
+
 // All audio/WMI/DDC writes stay on the original Explorer OSD UI thread.
 // The STA handles pointer geometry and sends only bounded POD commands.
 void SendInput(State& state, InputAction action, int value) {
@@ -1264,13 +1266,15 @@ void DrawSnapshot(State& state, const Snapshot& value) {
 
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.16: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.17: show failed (%lu)", GetLastError());
         return;
     }
+    PositionInputs(state, x, y);
     KillTimer(state.host, kHideTimer);
     SetTimer(state.host, kHideTimer,
         std::clamp(value.durationMs, DWORD(500), DWORD(20000)), nullptr);
 }
+void DeliverPending(State& root); // Defined after native/XAML host creation.
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_NCCREATE) {
         auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
@@ -1280,10 +1284,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     auto* state = reinterpret_cast<State*>(
         GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (state) {
+        LRESULT overlayResult = 0;
+        if (HandleInputWindow(*state, hwnd, msg, wp, lp, overlayResult))
+            return overlayResult;
+    }
     switch (msg) {
         case kShowMessage:
             if (state) {
-                try { DrawSnapshot(*state); }
+                try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
                     Wh_Log(L"XAML v1.0.16: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
@@ -1299,8 +1308,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case kHideMessage:
-            KillTimer(hwnd, kHideTimer);
-            ShowWindow(hwnd, SW_HIDE);
+            if (state) HideAll(*state);
             return 0;
         case WM_SIZE:
             if (state && state->island && wp != SIZE_MINIMIZED)
@@ -1309,11 +1317,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         case WM_TIMER:
-            if (wp == kHideTimer) {
-                KillTimer(hwnd, kHideTimer);
-                ShowWindow(hwnd, SW_HIDE);
-            }
+            if (wp == kHideTimer && state) HideSurface(*state);
             return 0;
+        case WM_ERASEBKGND: return TRUE;
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_CLOSE: PostQuitMessage(0); return 0;
     }
