@@ -911,6 +911,11 @@ void HideAll(State& root) {
 void ArmInteractionTimer(State& state, bool active) {
     if (!state.host) return;
     KillTimer(state.host, kHideTimer);
+    if (active && state.fadeOut) {
+        KillTimer(state.host, kFadeTimer);
+        state.fading = state.fadeOut = false;
+        if (state.card) state.card.Opacity(1.0);
+    }
     if (!active)
         SetTimer(state.host, kHideTimer,
             std::clamp(state.current.durationMs, DWORD(500), DWORD(20000)),
@@ -1291,6 +1296,13 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         state.iconH = iconH;
     }
 
+    if (!wasVisible)
+        state.card.Opacity(value.fadeEnabled ? 0.0 : 1.0);
+    else if (state.fadeOut) {
+        KillTimer(state.host, kFadeTimer);
+        state.fading = state.fadeOut = false;
+        state.card.Opacity(1.0); // A fresh event cancels pending fade-out.
+    }
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
         Wh_Log(L"XAML v1.0.19: show failed (%lu)", GetLastError());
@@ -1300,7 +1312,6 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         state.fading = value.fadeEnabled;
         state.fadeOut = false;
         state.fadeStart = GetTickCount64();
-        state.card.Opacity(value.fadeEnabled ? 0.0 : 1.0);
         if (state.fading) SetTimer(state.host, kFadeTimer, 16, nullptr);
     } else if (!value.fadeEnabled && state.fading) {
         state.fading = false;
@@ -1341,8 +1352,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) HideAll(*state);
             return 0;
         case WM_SIZE:
-            // The input overlays share this WndProc but must NEVER resize
-            // the actual XAML island when their hit rectangles change.
+            // Resize only the Island belonging to this XAML host.
             if (state && hwnd == state->host &&
                 state->island && wp != SIZE_MINIMIZED)
                 SetWindowPos(state->island, nullptr, 0, 0,
@@ -1377,7 +1387,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ERASEBKGND: return TRUE;
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_CLOSE:
-            // A hit surface or DDC peer must not terminate the STA.
+            // DDC peer cleanup must not terminate the root STA.
             if (state && hwnd != state->host) {
                 ShowWindow(hwnd, SW_HIDE);
                 return 0;
@@ -1392,9 +1402,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 void CreateContent(State& state) {
-    // The top-level HWND is rounded by DWM. A second XAML Border radius
-    // disagrees with DWM's physical curve and can expose dark corner pixels.
-    // Keep the XAML card square and let DWM clip the *entire* child surface.
+    // The XAML Border owns the user-configured radius and alpha.
+    // DWM rounding is disabled on the host to avoid conflicting clips.
     controls::Border card;
     card.CornerRadius(wx::CornerRadius{0.0, 0.0, 0.0, 0.0});
     card.Padding(wx::Thickness{0.0, 0.0, 0.0, 0.0});
@@ -1497,9 +1506,8 @@ void CreateSurface(State& state, HINSTANCE instance) {
         &corner, sizeof(corner));
     const HRESULT border = DwmSetWindowAttribute(
         state.host, DWMWA_BORDER_COLOR, &noBorder, sizeof(noBorder));
-    // A full-glass host has no opaque Win32 client-area paint behind
-    // the alpha-enabled XAML Island content. The top-level DWM window
-    // remains non-layered so its compositor-anti-aliased corners work.
+    // The non-layered Win32 host extends glass behind the transparent
+    // Island; the XAML Border provides the only visible card background.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
     Wh_Log(L"XAML v1.0.19: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
@@ -1519,7 +1527,6 @@ void CreateSurface(State& state, HINSTANCE instance) {
         SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW))
         winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
     CreateContent(state);
-
 }
 
 void CloseSurface(State& state) {
