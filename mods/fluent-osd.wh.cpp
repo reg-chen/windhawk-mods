@@ -686,6 +686,9 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #undef GetCurrentTime
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.UI.h>
+// PointerRoutedEventArgs::GetCurrentPoint returns Windows.UI.Input.PointerPoint.
+// Its Position/Properties members require the full projection, not just XAML.Input.
+#include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
