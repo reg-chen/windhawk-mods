@@ -758,7 +758,24 @@ DWORD PercentToRaw(DWORD minimum, DWORD maximum, int percent) {
 namespace osd_model {
 enum class Kind {
     Volume, NativeBrightness, DdcBrightness, LockStatus, NoticeStatus,
-    NativeEvent, ClipboardImage
+    NativeEvent, ClipboardImage, Mixer
+};
+struct MixerRow {
+    std::wstring title;
+    int percent = 0;
+    bool muted = false;
+};
+struct MixerOutput {
+    std::wstring title;
+    bool selected = false;
+};
+struct MixerModel {
+    std::wstring title, outputHeading;
+    std::vector<MixerRow> rows;
+    std::vector<MixerOutput> outputs;
+    uint32_t generation = 0;
+    bool outputExpanded = false, outputFailed = false;
+    int maxVisibleRows = 6;
 };
 struct Snapshot {
     Kind kind = Kind::Volume;
@@ -778,6 +795,8 @@ struct Snapshot {
     DWORD noticeInteractiveDurationMs = 8000;
     uint32_t clipboardWidth = 0, clipboardHeight = 0;
     std::vector<uint8_t> clipboardPixels; // Bounded 32-bit BGRA, no HBITMAP on STA.
+    MixerModel mixer;
+    bool mixerChevron = false;
     bool brightness = false;
     bool showIcon = true;
     BYTE backgroundAlpha = 255;
@@ -797,8 +816,9 @@ struct Snapshot {
 
 // Functional transformations: unchanged input -> new owned output.
 // No renderer, HWND lookup or hardware operation occurs in these functions.
-enum class View { Level, Status, ClipboardImage };
+enum class View { Level, Status, ClipboardImage, Mixer };
 View SelectView(Kind kind) {
+    if (kind == Kind::Mixer) return View::Mixer;
     if (kind == Kind::ClipboardImage) return View::ClipboardImage;
     if (kind == Kind::LockStatus || kind == Kind::NoticeStatus ||
         kind == Kind::NativeEvent) return View::Status;
@@ -844,12 +864,18 @@ Snapshot AsStatus(Snapshot data, Kind category,
 // Control adapter: XAML (or a future renderer) may emit a command, but
 // hardware and audio APIs are called only by the existing UI-thread handler.
 namespace osd_control {
-enum class Action { SetPercent, Wheel, ToggleMute };
-enum class Target { None, Volume, NativeBrightness, DdcBrightness };
+enum class Action {
+    SetPercent, Wheel, ToggleMute,
+    OpenMixer, CloseMixer, MixerSetPercent, MixerToggleMute,
+    MixerSelectOutput, MixerToggleOutput
+};
+enum class Target { None, Volume, NativeBrightness, DdcBrightness, Mixer };
 struct Command {
     Target target = Target::None;
     Action action = Action::SetPercent;
     int value = 0;
+    int index = -1; // 0=master, positive=audio session, or output index.
+    uint32_t generation = 0;
     WCHAR device[CCHDEVICENAME]{};
     DWORD physicalIndex = 0, minimum = 0, maximum = 0;
 };
@@ -862,18 +888,28 @@ Target ForCategory(osd_model::Kind kind) {
         case osd_model::Kind::Volume: return Target::Volume;
         case osd_model::Kind::NativeBrightness: return Target::NativeBrightness;
         case osd_model::Kind::DdcBrightness: return Target::DdcBrightness;
+        case osd_model::Kind::Mixer: return Target::Mixer;
         default: return Target::None;
     }
 }
 Command Build(const osd_model::Snapshot& source, Action action, int value) {
     Command cmd;
-    cmd.target = ForCategory(source.kind);
+    cmd.target = action == Action::OpenMixer
+        ? Target::Mixer : ForCategory(source.kind);
     cmd.action = action;
     cmd.value = value;
+    cmd.generation = source.mixer.generation;
     wcscpy_s(cmd.device, source.device);
     cmd.physicalIndex = source.physicalIndex;
     cmd.minimum = source.minimum;
     cmd.maximum = source.maximum;
+    return cmd;
+}
+Command BuildMixer(const osd_model::Snapshot& source,
+                   Action action, int row, int value = 0) {
+    Command cmd = Build(source, action, value);
+    cmd.target = Target::Mixer;
+    cmd.index = row;
     return cmd;
 }
 void Submit(const Command& cmd, HWND receiver) {
