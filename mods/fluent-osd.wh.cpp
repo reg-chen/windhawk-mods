@@ -8863,19 +8863,21 @@ void HandleMixerDrag(LPARAM lp) {
     ResetHideTimerFor(DurationKind::Interactive);
 }
 
-// XAML interaction commands reach this original UI thread without
-// cross-apartment WinRT calls. Physical DDC identity is carried on each
-// command, not inferred from whichever monitor happened to be last active.
-struct XamlPendingDdcWrite {
+// Imperative control boundary: returns refresh intents instead of drawing.
+// Every hardware target keeps its existing identity and async write behavior.
+struct PendingDdcWrite {
     BrightnessEvent event{};
     DWORD previousValue = 0, generation = 0;
 };
-std::vector<XamlPendingDdcWrite> g_xamlPendingDdcWrites; // UI thread only.
-
-void ProcessXamlInputs() {
-    auto inputs = osd_control::Drain();
-    if (g_closing.load() || !g_xamlForMigrated.load()) return;
-    for (const auto& cmd : inputs) {
+std::vector<PendingDdcWrite> g_pendingDdcWrites; // UI thread only.
+struct ControlEffects {
+    bool volume = false, nativeBrightness = false, ddc = false;
+};
+ControlEffects ApplyOsdCommands(
+        const std::vector<osd_control::Command>& commands) {
+    ControlEffects effects;
+    if (g_closing.load()) return effects;
+    for (const auto& cmd : commands) {
         if (cmd.target == osd_control::Target::Volume) {
             if (g_popupKind != PopupKind::NativeVolume) continue;
             bool ok = false;
@@ -8885,7 +8887,7 @@ void ProcessXamlInputs() {
                 const int steps = cmd.value / WHEEL_DELTA;
                 ok = steps != 0 && AdjustDefaultAudioWheel(steps);
             } else ok = SetDefaultAudioBarPercent(cmd.value);
-            if (ok) ShowMigratedXamlLevel(PopupKind::NativeVolume);
+            if (ok) effects.volume = true;
             continue;
         }
         if (!g_wheelWriteWake) continue;
@@ -8907,7 +8909,7 @@ void ProcessXamlInputs() {
                 g_lastConfirmedNativeBrightness = g_nativePercent;
             g_nativePercent = percent;
             QueueBrightnessWheelTask(task);
-            ShowMigratedXamlLevel(PopupKind::NativeBrightness);
+            effects.nativeBrightness = true;
             continue;
         }
 
@@ -8943,15 +8945,15 @@ void ProcessXamlInputs() {
         task.value = static_cast<int>(raw);
         task.generation = ++g_wheelWriteGeneration;
         auto pending = std::find_if(
-            g_xamlPendingDdcWrites.begin(), g_xamlPendingDdcWrites.end(),
-            [&](const XamlPendingDdcWrite& item) {
+            g_pendingDdcWrites.begin(), g_pendingDdcWrites.end(),
+            [&](const PendingDdcWrite& item) {
                 return item.event.physicalIndex == event.physicalIndex &&
                     _wcsicmp(item.event.device, event.device) == 0;
             });
-        if (pending == g_xamlPendingDdcWrites.end()) {
-            if (g_xamlPendingDdcWrites.size() >= kMaxDdcTargets)
-                g_xamlPendingDdcWrites.erase(g_xamlPendingDdcWrites.begin());
-            g_xamlPendingDdcWrites.push_back(
+        if (pending == g_pendingDdcWrites.end()) {
+            if (g_pendingDdcWrites.size() >= kMaxDdcTargets)
+                g_pendingDdcWrites.erase(g_pendingDdcWrites.begin());
+            g_pendingDdcWrites.push_back(
                 {event, event.value, task.generation});
         } else pending->generation = task.generation;
         event.value = raw;
@@ -8959,13 +8961,25 @@ void ProcessXamlInputs() {
             _wcsicmp(g_visible.device, event.device) == 0)
             g_visible.value = raw;
         QueueBrightnessWheelTask(task);
-        (void)ShowXamlDdcTargets(g_visible);
+        effects.ddc = true;
     }
+    return effects;
 }
 
 LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (hwnd == g_receiveWnd && msg == osd_control::kMessage) {
-        ProcessXamlInputs();
+        const auto commands = osd_control::Drain();
+        // Event routing owns the active-backend policy; hardware execution
+        // does not read an XAML feature flag or depend on renderer types.
+        if (g_xamlForMigrated.load()) {
+            const auto effects = ApplyOsdCommands(commands);
+            if (effects.volume)
+                ShowMigratedXamlLevel(PopupKind::NativeVolume);
+            if (effects.nativeBrightness)
+                ShowMigratedXamlLevel(PopupKind::NativeBrightness);
+            if (effects.ddc)
+                (void)ShowXamlDdcTargets(g_visible);
+        }
         return 0;
     }
     if (hwnd == g_receiveWnd && msg == WM_TIMER && wp == kEventBatchTimer) {
@@ -9130,15 +9144,15 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const bool native = (lp & 2) != 0;
         if (!native && g_xamlForMigrated.load()) {
             const auto pending = std::find_if(
-                g_xamlPendingDdcWrites.begin(),
-                g_xamlPendingDdcWrites.end(),
-                [generation](const XamlPendingDdcWrite& item) {
+                g_pendingDdcWrites.begin(),
+                g_pendingDdcWrites.end(),
+                [generation](const PendingDdcWrite& item) {
                     return item.generation == generation;
                 });
-            if (pending == g_xamlPendingDdcWrites.end())
+            if (pending == g_pendingDdcWrites.end())
                 return 0; // Superseded DDC write: never roll back its target.
-            const XamlPendingDdcWrite write = *pending;
-            g_xamlPendingDdcWrites.erase(pending);
+            const PendingDdcWrite write = *pending;
+            g_pendingDdcWrites.erase(pending);
             const auto target = std::find_if(
                 g_ddcTargets.begin(), g_ddcTargets.end(),
                 [&](const DdcTargetState& item) {
