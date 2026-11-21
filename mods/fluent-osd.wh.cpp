@@ -1338,7 +1338,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_ERASEBKGND: return TRUE;
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-        case WM_CLOSE: PostQuitMessage(0); return 0;
+        case WM_CLOSE:
+            // Closing one DDC target must not terminate the shared STA.
+            if (state && !state->current.key.empty()) {
+                HideSurface(*state);
+                return 0;
+            }
+            PostQuitMessage(0);
+            return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -1529,9 +1536,14 @@ void DeliverPending(State& root) {
         }
         DrawSnapshot(*found->second, snap);
     }
-    for (auto& peer : root.peers)
-        if (requested.find(peer.first) == requested.end())
-            HideSurface(*peer.second);
+    // Reclaim no-longer-active DDC Island resources instead of keeping
+    // every monitor ever attached alive for Explorer's entire lifetime.
+    for (auto it = root.peers.begin(); it != root.peers.end();) {
+        if (requested.find(it->first) == requested.end()) {
+            CloseSurface(*it->second);
+            it = root.peers.erase(it);
+        } else ++it;
+    }
 }
 
 void TryEnableIslandTransparency() {
