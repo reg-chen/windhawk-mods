@@ -3315,6 +3315,7 @@ void FlushNoticeBatch();
 void ShowPanel();
 void ShowNotice(std::wstring, std::wstring, DurationKind, NoticeIcon);
 void ShowMigratedXamlDeviceNotice(DurationKind);
+void ShowMigratedXamlClipboardNotice();
 std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot();
 namespace bt_monitor {
     void Start();
@@ -4800,11 +4801,16 @@ void ShowNotice(std::wstring title, std::wstring body, DurationKind kind,
     // Every USB/Bluetooth/network notice, including a multi-device batch,
     // is now native XAML when selected. Never revert interactive details
     // to GDI+ because a notice has multiple device names.
-    if (g_xamlForMigrated.load() &&
-        (icon == NoticeIcon::Usb || icon == NoticeIcon::Bluetooth ||
-         icon == NoticeIcon::Network)) {
-        ShowMigratedXamlDeviceNotice(kind);
-        return;
+    if (g_xamlForMigrated.load()) {
+        if (icon == NoticeIcon::Clipboard) {
+            ShowMigratedXamlClipboardNotice();
+            return;
+        }
+        if (icon == NoticeIcon::Usb || icon == NoticeIcon::Bluetooth ||
+            icon == NoticeIcon::Network) {
+            ShowMigratedXamlDeviceNotice(kind);
+            return;
+        }
     }
     SetNoticeHitTesting(g_noticeClickable);
     ShowPopupAnimated();
@@ -8570,6 +8576,69 @@ void ShowMigratedXamlNativeEvent() {
     }
     if (!xaml_osd::Show(snapshot))
         Wh_Log(L"XAML v1.0.23: native event unavailable; NO GDI+ fallback");
+}
+
+// Convert the already-downscaled clipboard HBITMAP into a private, bounded
+// byte buffer on the Explorer UI thread. A GDI handle never crosses to XAML.
+bool CopyClipboardThumbnailPixels(HBITMAP bitmap,
+                                  xaml_osd::Snapshot& snapshot) {
+    if (!bitmap) return false;
+    BITMAP info{};
+    if (GetObjectW(bitmap, sizeof(info), &info) != sizeof(info) ||
+        info.bmWidth <= 0 || info.bmHeight <= 0 ||
+        info.bmWidth > 224 || info.bmHeight > 164)
+        return false;
+    const auto width = static_cast<uint32_t>(info.bmWidth);
+    const auto height = static_cast<uint32_t>(info.bmHeight);
+    const size_t bytes = static_cast<size_t>(width) * height * 4;
+    if (!bytes || bytes > 224u * 164u * 4u) return false;
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = info.bmWidth;
+    bmi.bmiHeader.biHeight = -info.bmHeight;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    std::vector<uint8_t> pixels(bytes);
+    HDC dc = GetDC(nullptr);
+    if (!dc) return false;
+    const int copied = GetDIBits(dc, bitmap, 0, height, pixels.data(),
+                                &bmi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    if (copied != static_cast<int>(height)) return false;
+    // Win32 CF_BITMAP alpha is unspecified: match the original opaque
+    // preview instead of accidentally displaying entirely transparent pixels.
+    for (size_t offset = 3; offset < bytes; offset += 4)
+        pixels[offset] = 255;
+    snapshot.clipboardWidth = width;
+    snapshot.clipboardHeight = height;
+    snapshot.clipboardPixels = std::move(pixels);
+    return true;
+}
+
+// Text/file notices use the same compact XAML card. If the original capture
+// produced a bounded thumbnail, use the native XAML image-first layout.
+void ShowMigratedXamlClipboardNotice() {
+    HideGdiLevelForXaml();
+    RECT target{};
+    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
+        ClearClipboardThumbnail();
+        Wh_Log(L"XAML v1.0.24: clipboard notice missing placement anchor");
+        return;
+    }
+    auto snapshot = MakeXamlStatusSnapshot(
+        xaml_osd::LevelKind::NoticeStatus, target,
+        DurationKind::Clipboard, true);
+    snapshot.statusTitle = g_noticeTitle;
+    snapshot.statusDetail = g_noticeBody;
+    snapshot.statusGlyph = L"\uE8C8"; // Segoe Fluent Icons Copy
+    if (CopyClipboardThumbnailPixels(g_clipboardThumbnail, snapshot))
+        snapshot.kind = xaml_osd::LevelKind::ClipboardImage;
+    // XAML owns pixel bytes now. Release the transient GDI thumbnail
+    // regardless of whether posting the XAML snapshot succeeds.
+    ClearClipboardThumbnail();
+    if (!xaml_osd::Show(snapshot))
+        Wh_Log(L"XAML v1.0.24: clipboard notice unavailable; NO GDI+ fallback");
 }
 
 void ShowNativeVolumePopup() {
