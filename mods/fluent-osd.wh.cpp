@@ -1213,12 +1213,24 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.statusDetail.TextTrimming(wx::TextTrimming::CharacterEllipsis);
     const double lineGap = std::clamp(bodyH * .045, 2.0, 6.0);
     const double textBlockH = titleFont * 1.43 + detailFont * 1.43 + lineGap;
-    const double top = std::max(0.0, (bodyH - textBlockH) / 2.0 - 2.0);
+    const double lineHeight = std::max(2.0, bodyH * .04);
+    // Reserve enough bottom clearance for the card's rounded corners.
+    // Keep the underline within the unrounded interior instead of
+    // anchoring it against the very bottom edge.
+    const double bottomInset = std::max(pad, radius * .65);
+    const double underlineTop = std::max(0.0,
+        bodyH - bottomInset - lineHeight);
+    const double centeredTextTop = std::max(0.0,
+        (bodyH - textBlockH) / 2.0 - 2.0);
+    // On short/high-radius cards, shift the text block upward to preserve
+    // its gap to the underline rather than overlapping either element.
+    const double availableTextTop = std::max(0.0,
+        underlineTop - lineGap - textBlockH);
+    const double top = std::min(centeredTextTop, availableTextTop);
     controls::Canvas::SetLeft(state.statusTitle, textX);
     controls::Canvas::SetTop(state.statusTitle, top);
     controls::Canvas::SetLeft(state.statusDetail, textX);
     controls::Canvas::SetTop(state.statusDetail, top + titleFont * 1.43 + lineGap);
-    const double lineHeight = std::max(2.0, bodyH * .04);
     state.statusUnderline.Width(textW);
     state.statusUnderline.Height(lineHeight);
     state.statusUnderline.RadiusX(lineHeight / 2.0);
@@ -1226,8 +1238,7 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.statusUnderline.Fill(Brush(value.accent,
         value.statusActive ? 255 : 145));
     controls::Canvas::SetLeft(state.statusUnderline, textX);
-    controls::Canvas::SetTop(state.statusUnderline,
-        std::max(0.0, bodyH - pad * .55 - lineHeight));
+    controls::Canvas::SetTop(state.statusUnderline, underlineTop);
     ShowPositionedSurface(state, value, insetX, insetY, bodyW, bodyH);
 }
 
