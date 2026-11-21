@@ -2,7 +2,7 @@
 
 **Branch:** `fluent-osd-xaml`  
 **Baseline:** `fluent-osd` v1.0.1 (`8ff2d4352d8c081e78208266ff1561b5e5bfe31b`)  
-**Status:** standalone XAML probe v0.1.3 passed the user's earlier host test; integrated experimental `fluent-osd-xaml` **v1.0.17** now includes XAML volume, native brightness and per-target DDC/CI, original background-opacity settings, and click/drag/wheel input. **v1.0.17 is not yet compiled or runtime-tested in Windhawk.**
+**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.18** now includes XAML volume, native brightness, per-target DDC/CI, background-opacity settings and a shared input layer. **v1.0.18 has not yet been compiled or runtime-tested in Windhawk.**
 
 ## Goal / non-goals
 
@@ -483,6 +483,51 @@ Windhawk runtime test; no Windows compiler/runtime validation was run.
    `XAML v1.0.17` logs. Compilation, visual compositing and hardware
    interaction **require real Windows validation**; they have not
    been verified in the developer environment used for these edits.
+
+## v1.0.18 — Shared input behavior and renderer-neutral arithmetic
+
+After bringing the DDC/CI controls onto native XAML in v1.0.17,
+consolidate click/drag/wheel behavior rather than reimplementing it for
+each OSD type.
+
+- `osd_input::TrackPercent`: maps either horizontal or inverted
+  vertical track coordinates to clamped 0–100% with zero-span and
+  non-finite input guards. Used by **both** the original GDI+ hit
+  handler and the new XAML pointer handler.
+- `osd_input::ConsumeWheelSteps`: accumulates fractional wheel deltas
+  into integer steps and retains sub-notch remainder. Shared by the
+  GDI+ and XAML scroll paths.
+- `osd_input::PercentToRaw`: one rounded 0–100% conversion for
+  hardware-specific DDC minimum/maximum values. Shared by visual
+  previews, XAML DDC writes and the legacy slider.
+- `BeginInputGesture`, `EndInputGesture`,
+  `CancelInputGesture`, `ArmInteractionTimer` and
+  `PointerInsideClient` implement **one XAML Hit Window capture and
+  hide-timer lifecycle**. Volume uses the click action for mute; volume,
+  native brightness, and DDC use the exact same slider gesture.
+  Their hardware writers remain separate behind `InputCommand` dispatch.
+- Input overlays **must not** resize the real XAML Island on
+  `WM_SIZE`. The shared window procedure now checks
+  `hwnd == state.host` before resizing the Island; overlay close
+  messages also must not stop the shared STA.
+- The former `xaml_volume` namespace is renamed `xaml_osd`
+  because it now implements all migrated level-indicator categories.
+
+### Regression cases
+
+1. Use a mouse to click 0%, 50%, 100% and drag the volume and DDC
+   tracks in each axis. The full XAML Island must **not shrink** when
+   its transparent input overlay is repositioned.
+2. Wheel test: +60 then +60, -60 then -60, and standard ±120 deltas.
+   One step should be generated per full notch, not per fractional event.
+3. DDC test with non-0–100 ranges: test 20–80 and 0–255. UI endpoints
+   must map to the target's real minimum and maximum, never a different
+   monitor's brightness.
+4. Test muted-speaker click and pointer release outside the icon;
+   only a release inside the pressed icon may toggle mute.
+5. Disable/re-enable Windhawk, check Explorer teardown, and examine
+   `XAML v1.0.18` logs. Compilation and runtime behavior are still
+   **unverified** in this editing environment.
 
 ## Migration gates
 
