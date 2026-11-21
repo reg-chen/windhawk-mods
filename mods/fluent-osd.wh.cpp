@@ -1098,7 +1098,7 @@ struct MediaGeometry {
     Frame frame;
     double artX = 0, artY = 0, artSize = 0;
     double textX = 0, textW = 0, titleY = 0, artistY = 0;
-    double timelineY = 0, timeY = 0, controlsY = 0;
+    double timelineY = 0, timeY = 0, timeHeight = 0, controlsY = 0;
     double controlRadius = 0, controlX[3]{};
     double extraX = 0, extraY[2]{};
 };
@@ -1110,8 +1110,9 @@ MediaGeometry MediaLayout(const osd_model::Snapshot& value) {
     const double artGap = std::clamp(w * .035, 8.0, 16.0);
     const double availableW = std::max(1.0, w - 2.0 * pad);
     const double availableH = std::max(1.0, h - 2.0 * pad);
-    const bool extra = (value.media.canShuffle && value.media.shuffleKnown) ||
-                       (value.media.canRepeat && value.media.repeatMode >= 0);
+    const bool shuffle = value.media.canShuffle && value.media.shuffleKnown;
+    const bool repeat = value.media.canRepeat && value.media.repeatMode >= 0;
+    const bool extra = shuffle || repeat, both = shuffle && repeat;
     const double minControlW = extra ? 139.0 : 112.0;
     g.artSize = std::max(1.0, std::min({
         availableH, availableW * .52,
@@ -1123,24 +1124,44 @@ MediaGeometry MediaLayout(const osd_model::Snapshot& value) {
     g.titleY = g.artY + g.artSize * .025;
     g.artistY = g.artY + g.artSize * .235;
     g.timelineY = g.artY + g.artSize * .448;
-    g.timeY = g.artY + g.artSize * .575;
-    g.controlsY = g.artY + g.artSize * .81;
+    g.timeY = g.artY + g.artSize * .55;
+    g.timeHeight = std::max(12.0, g.artSize * .13);
     const double scale = std::clamp(
         value.media.controlSizePercent / 100.0, .9, 1.35);
-    // Include extra column AND all three controls before solving radius.
+    // The old radius could consume 100% of the row width. Reserve a
+    // horizontal gap for each primary button and for the auxiliary column.
+    const double mainGap = std::clamp(g.textW * .045, 5.0, 8.0);
+    const double auxGap = extra ? std::clamp(g.textW * .05, 6.0, 9.0) : 0.0;
+    const double gapReserve = 2.0 * mainGap + auxGap;
+    // Cap diameter vertically as well: a 135%-size control must never
+    // collide with the time labels or escape the rounded card bottom.
+    const double verticalRoom = g.artSize - 3.0 -
+        (g.timeY - g.artY) - g.timeHeight - 4.0 - (both ? 5.0 : 0.0);
+    const double maxVerticalRadius = std::max(1.0, verticalRoom / 2.0);
     g.controlRadius = std::max(1.0, std::min({
         g.artSize * .115 * scale, 20.0 * scale,
-        (g.textW - (extra ? 6.0 : 0.0)) / (extra ? 8.0 : 6.0)}));
-    const double extraW = extra ? 2.0 * g.controlRadius + 6.0 : 0.0;
-    const double first = g.textX + extraW + g.controlRadius;
-    const double gap = std::max(0.0, (g.textW - extraW -
-        6.0 * g.controlRadius) / 2.0);
-    g.controlX[0] = first;
-    g.controlX[1] = first + 2.0 * g.controlRadius + gap;
-    g.controlX[2] = g.controlX[1] + 2.0 * g.controlRadius + gap;
-    g.extraX = first - 1.5 * g.controlRadius - 4.0;
-    g.extraY[0] = g.controlsY - .55 * g.controlRadius;
-    g.extraY[1] = g.controlsY + .55 * g.controlRadius;
+        (g.textW - gapReserve) / (extra ? 7.0 : 6.0),
+        maxVerticalRadius}));
+    // Half-size extra buttons use one primary radius in width, not two.
+    const double auxiliaryWidth = extra ? g.controlRadius : 0.0;
+    const double groupWidth = auxiliaryWidth + auxGap +
+        6.0 * g.controlRadius + 2.0 * mainGap;
+    const double left = g.textX + std::max(0.0,
+        (g.textW - groupWidth) / 2.0);
+    g.controlX[0] = left + auxiliaryWidth + auxGap + g.controlRadius;
+    g.controlX[1] = g.controlX[0] + 2.0 * g.controlRadius + mainGap;
+    g.controlX[2] = g.controlX[1] + 2.0 * g.controlRadius + mainGap;
+    g.extraX = left + auxiliaryWidth / 2.0;
+    // Both extras are a true stacked column. A lone extra sits on the
+    // transport baseline instead of floating above or below it.
+    const double stackOffset = both ? g.controlRadius / 2.0 + 2.5 : 0.0;
+    const double verticalExtent = g.controlRadius + (both ? 2.5 : 0.0);
+    const double earliest = g.timeY + g.timeHeight + 4.0 + verticalExtent;
+    const double latest = g.artY + g.artSize - 3.0 - verticalExtent;
+    g.controlsY = std::clamp(g.artY + g.artSize * .825,
+        std::min(earliest, latest), latest);
+    g.extraY[0] = g.controlsY - stackOffset;
+    g.extraY[1] = g.controlsY + stackOffset;
     return g;
 }
 struct Status {
@@ -1247,6 +1268,40 @@ Surface SurfaceGeometry(const osd_model::Snapshot& value,
     return out;
 }
 } // namespace osd_layout
+
+// Value-only visual tokens: do not mix presentation styling with hardware
+// commands. The native Mixer and Media Sliders keep their system template.
+namespace osd_style {
+struct Thumb {
+    double diameter = 0, coreRatio = .52;
+    DWORD rim = 0, center = 0;
+};
+DWORD MixRgb(DWORD a, DWORD b, double ratio) {
+    const auto channel = [&](unsigned shift) -> DWORD {
+        const double x = static_cast<double>((a >> shift) & 255);
+        const double y = static_cast<double>((b >> shift) & 255);
+        return static_cast<DWORD>(std::lround(
+            std::clamp(x + (y - x) * ratio, 0.0, 255.0)));
+    };
+    return (channel(16) << 16) | (channel(8) << 8) | channel(0);
+}
+Thumb LevelThumb(const osd_model::Snapshot& data) {
+    Thumb out;
+    // 0 still hides the thumb. The native Slider has a larger visual
+    // footprint than the former 11px handmade circle.
+    if (data.thumbDiameter > 0)
+        out.diameter = std::min(20.0, data.thumbDiameter * 1.55);
+    const DWORD bg = data.background;
+    const DWORD fg = data.text;
+    const double brightness =
+        ((bg >> 16) & 255) * .2126 +
+        ((bg >> 8) & 255) * .7152 + (bg & 255) * .0722;
+    out.rim = brightness > 150 ? MixRgb(bg, fg, .22)
+                              : MixRgb(bg, 0x000000, .14);
+    out.center = MixRgb(bg, fg, .53);
+    return out;
+}
+} // namespace osd_style
 
 // Compile-time structural contracts: owned cross-thread view descriptions,
 // plain-value control commands, and no WinRT types at either boundary.
@@ -2353,11 +2408,10 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         slider.Value(std::clamp(100.0*double(pos-m.start)/
             double(m.end-m.start),0.0,100.0));
         state.mediaElapsed=text(osd_model::MediaTime(pos-m.start),
-            g.textX,g.timeY,g.textW*.5,std::max(12.0,g.artSize*.15),
+            g.textX,g.timeY,g.textW*.5,g.timeHeight,
             std::clamp(snap.fontSize-4,9,14),190);
         auto total=text(osd_model::MediaTime(m.end-m.start),
-            g.textX+g.textW*.5,g.timeY,g.textW*.5,
-            std::max(12.0,g.artSize*.15),
+            g.textX+g.textW*.5,g.timeY,g.textW*.5,g.timeHeight,
             std::clamp(snap.fontSize-4,9,14),190);
         total.TextAlignment(wx::TextAlignment::Right);
         state.mediaSlider=slider;
@@ -2775,12 +2829,12 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     state.value.Foreground(Brush(value.text));
     state.track.Fill(Brush(value.track));
     state.fill.Fill(Brush(value.accent));
-    // Mirror the Mixer's native Slider thumb: contrast shell and accent dot.
-    // This is presentation only; bar hit testing/commands are untouched.
-    state.thumb.Fill(Brush(0xffffff));
-    state.thumb.Stroke(Brush(value.accent));
-    state.thumb.StrokeThickness(1.0);
-    state.thumbCore.Fill(Brush(value.accent));
+    // Native Slider motif: dark outer ring and pale center, theme-relative.
+    // The bar's existing input controller and percent math are unchanged.
+    const auto thumbVisual = osd_style::LevelThumb(value);
+    state.thumb.Fill(Brush(thumbVisual.rim));
+    state.thumb.StrokeThickness(0.0);
+    state.thumbCore.Fill(Brush(thumbVisual.center));
 
     const int percent = std::clamp(value.percent, 0, 100);
     // Segoe Fluent Icons is provided by Windows; no external font assets.
@@ -2800,8 +2854,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     const double trackThickness =
         static_cast<double>(std::clamp(value.barThickness, 2, 18));
     const int fillPercent = value.valueKnown ? percent : 0;
-    const double wantedThumb =
-        static_cast<double>(std::clamp(value.thumbDiameter, 0, 20));
+    const double wantedThumb = thumbVisual.diameter;
 
     // Measure the intrinsic maximum among possible glyphs and labels.
     // Do not base the available track width on the *current* percentage.
@@ -2877,7 +2930,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
             std::max(trackTop + thumbHalf, trackBottom - thumbHalf));
         controls::Canvas::SetLeft(state.thumb, centerX - thumbHalf);
         controls::Canvas::SetTop(state.thumb, thumbY - thumbHalf);
-        const double core = thumbSize * .62;
+        const double core = thumbSize * thumbVisual.coreRatio;
         state.thumbCore.Width(core);
         state.thumbCore.Height(core);
         state.thumbCore.Visibility(thumbSize > 0.0 && value.valueKnown
@@ -2955,7 +3008,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
             std::max(thumbHalf, trackW - thumbHalf));
         controls::Canvas::SetLeft(state.thumb, trackX + thumbX - thumbHalf);
         controls::Canvas::SetTop(state.thumb, midY - thumbHalf);
-        const double core = thumbSize * .62;
+        const double core = thumbSize * thumbVisual.coreRatio;
         state.thumbCore.Width(core);
         state.thumbCore.Height(core);
         state.thumbCore.Visibility(thumbSize > 0.0 && value.valueKnown
@@ -3119,14 +3172,13 @@ void CreateContent(State& state) {
     shapes::Ellipse thumb;
     thumb.Width(11.0);
     thumb.Height(11.0);
-    thumb.Fill(Brush(0xffffff));
-    thumb.Stroke(Brush(0x67acff));
-    thumb.StrokeThickness(1.0);
+    thumb.Fill(Brush(0x303034));
+    thumb.StrokeThickness(0.0);
     canvas.Children().Append(thumb);
     shapes::Ellipse thumbCore;
     thumbCore.Width(7.0);
     thumbCore.Height(7.0);
-    thumbCore.Fill(Brush(0x67acff));
+    thumbCore.Fill(Brush(0xa6a6a6));
     canvas.Children().Append(thumbCore);
 
     controls::TextBlock value;
