@@ -1574,9 +1574,11 @@ DWORD WINAPI ThreadProc(void*) {
 
             root.manager =
                 hosting::WindowsXamlManager::InitializeForCurrentThread();
-            TryEnableIslandTransparency();
             if (!g_stopping.load()) {
                 CreateSurface(root, instance);
+                // Window.Current is available once the first Island has
+                // been created; the interface applies to the entire STA.
+                TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
                 Wh_Log(L"XAML v1.0.17: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
