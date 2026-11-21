@@ -1078,6 +1078,40 @@ MixerButton MixerButtonGeometry(const osd_model::Snapshot& value,
     return {true, size, std::max(0.0, (bodyW - size) / 2.0),
         std::max(0.0, bodyH - size - bottom), size + bottom + gap};
 }
+// Reserve exactly the measured text/icon rows and the chevron button row.
+// The previous layout spent up to a full Thumb diameter on EACH vertical
+// gap; a short customizable card consequently had almost no Slider travel.
+struct VerticalLevelFlow {
+    double pad = 0, gap = 0;
+    double sliderTop = 0, sliderBottom = 0, iconTop = 0;
+};
+VerticalLevelFlow VerticalLevelBounds(
+        const osd_model::Snapshot& value, double bodyHeight,
+        double chevronReserve, double iconHeight, double labelHeight) {
+    const double contentHeight = std::max(0.0,
+        bodyHeight - chevronReserve);
+    const double freeHeight = std::max(0.0,
+        contentHeight - iconHeight - labelHeight);
+    const double desiredPad = std::clamp(
+        double(value.innerPadding) * .28, 2.0, 5.0);
+    const double desiredGap = std::clamp(
+        double(value.innerPadding) * .24, 2.0, 5.0);
+    const int gapCount = int(value.showIcon) + int(value.showValue);
+    VerticalLevelFlow out;
+    out.pad = std::min(desiredPad,
+        freeHeight / (gapCount == 2 ? 6.0 : 4.0));
+    out.gap = gapCount ? std::min(desiredGap,
+        std::max(0.0, (freeHeight - 2.0 * out.pad) /
+                           (gapCount + 1.0))) : 0.0;
+    out.iconTop = bodyHeight - chevronReserve -
+        out.pad - iconHeight;
+    out.sliderTop = out.pad +
+        (value.showValue ? labelHeight + out.gap : 0.0);
+    out.sliderBottom = std::max(out.sliderTop,
+        value.showIcon ? out.iconTop - out.gap :
+            bodyHeight - chevronReserve - out.pad);
+    return out;
+}
 // Computed card layout, shared by future XAML painting and hit geometry.
 // One shape policy for Previous/Play/Next, Shuffle/Repeat and session switch.
 double MediaButtonCornerRadius(const osd_model::MediaModel& model,
@@ -1627,7 +1661,9 @@ void ArmInteractionTimer(State& state, bool active) {
     }
     if (!active && (state.current.kind == LevelKind::Mixer ||
                     state.current.kind == LevelKind::Media) &&
-        state.pairedVolume && PointerInsideHost(*state.pairedVolume))
+        state.pairedVolume &&
+        (PointerInsideHost(*state.pairedVolume) ||
+         PointerInsideHost(state)))
         return;
     if (!active)
         SetTimer(state.host, kHideTimer,
@@ -2979,23 +3015,13 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     const double inner = std::max(0.0, static_cast<double>(value.innerPadding));
 
     if (value.vertical) {
-        // Center both texts using their measured bounds. Stack the label,
-        // an expanding progress region, and speaker from top to bottom.
-        // The inset uses the user's inner padding; space compresses when
-        // a custom height cannot accommodate all three elements.
-        const double freeHeight = std::max(0.0, bodyH -
-            mixerButton.verticalReserve - iconH - labelH -
-            std::max(trackThickness, wantedThumb));
-        const double pad = std::min(inner / 2.0,
-            freeHeight / (value.showValue ? 4.0 : 3.0));
-        const double gap = std::min(
-            std::max(trackThickness, wantedThumb),
-            std::max(0.0, (freeHeight - 2.0 * pad) /
-                (value.showValue ? 2.0 : 1.0)));
-        const double iconTop =
-            bodyH - mixerButton.verticalReserve - pad - iconH;
-        const double trackTop = value.showValue ? pad + labelH + gap : pad;
-        const double trackBottom = std::max(trackTop, iconTop - gap);
+        // Controls and text have distinct measured rows. Layout budgets
+        // modest gaps first and assigns the entire remainder to the Slider.
+        const auto flow = osd_layout::VerticalLevelBounds(value,
+            bodyH, mixerButton.verticalReserve, iconH, labelH);
+        const double iconTop = flow.iconTop;
+        const double trackTop = flow.sliderTop;
+        const double trackBottom = flow.sliderBottom;
         const double length = trackBottom - trackTop;
         const double filled = length * fillPercent / 100.0;
         const double centerX = bodyW / 2.0;
@@ -3023,7 +3049,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         state.value.Width(bodyW);
         state.value.TextAlignment(wx::TextAlignment::Center);
         controls::Canvas::SetLeft(state.value, 0.0);
-        controls::Canvas::SetTop(state.value, pad);
+        controls::Canvas::SetTop(state.value, flow.pad);
         state.levelSlider.Width(std::max(30.0,
             std::max(trackThickness, wantedThumb) + 12.0));
         state.levelSlider.Height(std::max(1.0, length));
@@ -3600,7 +3626,12 @@ void DeliverPending(State& root) {
         }
         root.pairedPanel = panel;
         panel->pairedVolume = &root;
-        ArmInteractionTimer(*panel, false);
+        // A metadata/progress refresh is not user interaction. Re-arming
+        // every 3s while the player worker polls prevents the configured
+        // timeout from ever firing (especially with Media duration 3s).
+        // On first show, ShowPositionedSurface already arms the timer.
+        if (!batch[1].passiveRefresh)
+            ArmInteractionTimer(*panel, false);
     }
     for (size_t i = extraStart; i < batch.size(); ++i)
         if (batch[i].mirrorView && !batch[i].key.empty())
