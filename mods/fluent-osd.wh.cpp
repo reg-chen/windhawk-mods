@@ -963,6 +963,16 @@ void ArmInteractionTimer(State& state, bool active) {
             nullptr);
 }
 
+// Interactive XAML details remain visible while the pointer is over their
+// native host. The normal configured timeout resumes when it leaves.
+bool PointerInsideHost(const State& state) {
+    if (!state.host) return false;
+    POINT point{};
+    RECT area{};
+    return GetCursorPos(&point) && GetWindowRect(state.host, &area) &&
+        PtInRect(&area, point) != FALSE;
+}
+
 bool InHitRegion(double x, double y, double left, double top,
                  double width, double height, double halo) {
     return width > 0.0 && height > 0.0 &&
@@ -1053,7 +1063,7 @@ void PointerReleased(State& state, const xinput::PointerRoutedEventArgs& args) {
                 Wh_Log(L"XAML notice details unexpected exception");
             }
         }
-        ArmInteractionTimer(state, false);
+        ArmInteractionTimer(state, PointerInsideHost(state));
         args.Handled(true);
         return;
     }
