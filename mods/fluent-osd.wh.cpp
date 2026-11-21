@@ -953,6 +953,40 @@ Frame CardFrame(const osd_model::Snapshot& value,
     return {x, y, std::max(28.0, logicalW - x * 2.0),
                   std::max(28.0, logicalH - y * 2.0)};
 }
+// Main level and attached Mixer share the exact same visible card insets.
+Frame LevelFrame(const osd_model::Snapshot& value) {
+    const double scale = std::clamp(
+        static_cast<double>(value.scale), 0.5, 6.0);
+    const double w = static_cast<double>(
+        value.anchor.right - value.anchor.left) / scale;
+    const double h = static_cast<double>(
+        value.anchor.bottom - value.anchor.top) / scale;
+    const double x = value.vertical ? 7.0 : 13.0;
+    const double y = value.vertical ? 6.0 : 10.0;
+    return {x, y, std::max(28.0, w - 2.0 * x),
+        std::max(28.0, h - (value.vertical ? 12.0 : 23.0))};
+}
+struct MixerButton {
+    bool visible = false;
+    double size = 0, x = 0, y = 0, verticalReserve = 0;
+};
+MixerButton MixerButtonGeometry(const osd_model::Snapshot& value,
+                                double bodyW, double bodyH) {
+    if (value.kind != osd_model::Kind::Volume || !value.mixerChevron)
+        return {};
+    if (!value.vertical) {
+        const double size = std::clamp(bodyW * .09, 20.0, 28.0);
+        return {true, size, std::max(0.0, bodyW - size - 2.0),
+            std::max(0.0, (bodyH - size) / 2.0), 0.0};
+    }
+    // On the slim card, the button has its own bottom row rather
+    // than sharing the speaker/track region.
+    const double size = std::clamp(bodyW * .40, 20.0, 28.0);
+    const double bottom = std::clamp(bodyH * .04, 4.0, 9.0);
+    const double gap = std::clamp(bodyH * .025, 4.0, 10.0);
+    return {true, size, std::max(0.0, (bodyW - size) / 2.0),
+        std::max(0.0, bodyH - size - bottom), size + bottom + gap};
+}
 struct Status {
     Frame frame;
     bool lock = false, interactive = false;
@@ -1887,7 +1921,7 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         !state.mixerOutputs || !state.mixerOutputsScroll) return;
     state.mixerPopulating = true;
     state.current = data;
-    const auto frame = osd_layout::CardFrame(data, 4.0 / 380.0, 4.0 / 200.0);
+    const auto frame = osd_layout::LevelFrame(data);
     const double w = frame.width, h = frame.height;
     const double pad = std::clamp(
         static_cast<double>(data.innerPadding), 6.0, 22.0) * .68;
@@ -2138,16 +2172,11 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     state.track.Visibility(wx::Visibility::Visible);
     state.fill.Visibility(wx::Visibility::Visible);
 
-    const float scale = std::clamp(value.scale, 0.5f, 6.0f);
-    const double logicalW = static_cast<double>(
-        value.anchor.right - value.anchor.left) / scale;
-    const double logicalH = static_cast<double>(
-        value.anchor.bottom - value.anchor.top) / scale;
-    const double insetX = value.vertical ? 7.0 : 13.0;
-    const double insetY = value.vertical ? 6.0 : 10.0;
-    const double bodyW = std::max(28.0, logicalW - insetX * 2.0);
-    const double bodyH = std::max(28.0, logicalH -
-        (value.vertical ? 12.0 : 23.0));
+    const auto frame = osd_layout::LevelFrame(value);
+    const double insetX = frame.insetX, insetY = frame.insetY;
+    const double bodyW = frame.width, bodyH = frame.height;
+    const auto mixerButton =
+        osd_layout::MixerButtonGeometry(value, bodyW, bodyH);
     state.canvas.Width(bodyW);
     state.canvas.Height(bodyH);
     state.card.Background(Brush(value.background, value.backgroundAlpha));
@@ -2215,14 +2244,16 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         // The inset uses the user's inner padding; space compresses when
         // a custom height cannot accommodate all three elements.
         const double freeHeight = std::max(0.0, bodyH -
-            iconH - labelH - std::max(trackThickness, wantedThumb));
+            mixerButton.verticalReserve - iconH - labelH -
+            std::max(trackThickness, wantedThumb));
         const double pad = std::min(inner / 2.0,
             freeHeight / (value.showValue ? 4.0 : 3.0));
         const double gap = std::min(
             std::max(trackThickness, wantedThumb),
             std::max(0.0, (freeHeight - 2.0 * pad) /
                 (value.showValue ? 2.0 : 1.0)));
-        const double iconTop = bodyH - pad - iconH;
+        const double iconTop =
+            bodyH - mixerButton.verticalReserve - pad - iconH;
         const double trackTop = value.showValue ? pad + labelH + gap : pad;
         const double trackBottom = std::max(trackTop, iconTop - gap);
         const double length = trackBottom - trackTop;
@@ -2280,7 +2311,8 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         // The outer inset follows the original painted-card cutout and
         // the user's configurable inner padding.
         const double minTrack = std::max(trackThickness, wantedThumb);
-        const double chevronSpace = value.mixerChevron ? 32.0 : 0.0;
+        const double chevronSpace = mixerButton.visible
+            ? mixerButton.size + 4.0 : 0.0;
         const double freeWidth = std::max(0.0,
             bodyW - iconW - labelW - minTrack - chevronSpace);
         const double pad = std::min(inner + insetX,
@@ -2290,8 +2322,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
                 (freeWidth - 2.0 * pad) /
                 (value.showValue ? 2.0 : 1.0)));
         const double iconX = pad;
-        const double valueX = bodyW - pad - labelW -
-            (value.mixerChevron ? 32.0 : 0.0);
+        const double valueX = bodyW - pad - labelW - chevronSpace;
         const double trackX = iconX + iconW + gap;
         const double trackRight = value.showValue
             ? valueX - gap : bodyW - pad;
@@ -2346,15 +2377,11 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         state.iconH = iconH;
     }
 
-    if (value.kind == LevelKind::Volume && value.mixerChevron) {
-        const double size = std::clamp(bodyW * .09, 20.0, 28.0);
-        state.mixerChevron.Width(size);
-        state.mixerChevron.Height(size);
-        controls::Canvas::SetLeft(state.mixerChevron,
-            std::max(0.0, bodyW - size - 2.0));
-        controls::Canvas::SetTop(state.mixerChevron,
-            value.vertical ? std::max(0.0, bodyH - size - 2.0)
-                           : std::max(0.0, (bodyH - size) / 2.0));
+    if (mixerButton.visible) {
+        state.mixerChevron.Width(mixerButton.size);
+        state.mixerChevron.Height(mixerButton.size);
+        controls::Canvas::SetLeft(state.mixerChevron, mixerButton.x);
+        controls::Canvas::SetTop(state.mixerChevron, mixerButton.y);
         state.mixerChevron.Visibility(wx::Visibility::Visible);
     }
     ShowPositionedSurface(state, value, insetX, insetY, bodyW, bodyH);
@@ -2548,6 +2575,10 @@ void CreateContent(State& state) {
     mixerChevron.Visibility(wx::Visibility::Collapsed);
     mixerChevron.Content(winrt::box_value(winrt::hstring(L"\uE70D")));
     mixerChevron.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+    // Default Button styles can exceed the width of a vertical OSD.
+    mixerChevron.MinWidth(0.0);
+    mixerChevron.MinHeight(0.0);
+    mixerChevron.Padding(wx::Thickness{0.0, 0.0, 0.0, 0.0});
     mixerChevron.Click([&state](auto const&, auto const&) {
         if (state.current.kind == LevelKind::Volume)
             SendInput(state, InputAction::OpenMixer, 0);
@@ -6612,7 +6643,13 @@ void HideGdiLevelForXaml() {
         ShowWindow(g_popupWnd, SW_HIDE);
     }
     HideMirroredWindows(false);
-    ClosePanel();
+    if (g_xamlMixerOpen && g_popupKind == PopupKind::NativeVolume) {
+        // A rendering-backend hide must not perform a Mixer close:
+        // ClosePanel also destroys the endpoint/session snapshot.
+        if (g_panelWnd) ShowWindow(g_panelWnd, SW_HIDE);
+    } else {
+        ClosePanel();
+    }
     if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
     UpdateArrowHitWindow();
     UpdateSpeakerHitWindow();
@@ -9395,8 +9432,14 @@ bool BuildMixerPanelAnchors(RECT& main, RECT& panel, float scale) {
     const int position = g_position.load();
     const auto direction = DirectionForPopup(main, mi.rcWork,
                                              position, vertical);
-    const auto attachment = GetPanelAttachment(vertical, direction, scale,
-                                              mw, mh, pw, ph);
+    auto attachment = GetPanelAttachment(vertical, direction, scale,
+                                         mw, mh, pw, ph);
+    if (vertical) {
+        // GetPanelAttachment assumes the 4px legacy panel inset;
+        // both XAML cards now have a 7px side inset.
+        const int delta = static_cast<int>(std::lround(3.0f * scale));
+        attachment.x += direction == FlyoutDirection::Left ? delta : -delta;
+    }
     // Center the composition as one unit on the relevant central axis,
     // preserving the same attachment offset as the original panel.
     if (vertical && PositionCentersX(position)) {
