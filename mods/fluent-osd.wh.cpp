@@ -1096,72 +1096,145 @@ double MediaButtonCornerRadius(const osd_model::MediaModel& model,
 }
 struct MediaGeometry {
     Frame frame;
-    double artX = 0, artY = 0, artSize = 0;
-    double textX = 0, textW = 0, titleY = 0, artistY = 0;
-    double timelineY = 0, timeY = 0, timeHeight = 0, controlsY = 0;
-    double controlRadius = 0, controlX[3]{};
+    bool hasTimeline = false, cycleVisible = false;
+    double artX = 0, artY = 0, artSize = 0, artCorner = 0;
+    double textX = 0, textW = 0;
+    double titleY = 0, titleH = 0, titleFont = 0;
+    double artistY = 0, artistH = 0, artistFont = 0;
+    double timelineY = 0, timelineH = 0;
+    double timeY = 0, timeHeight = 0, timeFont = 0;
+    double controlsY = 0, controlRadius = 0, controlX[3]{};
     double extraX = 0, extraY[2]{};
+    double cycleX = 0, cycleY = 0, cycleSize = 0, cycleFont = 0;
+    double placeholderFont = 0;
 };
 MediaGeometry MediaLayout(const osd_model::Snapshot& value) {
     MediaGeometry g;
     g.frame = LevelFrame(value);
+    const auto& m = value.media;
     const double w = g.frame.width, h = g.frame.height;
     const double pad = std::clamp(value.innerPadding * .7, 9.0, 17.0);
     const double artGap = std::clamp(w * .035, 8.0, 16.0);
     const double availableW = std::max(1.0, w - 2.0 * pad);
     const double availableH = std::max(1.0, h - 2.0 * pad);
-    const bool shuffle = value.media.canShuffle && value.media.shuffleKnown;
-    const bool repeat = value.media.canRepeat && value.media.repeatMode >= 0;
+    const double scale = std::clamp(m.controlSizePercent / 100.0, .9, 1.35);
+    const bool shuffle = m.canShuffle && m.shuffleKnown;
+    const bool repeat = m.canRepeat && m.repeatMode >= 0;
     const bool extra = shuffle || repeat, both = shuffle && repeat;
-    const double minControlW = extra ? 139.0 : 112.0;
-    g.artSize = std::max(1.0, std::min({
-        availableH, availableW * .52,
-        std::max(1.0, availableW - artGap - minControlW)}));
+    const bool buttons = m.canPrevious || m.canToggle || m.canNext || extra;
+    g.hasTimeline = m.hasTimeline && m.end > m.start;
+
+    // Solve the square cover against the control group's required width.
+    // Unlike a fixed 112/139px reservation, this responds to panel width,
+    // artwork height, available actions and configured button scale.
+    const auto fits = [&](double art) {
+        const double textWidth = availableW - art - artGap;
+        const double mainGap = std::clamp(textWidth * .045, 5.0, 8.0);
+        const double auxGap = extra
+            ? std::clamp(textWidth * .05, 6.0, 9.0) : 0.0;
+        const double r = std::min(art * .115 * scale, 20.0 * scale);
+        return textWidth >= (extra ? 7.0 : 6.0) * r +
+            2.0 * mainGap + auxGap;
+    };
+    const double maxArt = std::max(1.0,
+        std::min(availableH, availableW * .52));
+    g.artSize = maxArt;
+    if (!fits(maxArt)) {
+        double low = 1.0, high = maxArt;
+        // Pure bounded search: at larger art sizes, the remaining text
+        // column is narrower and the desired transport buttons are larger.
+        for (int i = 0; i < 18; ++i) {
+            const double mid = (low + high) / 2.0;
+            if (fits(mid)) low = mid;
+            else high = mid;
+        }
+        g.artSize = low;
+    }
     g.artX = pad;
-    g.artY = pad + std::max(0.0, (availableH - g.artSize) / 2.0);
+    g.artY = pad + std::max(0.0,
+        (availableH - g.artSize) / 2.0);
+    const double artBottom = g.artY + g.artSize;
+    g.artCorner = std::clamp(g.artSize * .056, 4.0, 14.0);
+    g.placeholderFont = std::clamp(g.artSize * .30, 20.0, 48.0);
     g.textX = g.artX + g.artSize + artGap;
     g.textW = std::max(1.0, w - pad - g.textX);
-    g.titleY = g.artY + g.artSize * .025;
-    g.artistY = g.artY + g.artSize * .235;
-    g.timelineY = g.artY + g.artSize * .448;
-    g.timeY = g.artY + g.artSize * .55;
-    g.timeHeight = std::max(12.0, g.artSize * .13);
-    const double scale = std::clamp(
-        value.media.controlSizePercent / 100.0, .9, 1.35);
-    // The old radius could consume 100% of the row width. Reserve a
-    // horizontal gap for each primary button and for the auxiliary column.
+
+    // Typography and the complete vertical stack are functions of the
+    // available cover area and user's font size, not absolute positions.
+    const double fontScale = std::clamp(g.artSize / 120.0, .78, 1.0);
+    g.titleFont = std::max(10.0,
+        std::clamp(double(value.fontSize + 1), 12.0, 22.0) * fontScale);
+    g.artistFont = std::max(9.0,
+        std::clamp(double(value.fontSize - 2), 10.0, 18.0) * fontScale);
+    g.timeFont = std::max(9.0,
+        std::clamp(double(value.fontSize - 4), 9.0, 14.0) * fontScale);
+    g.titleH = g.titleFont * 1.25;
+    g.artistH = g.artistFont * 1.25;
+    g.timeHeight = g.timeFont * 1.25;
+    g.timelineH = std::clamp(g.artSize * .18, 20.0, 30.0);
+    const double titleGap = std::clamp(g.artSize * .02, 2.0, 5.0);
+    const double artistSeekGap = std::clamp(g.artSize * .03, 2.0, 6.0);
+    const double seekTimeGap = std::clamp(g.artSize * .014, 1.0, 3.0);
+    const double timeControlsGap = std::clamp(g.artSize * .025, 2.0, 6.0);
+    const double stackedExtraGap = both
+        ? std::clamp(g.artSize * .022, 2.0, 5.0) : 0.0;
+
+    // Align every main transport button's BOTTOM with the cover bottom.
+    // With both extras, Repeat's bottom shares that baseline; Shuffle sits
+    // above it at the calculated gap. This is a constraint, not a Y ratio.
     const double mainGap = std::clamp(g.textW * .045, 5.0, 8.0);
-    const double auxGap = extra ? std::clamp(g.textW * .05, 6.0, 9.0) : 0.0;
-    const double gapReserve = 2.0 * mainGap + auxGap;
-    // Cap diameter vertically as well: a 135%-size control must never
-    // collide with the time labels or escape the rounded card bottom.
-    const double verticalRoom = g.artSize - 3.0 -
-        (g.timeY - g.artY) - g.timeHeight - 4.0 - (both ? 5.0 : 0.0);
-    const double maxVerticalRadius = std::max(1.0, verticalRoom / 2.0);
-    g.controlRadius = std::max(1.0, std::min({
+    const double auxGap = extra
+        ? std::clamp(g.textW * .05, 6.0, 9.0) : 0.0;
+    const double rows = g.titleH + titleGap + g.artistH +
+        (g.hasTimeline ? artistSeekGap + g.timelineH +
+            seekTimeGap + g.timeHeight : 0.0);
+    const double maxVerticalRadius = std::max(1.0,
+        (artBottom - pad - rows - timeControlsGap - stackedExtraGap) / 2.0);
+    g.controlRadius = buttons ? std::max(1.0, std::min({
         g.artSize * .115 * scale, 20.0 * scale,
-        (g.textW - gapReserve) / (extra ? 7.0 : 6.0),
-        maxVerticalRadius}));
-    // Half-size extra buttons use one primary radius in width, not two.
-    const double auxiliaryWidth = extra ? g.controlRadius : 0.0;
-    const double groupWidth = auxiliaryWidth + auxGap +
+        (g.textW - 2.0 * mainGap - auxGap) / (extra ? 7.0 : 6.0),
+        maxVerticalRadius})) : 0.0;
+    g.controlsY = artBottom - g.controlRadius;
+    const double groupWidth = (extra ? g.controlRadius : 0.0) + auxGap +
         6.0 * g.controlRadius + 2.0 * mainGap;
-    const double left = g.textX + std::max(0.0,
-        (g.textW - groupWidth) / 2.0);
-    g.controlX[0] = left + auxiliaryWidth + auxGap + g.controlRadius;
+    const double groupLeft = g.textX +
+        std::max(0.0, (g.textW - groupWidth) / 2.0);
+    g.controlX[0] = groupLeft +
+        (extra ? g.controlRadius : 0.0) + auxGap + g.controlRadius;
     g.controlX[1] = g.controlX[0] + 2.0 * g.controlRadius + mainGap;
     g.controlX[2] = g.controlX[1] + 2.0 * g.controlRadius + mainGap;
-    g.extraX = left + auxiliaryWidth / 2.0;
-    // Both extras are a true stacked column. A lone extra sits on the
-    // transport baseline instead of floating above or below it.
-    const double stackOffset = both ? g.controlRadius / 2.0 + 2.5 : 0.0;
-    const double verticalExtent = g.controlRadius + (both ? 2.5 : 0.0);
-    const double earliest = g.timeY + g.timeHeight + 4.0 + verticalExtent;
-    const double latest = g.artY + g.artSize - 3.0 - verticalExtent;
-    g.controlsY = std::clamp(g.artY + g.artSize * .825,
-        std::min(earliest, latest), latest);
-    g.extraY[0] = g.controlsY - stackOffset;
-    g.extraY[1] = g.controlsY + stackOffset;
+    g.extraX = groupLeft + (extra ? g.controlRadius / 2.0 : 0.0);
+    g.extraY[0] = both ? artBottom - 1.5 * g.controlRadius -
+        stackedExtraGap : artBottom - g.controlRadius / 2.0;
+    g.extraY[1] = artBottom - g.controlRadius / 2.0;
+
+    // Lay out content backwards from the cover-anchored control group.
+    // Labels can rise into free panel space above the image when a narrow
+    // album cover cannot contain a large user-configured font and Slider.
+    const double controlTop = artBottom -
+        2.0 * g.controlRadius - stackedExtraGap;
+    if (g.hasTimeline) {
+        g.timeY = controlTop - timeControlsGap - g.timeHeight;
+        g.timelineY = g.timeY - seekTimeGap - g.timelineH;
+        g.titleY = std::max(pad, std::min(g.artY,
+            g.timelineY - artistSeekGap - g.artistH -
+            titleGap - g.titleH));
+    } else {
+        g.titleY = std::max(pad, std::min(g.artY,
+            controlTop - timeControlsGap - g.artistH -
+            titleGap - g.titleH));
+    }
+    g.artistY = g.titleY + g.titleH + titleGap;
+
+    // The session-switch badge is anchored INSIDE the cover, and does
+    // not depend on the independently configurable transport-button size.
+    const double overlayInset = std::clamp(g.artSize * .035, 3.0, 8.0);
+    g.cycleSize = std::clamp(g.artSize * .20, 16.0, 28.0);
+    g.cycleVisible = m.sessionCount > 1 &&
+        g.cycleSize + 2.0 * overlayInset < g.artSize;
+    g.cycleX = g.artX + g.artSize - overlayInset - g.cycleSize;
+    g.cycleY = g.artY + overlayInset;
+    g.cycleFont = std::clamp(g.cycleSize * .50, 8.0, 16.0);
     return g;
 }
 struct Status {
@@ -2282,6 +2355,16 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         prev.controlSizePercent==m.controlSizePercent&&
         prev.squareButtons==m.squareButtons&&
         prev.buttonCornerRadius==m.buttonCornerRadius&&
+        state.current.fontSize==snap.fontSize&&
+        state.current.innerPadding==snap.innerPadding&&
+        state.current.cornerRadius==snap.cornerRadius&&
+        state.current.vertical==snap.vertical&&
+        state.current.background==snap.background&&
+        state.current.backgroundAlpha==snap.backgroundAlpha&&
+        state.current.accent==snap.accent&&
+        state.current.text==snap.text&&
+        state.current.track==snap.track&&
+        state.current.borderless==snap.borderless&&
         state.current.anchor.left==snap.anchor.left&&
         state.current.anchor.top==snap.anchor.top&&
         state.current.anchor.right==snap.anchor.right&&
@@ -2342,8 +2425,8 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
     };
     controls::Border cover;
     cover.Width(g.artSize);cover.Height(g.artSize);
-    const double cr=std::clamp(g.artSize*.056,4.0,14.0);
-    cover.CornerRadius(wx::CornerRadius{cr,cr,cr,cr});
+    cover.CornerRadius(wx::CornerRadius{
+        g.artCorner,g.artCorner,g.artCorner,g.artCorner});
     cover.Background(Brush(snap.track,180));
     if (state.mediaBitmap) {
         controls::Image img;
@@ -2354,7 +2437,7 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
     } else {
         controls::TextBlock fallback;
         fallback.Text(L"\u266B");
-        fallback.FontSize(std::clamp(g.artSize*.3,20.0,48.0));
+        fallback.FontSize(g.placeholderFont);
         fallback.Foreground(Brush(snap.text,190));
         fallback.TextAlignment(wx::TextAlignment::Center);
         fallback.VerticalAlignment(wx::VerticalAlignment::Center);
@@ -2372,22 +2455,21 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         place(v,x,y);
         return v;
     };
-    text(m.title,g.textX,g.titleY,g.textW,g.artSize*.21,
-         std::clamp(snap.fontSize+1,12,22),255);
-    text(m.artist,g.textX,g.artistY,g.textW,g.artSize*.17,
-         std::clamp(snap.fontSize-2,10,18),190);
-    if (m.sessionCount>1&&g.artSize>45) {
-        const double r=std::clamp(g.artSize*.105,9.0,14.0);
+    text(m.title,g.textX,g.titleY,g.textW,g.titleH,
+         g.titleFont,255);
+    text(m.artist,g.textX,g.artistY,g.textW,g.artistH,
+         g.artistFont,190);
+    if (g.cycleVisible) {
         controls::Button cycle;
-        cycle.Width(2*r);cycle.Height(2*r);
+        cycle.Width(g.cycleSize);cycle.Height(g.cycleSize);
         cycle.MinWidth(0);cycle.MinHeight(0);
         cycle.Padding(wx::Thickness{0,0,0,0});
         const double corner = osd_layout::MediaButtonCornerRadius(
-            m, 2.0 * r);
+            m, g.cycleSize);
         cycle.CornerRadius(wx::CornerRadius{
             corner, corner, corner, corner});
         cycle.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
-        cycle.FontSize(std::max(10.0,r));
+        cycle.FontSize(g.cycleFont);
         cycle.Content(winrt::box_value(winrt::hstring(L"\uE76C")));
         cycle.Background(Brush(0x181b22,205));
         cycle.Foreground(Brush(0xffffff));
@@ -2395,12 +2477,12 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
             SendMediaCommand(state,InputAction::MediaAction,7);
             ArmInteractionTimer(state,true);
         });
-        place(cycle,g.artX+g.artSize-2*r-4,g.artY+4);
+        place(cycle,g.cycleX,g.cycleY);
     }
-    if (m.hasTimeline&&m.end>m.start) {
+    if (g.hasTimeline) {
         controls::Slider slider;
         slider.Width(g.textW);
-        slider.Height(std::max(24.0,g.artSize*.18));
+        slider.Height(g.timelineH);
         slider.MinWidth(0);
         slider.Minimum(0);slider.Maximum(100);
         slider.SmallChange(1);slider.IsEnabled(m.canSeek);
@@ -2409,10 +2491,10 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
             double(m.end-m.start),0.0,100.0));
         state.mediaElapsed=text(osd_model::MediaTime(pos-m.start),
             g.textX,g.timeY,g.textW*.5,g.timeHeight,
-            std::clamp(snap.fontSize-4,9,14),190);
+            g.timeFont,190);
         auto total=text(osd_model::MediaTime(m.end-m.start),
             g.textX+g.textW*.5,g.timeY,g.textW*.5,g.timeHeight,
-            std::clamp(snap.fontSize-4,9,14),190);
+            g.timeFont,190);
         total.TextAlignment(wx::TextAlignment::Right);
         state.mediaSlider=slider;
         slider.ValueChanged([&state](auto const&,auto const& a) {
@@ -2443,7 +2525,7 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         slider.PointerCaptureLost([&state](auto const&,auto const&) {
             CompleteMediaSeek(state);
         });
-        place(slider,g.textX,g.timelineY-std::max(3.0,g.artSize*.028));
+        place(slider,g.textX,g.timelineY);
     }
     auto action=[&](int code,const wchar_t* glyph,
                     double x,double y,double size,bool enabled,bool active) {
@@ -2457,7 +2539,7 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         b.HorizontalContentAlignment(wx::HorizontalAlignment::Center);
         b.VerticalContentAlignment(wx::VerticalAlignment::Center);
         b.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
-        b.FontSize(std::max(10.0,size*.46));
+        b.FontSize(std::clamp(size*.46, 7.0, 24.0));
         b.Content(winrt::box_value(winrt::hstring(glyph)));
         b.Background(Brush(active?snap.accent:snap.track,active?110:175));
         b.Foreground(Brush(snap.text));b.IsEnabled(enabled);
