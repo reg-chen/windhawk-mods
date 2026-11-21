@@ -5661,6 +5661,22 @@ struct PopupPlacement {
     int width = 0, height = 0;
     RECT work{}, monitorBounds{}, bounds{};
 };
+// Shared placement output is authoritative for both render backends.
+// A renderer reads the calculated bounds, never measures another
+// backend's hidden HWND to discover where it should draw.
+namespace osd_placement {
+PopupPlacement g_main{};
+bool g_valid = false; // All placement callbacks run on the same UI thread.
+void Publish(const PopupPlacement& placement) {
+    g_main = placement;
+    g_valid = true;
+}
+bool CurrentAnchor(RECT& anchor) {
+    if (!g_valid) return false;
+    anchor = g_main.bounds;
+    return true;
+}
+}
 bool CalculatePopupPlacement(HMONITOR monitor, PopupPlacement& p) {
     MONITORINFO mi{sizeof(mi)};
     if (!GetMonitorInfoW(monitor, &mi)) return false;
@@ -5880,7 +5896,11 @@ void MovePopupToDisplay(const BrightnessEvent& ev) {
     if (!monitor)
         monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
     PopupPlacement place{};
-    if (!CalculatePopupPlacement(monitor, place)) return;
+    if (!CalculatePopupPlacement(monitor, place)) {
+        osd_placement::g_valid = false;
+        return;
+    }
+    osd_placement::Publish(place);
     g_scale = place.scale;
     g_width = place.width;
     g_height = place.height;
@@ -8546,7 +8566,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     const bool brightness = kind == PopupKind::NativeBrightness;
     HideGdiLevelForXaml();
     RECT target{};
-    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
+    if (!osd_placement::CurrentAnchor(target)) {
         Wh_Log(L"Fluent OSD v1.0.24: XAML %s missing anchor",
                brightness ? L"brightness" : L"volume");
         return;
@@ -8575,7 +8595,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
 void ShowMigratedXamlLockStatus() {
     HideGdiLevelForXaml();
     RECT target{};
-    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
+    if (!osd_placement::CurrentAnchor(target)) {
         Wh_Log(L"XAML v1.0.24: lock status missing placement anchor");
         return;
     }
@@ -8597,7 +8617,7 @@ void ShowMigratedXamlLockStatus() {
 void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     HideGdiLevelForXaml();
     RECT target{};
-    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
+    if (!osd_placement::CurrentAnchor(target)) {
         Wh_Log(L"XAML v1.0.24: device notice missing placement anchor");
         return;
     }
@@ -8625,7 +8645,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
 void ShowMigratedXamlNativeEvent() {
     HideGdiLevelForXaml();
     RECT target{};
-    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
+    if (!osd_placement::CurrentAnchor(target)) {
         Wh_Log(L"XAML v1.0.24: native event missing placement anchor");
         return;
     }
@@ -8730,7 +8750,7 @@ bool CopyClipboardThumbnailPixels(HBITMAP bitmap,
 void ShowMigratedXamlClipboardNotice() {
     HideGdiLevelForXaml();
     RECT target{};
-    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
+    if (!osd_placement::CurrentAnchor(target)) {
         ClearClipboardThumbnail();
         Wh_Log(L"XAML v1.0.24: clipboard notice missing placement anchor");
         return;
@@ -8753,7 +8773,7 @@ void ShowMigratedXamlClipboardNotice() {
         // compact status-card bounds after a conversion failure.
         BrightnessEvent empty{};
         MovePopupToDisplay(empty);
-        if (!GetWindowRect(g_popupWnd, &snapshot.anchor)) return;
+        if (!osd_placement::CurrentAnchor(snapshot.anchor)) return;
         snapshot.scale = g_scale;
     }
     if (!xaml_osd::Show(snapshot))
