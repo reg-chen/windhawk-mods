@@ -37,7 +37,11 @@ relay clicks/drags/wheels to the existing audio and brightness
 workers. DDC targets have independent XAML hosts and their original
 monitor identity. Caps/Num/Scroll/Insert now use a shared XAML status card.
 Both single-item and aggregated USB/Bluetooth/network notices now use native
-XAML with click-to-expand details and ScrollViewer. Keyboard backlight,
+XAML with click-to-expand details and ScrollViewer. Normalized volume and
+brightness bars use native XAML Sliders (including DDC); hidden-thumb or
+unknown raw ranges retain the original manual bar. All-monitor mode projects
+read-only XAML Islands at each monitor's DPI and placement; independent DDC
+target values are never mirrored. Keyboard backlight,
 airplane mode, camera/access, microphone, virtual desktop and system text
 events use the same XAML status card. Clipboard text/file notices reuse that
 status card; bounded image previews use a native WriteableBitmap, without
@@ -841,6 +845,7 @@ struct Snapshot {
     MixerModel mixer;
     MediaModel media;
     bool passiveRefresh = false;
+    bool mirrorView = false; // Controller-projected XAML-only replica.
     bool mixerChevron = false;
     ChevronDirection mixerDirection = ChevronDirection::Down;
     bool brightness = false;
@@ -1471,7 +1476,7 @@ struct State {
     controls::TextBlock icon{nullptr};
     controls::TextBlock value{nullptr};
     controls::Slider levelSlider{nullptr};
-    bool levelPopulating = false;
+    bool levelPopulating = false, viewOnly = false;
     shapes::Rectangle track{nullptr};
     shapes::Rectangle fill{nullptr};
     media::RectangleGeometry fillClip{nullptr};
@@ -1544,14 +1549,14 @@ bool PointerInsideHost(const State&);
 // All audio/WMI/DDC writes stay on the original Explorer OSD UI thread.
 // The STA handles pointer geometry and sends only bounded POD commands.
 void SendInput(State& state, InputAction action, int value) {
-    if (g_stopping.load() || !state.current.receiver) return;
+    if (state.viewOnly || g_stopping.load() || !state.current.receiver) return;
     osd_control::Submit(
         osd_control::Build(state.current, action, value),
         state.current.receiver);
 }
 void SendMixerInput(State& state, InputAction action, int index,
                     int value = 0) {
-    if (g_stopping.load() || !state.current.receiver) return;
+    if (state.viewOnly || g_stopping.load() || !state.current.receiver) return;
     osd_control::Submit(
         osd_control::BuildMixer(state.current, action, index, value),
         state.current.receiver);
@@ -1560,7 +1565,7 @@ void SendMixerInput(State& state, InputAction action, int index,
 void ArmInteractionTimer(State&, bool);
 void SendMediaCommand(State& state, InputAction action,
                       int value = 0, int64_t pos = 0) {
-    if (g_stopping.load() || !state.current.receiver) return;
+    if (state.viewOnly || g_stopping.load() || !state.current.receiver) return;
     osd_control::Submit(osd_control::BuildMedia(
         state.current, action, value, pos), state.current.receiver);
 }
@@ -1578,6 +1583,19 @@ void CompleteMediaSeek(State& state) {
     state.mediaPreviewHold=GetTickCount64()+1800;
     SendMediaCommand(state,InputAction::MediaSeek,0,dest);
     ArmInteractionTimer(state,true);
+}
+// Replicas share the source card's fade clock, not a separate timeout.
+void FadeMirrorsWith(State& owner, ULONGLONG at) {
+    State* root = owner.pairedVolume ? owner.pairedVolume : &owner;
+    for (auto& item : root->peers) {
+        auto& mirror = *item.second;
+        if (!mirror.viewOnly || !mirror.host || !mirror.card ||
+            !IsWindowVisible(mirror.host) || !mirror.current.fadeEnabled)
+            continue;
+        mirror.fading = mirror.fadeOut = true;
+        mirror.fadeStart = at;
+        SetTimer(mirror.host, kFadeTimer, 16, nullptr);
+    }
 }
 void HideSurface(State& state) {
     if (state.host) {
@@ -1609,6 +1627,9 @@ void HideSurface(State& state) {
     state.dragging = state.iconPressed = state.pointerActive = false;
     state.fading = state.fadeOut = false;
     if (state.host) ShowWindow(state.host, SW_HIDE);
+    if (!state.viewOnly && !state.pairedVolume)
+        for (auto& peer : state.peers)
+            if (peer.second->viewOnly) HideSurface(*peer.second);
     // Mirror the native panel's lifetime in its UI-thread controller.
     // The action is idempotent and generation-checked at the receiver.
     if (state.current.kind == LevelKind::Mixer && !g_stopping.load())
@@ -1628,7 +1649,7 @@ void HideAll(State& root) {
 // XAML itself owns hit testing and pointer capture. No detached topmost
 // HWND can cover the Island (or another physical monitor's Island).
 void ArmInteractionTimer(State& state, bool active) {
-    if (!state.host) return;
+    if (!state.host || state.viewOnly) return;
     KillTimer(state.host, kHideTimer);
     if (active && state.fadeOut) {
         KillTimer(state.host, kFadeTimer);
@@ -1662,7 +1683,7 @@ void ArmInteractionTimer(State& state, bool active) {
 // Interactive XAML details remain visible while the pointer is over their
 // native host. The normal configured timeout resumes when it leaves.
 bool PointerInsideHost(const State& state) {
-    if (!state.host) return false;
+    if (!state.host || state.viewOnly) return false;
     POINT point{};
     RECT area{};
     return GetCursorPos(&point) && GetWindowRect(state.host, &area) &&
@@ -1903,7 +1924,11 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
         KillTimer(state.host, kFadeTimer);
         state.card.Opacity(1.0);
     }
-    if (!value.passiveRefresh || !wasVisible)
+    if (state.viewOnly) {
+        if (state.card) state.card.IsHitTestVisible(false);
+        if (state.canvas) state.canvas.IsHitTestVisible(false);
+    }
+    if ((!value.passiveRefresh || !wasVisible) && !state.viewOnly)
         ArmInteractionTimer(state, state.dragging || state.iconPressed);
 }
 
@@ -3244,6 +3269,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         state->fading = state->fadeOut = true;
                         state->fadeStart = GetTickCount64();
                         SetTimer(hwnd, kFadeTimer, 16, nullptr);
+                        if (!state->viewOnly) {
+                            FadeMirrorsWith(*state, state->fadeStart);
+                            if (state->pairedVolume &&
+                                state->pairedVolume->host &&
+                                state->pairedVolume->card) {
+                                auto& master = *state->pairedVolume;
+                                master.fading = master.fadeOut = true;
+                                master.fadeStart = state->fadeStart;
+                                SetTimer(master.host, kFadeTimer, 16, nullptr);
+                            }
+                        }
                     } else HideSurface(*state);
                 } else if (wp == kStatusLineTimer) {
                     AdvanceStatusUnderline(*state, GetTickCount64());
@@ -3266,6 +3302,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_ERASEBKGND: return TRUE;
+        case WM_NCHITTEST:
+            if (state && state->viewOnly) return HTTRANSPARENT;
+            break;
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_CLOSE:
             // DDC peer cleanup must not terminate the root STA.
@@ -3520,7 +3559,8 @@ void CreateContent(State& state) {
 }
 void CreateSurface(State& state, HINSTANCE instance) {
     state.host = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+            (state.viewOnly ? WS_EX_TRANSPARENT : 0),
         kClass, L"", WS_POPUP, 0, 0, kWidth, kHeight,
         nullptr, nullptr, instance, &state);
     if (!state.host)
@@ -3551,6 +3591,10 @@ void CreateSurface(State& state, HINSTANCE instance) {
     winrt::check_hresult(interop->AttachToWindow(state.host));
     winrt::check_hresult(interop->get_WindowHandle(&state.island));
     if (!state.island) winrt::throw_hresult(E_POINTER);
+    if (state.viewOnly)
+        SetWindowLongPtrW(state.island, GWL_EXSTYLE,
+            GetWindowLongPtrW(state.island, GWL_EXSTYLE) |
+                WS_EX_TRANSPARENT);
     if (!SetWindowPos(state.island, nullptr, 0, 0, kWidth, kHeight,
         SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW))
         winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
@@ -3614,89 +3658,71 @@ void DeliverPending(State& root) {
     batch.swap(g_pending);
     ReleaseSRWLockExclusive(&g_snapshotLock);
     if (batch.empty()) return;
-
-    // Volume and its attached Media/Mixer panel share one lifetime.
-    if (batch.size() == 2 && batch.front().kind == LevelKind::Volume &&
-        (batch.back().kind == LevelKind::Mixer ||
-         batch.back().kind == LevelKind::Media)) {
-        const std::wstring panelKey =
-            batch.back().kind == LevelKind::Media ? L"media" : L"mixer";
-        for (auto it=root.peers.begin();it!=root.peers.end();) {
-            if (it->first!=panelKey) {
-                it->second->pairedVolume=nullptr;
-                CloseSurface(*it->second);
-                it=root.peers.erase(it);
-            } else ++it;
-        }
-        root.attachedPeerOpen = true;
-        DrawSnapshot(root, batch.front());
-        // Mixer owns the active inactivity timer while open. Do not hide
-        // the parent volume card earlier than its attached panel.
-        if (root.host) KillTimer(root.host, kHideTimer);
-        auto found = root.peers.find(panelKey);
-        if (found == root.peers.end()) {
-            auto fresh = std::make_unique<State>();
-            try { CreateSurface(*fresh, GetModuleHandleW(nullptr)); }
-            catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML Mixer host create failed: 0x%08lX",
-                    static_cast<unsigned long>(ex.code()));
-                CloseSurface(*fresh);
-                return;
-            }
-            found = root.peers.emplace(panelKey, std::move(fresh)).first;
-        }
-        root.pairedPanel = found->second.get();
-        found->second->pairedVolume = &root;
-        DrawSnapshot(*found->second, batch.back());
-        return;
-    }
     const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
-    if (!ddc) {
-        root.attachedPeerOpen = false;
-        root.pairedPanel = nullptr;
-        for (auto it = root.peers.begin(); it != root.peers.end();) {
-            if (it->first == L"mixer" || it->first == L"media") {
-                it->second->pairedVolume = nullptr;
-                CloseSurface(*it->second);
-                it = root.peers.erase(it);
-            } else {
-                HideSurface(*it->second);
-                ++it;
-            }
-        }
-        DrawSnapshot(root, batch.back());
-        return;
-    }
+    const bool attached = batch.size() >= 2 &&
+        batch[0].kind == LevelKind::Volume &&
+        (batch[1].kind == LevelKind::Media ||
+         batch[1].kind == LevelKind::Mixer);
+    const std::wstring panelKey = !attached ? L"" :
+        batch[1].kind == LevelKind::Media ? L"media" : L"mixer";
+    const size_t extraStart = attached ? 2 : (ddc ? 0 : 1);
+    std::unordered_set<std::wstring> active;
+    if (attached) active.insert(panelKey);
+    for (size_t i = extraStart; i < batch.size(); ++i)
+        if ((ddc || batch[i].mirrorView) && !batch[i].key.empty())
+            active.insert(batch[i].key);
+
     root.attachedPeerOpen = false;
     root.pairedPanel = nullptr;
-    HideSurface(root);
-    std::unordered_set<std::wstring> requested;
-    for (const auto& snap : batch) {
-        if (snap.key.empty()) continue;
-        requested.insert(snap.key);
-        auto found = root.peers.find(snap.key);
-        if (found == root.peers.end()) {
-            auto fresh = std::make_unique<State>();
-            try {
-                CreateSurface(*fresh, GetModuleHandleW(nullptr));
-            } catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.27: DDC target create failed 0x%08lX",
-                    static_cast<unsigned long>(ex.code()));
-                CloseSurface(*fresh);
-                continue;
-            }
-            found = root.peers.emplace(snap.key, std::move(fresh)).first;
-        }
-        DrawSnapshot(*found->second, snap);
-    }
-    // Reclaim no-longer-active DDC Island resources instead of keeping
-    // every monitor ever attached alive for Explorer's entire lifetime.
     for (auto it = root.peers.begin(); it != root.peers.end();) {
-        if (requested.find(it->first) == requested.end()) {
+        if (active.find(it->first) == active.end()) {
+            it->second->pairedVolume = nullptr;
             CloseSurface(*it->second);
             it = root.peers.erase(it);
         } else ++it;
     }
+    auto renderPeer = [&](const Snapshot& snap, const std::wstring& key,
+                          bool readOnly) -> State* {
+        auto found = root.peers.find(key);
+        if (found == root.peers.end()) {
+            auto peer = std::make_unique<State>();
+            peer->viewOnly = readOnly;
+            try { CreateSurface(*peer, GetModuleHandleW(nullptr)); }
+            catch (const winrt::hresult_error& ex) {
+                Wh_Log(L"XAML v1.0.27: peer create failed 0x%08lX",
+                    static_cast<unsigned long>(ex.code()));
+                CloseSurface(*peer);
+                return nullptr;
+            }
+            found = root.peers.emplace(key, std::move(peer)).first;
+        }
+        DrawSnapshot(*found->second, snap);
+        return found->second.get();
+    };
+    if (ddc) {
+        // DDC's per-display value is authoritative, never a clone.
+        HideSurface(root);
+        for (const auto& snap : batch)
+            if (!snap.key.empty()) (void)renderPeer(snap,snap.key,false);
+        return;
+    }
+    DrawSnapshot(root, batch.front());
+    if (attached) {
+        root.attachedPeerOpen = true;
+        if (root.host) KillTimer(root.host, kHideTimer);
+        State* panel = renderPeer(batch[1], panelKey, false);
+        if (!panel) {
+            root.attachedPeerOpen = false;
+            HideSurface(root);
+            return;
+        }
+        root.pairedPanel = panel;
+        panel->pairedVolume = &root;
+        ArmInteractionTimer(*panel, false);
+    }
+    for (size_t i = extraStart; i < batch.size(); ++i)
+        if (batch[i].mirrorView && !batch[i].key.empty())
+            (void)renderPeer(batch[i], batch[i].key, true);
 }
 
 void TryEnableIslandTransparency() {
@@ -7212,7 +7238,7 @@ HWND CreateMirrorSurface() {
 void RefreshMirrorOutputs(HMONITOR master) {
     // Every migrated popup owns its XAML Island; do not allocate unused
     // GDI+ replica HWNDs only to hide them immediately afterward.
-    // SMTC/Mixer still have their own GDI+ path until fully migrated.
+    // XAML all-monitor mode now creates native read-only peer Islands.
     const bool xamlPopup = g_popupKind == PopupKind::DdcBrightness ||
         g_popupKind == PopupKind::NativeBrightness ||
         g_popupKind == PopupKind::NativeVolume ||
@@ -7495,6 +7521,121 @@ xaml_osd::Snapshot MakeXamlSnapshot(
     data.accent = OsdAccentRgb();
     data.track = OsdTrackRgb(light);
     return data;
+}
+
+// Multi-display projection belongs to the controller, NOT XAML painting.
+// Replicas have per-display DPI/placement but no input commands or timers.
+int XamlMirrorOffset(int position, int difference, bool horizontal) {
+    if (horizontal) {
+        if (position == 2 || position == 6 || position == 8)
+            return difference;
+        if (PositionCentersX(position)) return difference / 2;
+    } else {
+        if (position == 0 || position == 1 || position == 2)
+            return difference;
+        if (PositionCentersY(position)) return difference / 2;
+    }
+    return 0;
+}
+bool ShowXamlMirroredBatch(std::vector<xaml_osd::Snapshot> batch) {
+    if (batch.empty()) return false;
+    if (g_displayOutputMode.load(std::memory_order_relaxed) == 3 &&
+        batch.front().kind != xaml_osd::LevelKind::DdcBrightness) {
+        const bool attached = batch.size() == 2 &&
+            batch.front().kind == xaml_osd::LevelKind::Volume &&
+            (batch[1].kind == xaml_osd::LevelKind::Media ||
+             batch[1].kind == xaml_osd::LevelKind::Mixer);
+        const xaml_osd::Snapshot master = batch.front();
+        MirrorScan scan{MonitorFromRect(&master.anchor,
+            MONITOR_DEFAULTTONEAREST), {}};
+        EnumDisplayMonitors(nullptr, nullptr, FindMirrorCallback,
+            reinterpret_cast<LPARAM>(&scan));
+        const int position = g_position.load(std::memory_order_relaxed);
+        const double originalScale = std::max(.5, double(master.scale));
+        for (HMONITOR monitor : scan.peers) {
+            MONITORINFOEXW info{sizeof(info)};
+            PopupPlacement target{};
+            if (!GetMonitorInfoW(monitor, &info) ||
+                !CalculatePopupPlacement(monitor, target) ||
+                target.scale <= 0.0f) continue;
+            const double ratio = target.scale / originalScale;
+            const auto scaled = [&](LONG length) {
+                return std::clamp(
+                    static_cast<int>(std::lround(length * ratio)), 1, 4096);
+            };
+            const int width = scaled(
+                master.anchor.right-master.anchor.left);
+            const int height = scaled(
+                master.anchor.bottom-master.anchor.top);
+            int x = target.bounds.left + XamlMirrorOffset(
+                position, target.width-width, true);
+            int y = target.bounds.top + XamlMirrorOffset(
+                position, target.height-height, false);
+            x = ClampPopupAxis(x,width,PositionCentersX(position)
+                ? target.monitorBounds : target.work,true);
+            y = ClampPopupAxis(y,height,PositionCentersY(position)
+                ? target.monitorBounds : target.work,false);
+            RECT main{x,y,x+width,y+height}, panel{};
+            if (attached) {
+                const auto& originalPanel = batch[1];
+                const int pw = scaled(originalPanel.anchor.right -
+                                      originalPanel.anchor.left);
+                const int ph = scaled(originalPanel.anchor.bottom -
+                                      originalPanel.anchor.top);
+                const bool vertical = master.vertical;
+                const auto direction = DirectionForPopup(
+                    main,target.work,position,vertical);
+                auto offset = GetPanelAttachment(
+                    vertical,direction,target.scale,width,height,pw,ph);
+                if (vertical) {
+                    const int correction = static_cast<int>(
+                        std::lround(3.0*target.scale));
+                    offset.x += direction == FlyoutDirection::Left
+                        ? correction : -correction;
+                }
+                if (vertical && PositionCentersX(position)) {
+                    const int low = std::min(0,offset.x);
+                    const int high = std::max(width,offset.x+pw);
+                    const int shift = (width-low-high)/2;
+                    main.left += shift; main.right += shift;
+                } else if (!vertical && PositionCentersY(position)) {
+                    const int low = std::min(0,offset.y);
+                    const int high = std::max(height,offset.y+ph);
+                    const int shift = (height-low-high)/2;
+                    main.top += shift; main.bottom += shift;
+                }
+                const int px = ClampPopupAxis(main.left+offset.x,pw,
+                    !vertical && PositionCentersX(position)
+                        ? target.monitorBounds : target.work,true);
+                const int py = ClampPopupAxis(main.top+offset.y,ph,
+                    vertical && PositionCentersY(position)
+                        ? target.monitorBounds : target.work,false);
+                panel=RECT{px,py,px+pw,py+ph};
+            }
+            const std::wstring prefix=std::wstring(L"mirror:")+
+                info.szDevice;
+            auto replica=master;
+            replica.key=prefix+L":main";
+            replica.anchor=main;
+            replica.scale=target.scale;
+            replica.receiver=nullptr;
+            replica.mirrorView=true;
+            batch.push_back(std::move(replica));
+            if (attached) {
+                auto other=batch[1];
+                other.key=prefix+L":panel";
+                other.anchor=panel;
+                other.scale=target.scale;
+                other.receiver=nullptr;
+                other.mirrorView=true;
+                batch.push_back(std::move(other));
+            }
+        }
+    }
+    return xaml_osd::ShowBatch(batch);
+}
+bool ShowXamlMirrored(xaml_osd::Snapshot snapshot) {
+    return ShowXamlMirroredBatch({std::move(snapshot)});
 }
 
 // All compact XAML categories share one rendering snapshot contract.
@@ -10027,7 +10168,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     static bool routeLogged[2]{};
     static bool unavailableLogged[2]{};
     const int index = brightness ? 1 : 0;
-    if (xaml_osd::Show(snapshot)) {
+    if (ShowXamlMirrored(snapshot)) {
         if (!routeLogged[index]) {
             Wh_Log(L"Fluent OSD v1.0.27: native %s -> XAML only",
                    brightness ? L"brightness" : L"volume");
@@ -10058,7 +10199,7 @@ void ShowMigratedXamlLockStatus() {
     snapshot.statusDetail = g_lastLockValue
         ? Tr(OsdText::On) : Tr(OsdText::Off);
     snapshot.statusActive = g_lastLockValue;
-    if (!xaml_osd::Show(snapshot))
+    if (!ShowXamlMirrored(snapshot))
         Wh_Log(L"XAML v1.0.27: lock status unavailable; NO GDI+ fallback");
 }
 
@@ -10087,7 +10228,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
         case NoticeIcon::Network:   snapshot.statusGlyph = L"\uE968"; break;
         default: return;
     }
-    if (!xaml_osd::Show(snapshot))
+    if (!ShowXamlMirrored(snapshot))
         Wh_Log(L"XAML v1.0.27: device notice unavailable; NO GDI+ fallback");
 }
 
@@ -10155,7 +10296,7 @@ void ShowMigratedXamlNativeEvent() {
             // Do not turn unknown payload kinds into invented status UI.
             return;
     }
-    if (!xaml_osd::Show(snapshot))
+    if (!ShowXamlMirrored(snapshot))
         Wh_Log(L"XAML v1.0.27: native event unavailable; NO GDI+ fallback");
 }
 
@@ -10228,7 +10369,7 @@ void ShowMigratedXamlClipboardNotice() {
         if (!osd_placement::CurrentAnchor(snapshot.anchor)) return;
         snapshot.scale = g_scale;
     }
-    if (!xaml_osd::Show(snapshot))
+    if (!ShowXamlMirrored(snapshot))
         Wh_Log(L"XAML v1.0.27: clipboard notice unavailable; NO GDI+ fallback");
 }
 
@@ -10429,7 +10570,7 @@ bool ShowXamlMediaPanel(bool passiveRefresh) {
     media.durationMs=OsdDuration(DurationKind::Media);
     media.passiveRefresh=passiveRefresh;
     media.media=BuildXamlMediaModel();
-    if(!xaml_osd::ShowBatch({volume,media})) {
+    if(!ShowXamlMirroredBatch({volume,media})) {
         Wh_Log(L"XAML SMTC: panel unavailable; NO GDI+ fallback");
         ResetXamlMediaController();
         return false;
@@ -10462,7 +10603,7 @@ void ShowXamlMixerPanel() {
     mixer.durationMs = OsdDuration(DurationKind::Interactive);
     mixer.mixerChevron = false;
     mixer.mixer = BuildMixerModel();
-    if (!xaml_osd::ShowBatch({volume, mixer})) {
+    if (!ShowXamlMirroredBatch({volume, mixer})) {
         Wh_Log(L"XAML Mixer: panel unavailable; no GDI+ fallback");
         ResetXamlMixerController();
     }
