@@ -1188,6 +1188,8 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
 void DrawSnapshot(State&, const Snapshot&);
 void DrawStatusSnapshot(State&, const Snapshot&);
 void DrawClipboardImageSnapshot(State&, const Snapshot&);
+imaging::WriteableBitmap BitmapFromPixels(
+    uint32_t, uint32_t, const std::vector<uint8_t>&);
 void DrawMixerSnapshot(State&, const Snapshot&);
 void ToggleNoticeDetails(State&);
 
@@ -1837,20 +1839,20 @@ imaging::WriteableBitmap BitmapFromPixels(
         uint32_t width, uint32_t height,
         const std::vector<uint8_t>& pixels) {
     if (!width || !height || width > 224 || height > 164)
-        return nullptr;
+        return imaging::WriteableBitmap{nullptr};
     const size_t bytes = static_cast<size_t>(width) * height * 4;
-    if (bytes != pixels.size()) return nullptr;
+    if (bytes != pixels.size()) return imaging::WriteableBitmap{nullptr};
     imaging::WriteableBitmap bitmap{
         static_cast<int32_t>(width), static_cast<int32_t>(height)};
     const auto buffer = bitmap.PixelBuffer();
-    if (buffer.Length() < bytes) return nullptr;
+    if (buffer.Length() < bytes) return imaging::WriteableBitmap{nullptr};
     ComPtr<IBufferByteAccess> access;
     winrt::check_hresult(winrt::get_unknown(buffer)->QueryInterface(
         kBufferByteAccessIID,
         reinterpret_cast<void**>(access.GetAddressOf())));
     BYTE* output = nullptr;
     winrt::check_hresult(access->Buffer(&output));
-    if (!output) return nullptr;
+    if (!output) return imaging::WriteableBitmap{nullptr};
     memcpy(output, pixels.data(), bytes);
     bitmap.Invalidate();
     return bitmap;
