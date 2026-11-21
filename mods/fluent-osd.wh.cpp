@@ -793,6 +793,51 @@ struct Snapshot {
     DWORD background = 0x232327, text = 0xf8f8fc;
     DWORD accent = 0x67acff, track = 0x56565c;
 };
+
+// Functional transformations: unchanged input -> new owned output.
+// No renderer, HWND lookup or hardware operation occurs in these functions.
+enum class View { Level, Status, ClipboardImage };
+View SelectView(Kind kind) {
+    if (kind == Kind::ClipboardImage) return View::ClipboardImage;
+    if (kind == Kind::LockStatus || kind == Kind::NoticeStatus ||
+        kind == Kind::NativeEvent) return View::Status;
+    return View::Level;
+}
+bool CanExpand(const Snapshot& data) {
+    return data.kind == Kind::NoticeStatus &&
+        data.noticeDetails.size() > 1;
+}
+bool SameNotice(const Snapshot& previous, const Snapshot& next,
+                bool previouslyVisible) {
+    return previouslyVisible &&
+        previous.kind == Kind::NoticeStatus &&
+        next.kind == Kind::NoticeStatus &&
+        previous.statusTitle == next.statusTitle &&
+        previous.noticeDetails == next.noticeDetails;
+}
+DWORD NoticeDuration(const Snapshot& data, bool expanded,
+                     DWORD originalDuration) {
+    return CanExpand(data) && expanded
+        ? data.noticeInteractiveDurationMs : originalDuration;
+}
+Snapshot WithPercent(Snapshot data, int percent) {
+    data.percent = std::clamp(percent, 0, 100);
+    data.rawValue = data.kind == Kind::DdcBrightness
+        ? static_cast<int>(osd_input::PercentToRaw(
+            data.minimum, data.maximum, data.percent))
+        : data.percent;
+    return data;
+}
+Snapshot AsStatus(Snapshot data, Kind category,
+                  DWORD duration, bool fluentIcon) {
+    data.kind = category;
+    data.brightness = false;
+    data.valueKnown = false;
+    data.showValue = false;
+    data.statusFontIcon = fluentIcon;
+    data.durationMs = duration;
+    return data;
+}
 } // namespace osd_model
 
 // Control adapter: XAML (or a future renderer) may emit a command, but
@@ -883,8 +928,7 @@ Status StatusGeometry(const osd_model::Snapshot& value) {
     g.frame = CardFrame(value, 8.0 / 296.0, 7.0 / 92.0);
     const double w = g.frame.width, h = g.frame.height;
     g.lock = value.kind == osd_model::Kind::LockStatus;
-    g.interactive = value.kind == osd_model::Kind::NoticeStatus &&
-        value.noticeDetails.size() > 1;
+    g.interactive = osd_model::CanExpand(value);
     g.radius = static_cast<double>(
         std::clamp(value.cornerRadius, 0, 34));
     g.pad = std::clamp(
@@ -1161,15 +1205,11 @@ void DragTrack(State& state, double x, double y) {
         vertical ? state.trackH : state.trackW,
         vertical);
     if (percent == state.current.percent) return;
-    state.current.percent = percent;
-    if (state.current.kind == LevelKind::DdcBrightness)
-        state.current.rawValue = static_cast<int>(
-            osd_input::PercentToRaw(state.current.minimum,
-                state.current.maximum, percent));
-    else state.current.rawValue = percent;
-    SendInput(state, InputAction::SetPercent, percent);
-    const Snapshot updated = state.current;
-    DrawSnapshot(state, updated); // Preview, independent of hardware latency.
+    const Snapshot updated = osd_model::WithPercent(state.current, percent);
+    // The renderer previews an owned value; the hardware controller receives
+    // only a typed user-intent command, never a mutable XAML State.
+    SendInput(state, InputAction::SetPercent, updated.percent);
+    DrawSnapshot(state, updated);
     ArmInteractionTimer(state, true);
 }
 
@@ -1448,8 +1488,7 @@ void TransitionStatusUnderline(State& state, bool sameVisibleStatus,
 void UpdateNoticeDetails(State& state, const Snapshot& value,
                          double bodyW, double headerH, double pad,
                          double insetY, double& totalBodyH) {
-    const bool clickable = value.kind == LevelKind::NoticeStatus &&
-        value.noticeDetails.size() > 1;
+    const bool clickable = osd_model::CanExpand(value);
     state.noticeHeaderH = headerH;
     state.noticeChevron.Visibility(clickable
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
@@ -1512,8 +1551,7 @@ void UpdateNoticeDetails(State& state, const Snapshot& value,
 }
 
 void ToggleNoticeDetails(State& state) {
-    if (state.current.kind != LevelKind::NoticeStatus ||
-        state.current.noticeDetails.size() <= 1) return;
+    if (!osd_model::CanExpand(state.current)) return;
     state.noticeExpanded = !state.noticeExpanded;
     const Snapshot snapshot = state.current;
     DrawStatusSnapshot(state, snapshot);
@@ -1533,10 +1571,7 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
         visible && state.current.kind == LevelKind::LockStatus &&
         state.current.statusTitle == value.statusTitle;
     const bool sameNotice =
-        visible && state.current.kind == LevelKind::NoticeStatus &&
-        value.kind == LevelKind::NoticeStatus &&
-        state.current.statusTitle == value.statusTitle &&
-        state.current.noticeDetails == value.noticeDetails;
+        osd_model::SameNotice(state.current, value, visible);
     if (!sameNotice) {
         state.noticeExpanded = false;
         state.noticeNormalDurationMs = value.durationMs;
@@ -1635,10 +1670,9 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
                         insetY, totalBodyH);
     state.canvas.Height(totalBodyH);
     state.current = value;
-    if (clickableNotice && state.noticeExpanded)
-        state.current.durationMs = value.noticeInteractiveDurationMs;
-    else if (value.kind == LevelKind::NoticeStatus)
-        state.current.durationMs = state.noticeNormalDurationMs;
+    if (value.kind == LevelKind::NoticeStatus)
+        state.current.durationMs = osd_model::NoticeDuration(
+            value, state.noticeExpanded, state.noticeNormalDurationMs);
     ShowPositionedSurface(state, state.current, insetX, insetY,
                           bodyW, totalBodyH);
 }
@@ -1732,7 +1766,8 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
 }
 
 void DrawSnapshot(State& state, const Snapshot& value) {
-    if (value.kind == LevelKind::ClipboardImage) {
+    const auto view = osd_model::SelectView(value.kind);
+    if (view == osd_model::View::ClipboardImage) {
         DrawClipboardImageSnapshot(state, value);
         return;
     }
@@ -1741,9 +1776,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         state.clipboardFrame.Visibility(wx::Visibility::Collapsed);
     if (state.clipboardCaption)
         state.clipboardCaption.Visibility(wx::Visibility::Collapsed);
-    if (value.kind == LevelKind::LockStatus ||
-        value.kind == LevelKind::NoticeStatus ||
-        value.kind == LevelKind::NativeEvent) {
+    if (view == osd_model::View::Status) {
         DrawStatusSnapshot(state, value);
         return;
     }
@@ -6106,15 +6139,9 @@ xaml_osd::Snapshot MakeXamlSnapshot(
 xaml_osd::Snapshot MakeXamlStatusSnapshot(
         xaml_osd::LevelKind category, const RECT& anchor,
         DurationKind duration, bool fluentIcon = false) {
-    auto data = MakeXamlSnapshot(
-        PopupKind::NativeBrightness, anchor, g_scale);
-    data.kind = category;
-    data.brightness = false;
-    data.valueKnown = false;
-    data.showValue = false;
-    data.statusFontIcon = fluentIcon;
-    data.durationMs = OsdDuration(duration);
-    return data;
+    return osd_model::AsStatus(
+        MakeXamlSnapshot(PopupKind::NativeBrightness, anchor, g_scale),
+        category, OsdDuration(duration), fluentIcon);
 }
 
 void HideGdiLevelForXaml() {
