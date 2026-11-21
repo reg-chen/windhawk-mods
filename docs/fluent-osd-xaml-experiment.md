@@ -671,12 +671,102 @@ each OSD type.
   panel hit-testing and frame assets; do not ship a permanent dual
   implementation. SMTC and Mixer remain unported.
 
+## Architecture refactor — value model, pure layout, control boundary
+
+This refactor intentionally retains **v1.0.24**: it changes internal
+ownership and dependency direction, not the set of displayed OSD categories.
+The Windhawk source remains **one self-contained `.wh.cpp` translation unit**
+for installation compatibility, but separates responsibilities by internal
+namespaces and explicit data contracts.
+
+```text
+Windows hooks / clipboard / DDC / audio / network listeners (UI thread)
+    -> snapshot adapter (reads current settings; captures owned values)
+    -> osd_model::Snapshot  [copyable, no WinRT visual objects]
+    -> xaml_osd::Show/ShowBatch  [owned snapshot passed to XAML STA]
+    -> osd_model::SelectView + osd_layout::*  [pure descriptions/geometry]
+    -> XAML Island visual tree, animation and pointer handling (STA)
+    -> osd_control::Command  [target identity + operation + value]
+    -> osd_control::Submit/Drain  [bounded UI message queue]
+    -> ApplyOsdCommands  [hardware side effects, UI thread]
+    -> ControlEffects  [refresh intent, no renderer calls]
+    -> UiWndProc  [active-backend policy; one refresh per batch]
+```
+
+- **`osd_model`** owns the independently copyable, plain-value display
+  snapshot. `SelectView`, `CanExpand`, `SameNotice`, `NoticeDuration`,
+  `WithPercent` and `AsStatus` are pure transformations. View state is
+  reduced to a new value before being rendered; the command dispatcher never
+  receives XAML controls.
+- **`osd_layout`** owns pure geometry for compact status cards, clipboard
+  previews, multi-item details and XAML host bounds. The functions accept
+  explicit snapshot dimensions and, where needed, work-area coordinates.
+  They do **not** query Windows, create HWNDs or allocate XAML objects.
+  Existing status ratios and font/underline calculations were preserved.
+- **`osd_placement`** publishes the already calculated `PopupPlacement`
+  whenever the regular UI-thread placement engine runs. XAML presenters read
+  those bounds instead of measuring the legacy GDI+ HWND. The *calculation*
+  still uses the existing monitor/DPI/position and per-category settings.
+- **`osd_control`** owns typed user intent and destination identities,
+  the bounded cross-thread command queue and message ID. `Target` is
+  independent of `osd_model::Kind`: a passive lock, notice, native event or
+  image has no hardware control target. The XAML pointer handler only emits
+  commands; `ApplyOsdCommands` handles audio, native brightness and DDC,
+  returning `ControlEffects` without calling the renderer. The UI receiver
+  decides whether the active renderer should refresh, preserving current
+  feature-switch semantics.
+- **`xaml_osd`** exclusively owns WinRT controls, XAML STA, pointer capture,
+  animation timers and XAML host/window lifecycle. Image preview remains an
+  owned BGRA byte payload in the snapshot and is constructed as a
+  `WriteableBitmap` *on the STA*.
+
+**Compile-time checks** assert the snapshot is copy-constructible and
+control commands are trivially copyable. The refactor has **not been
+Windhawk-compiled or exercised on Windows** in this editing environment.
+
+**Still coupled / intentionally deferred:**
+- The shared snapshot is a flat value envelope that still carries Win32
+  receiver/monitor identifiers alongside appearance. This is not pure
+  cross-platform FP; future extraction may separate a `VisualDescription`
+  and `ControlBinding` once remaining SMTC/Mixer data needs are known.
+- `CalculatePopupPlacement` still consults existing shared settings and
+  source kinds, and `MovePopupToDisplay` still positions the legacy HWND
+  while GDI+ remains necessary for unported categories. The XAML presenter
+  no longer *reads* that HWND for positioning.
+- The legacy GDI+ media/mixer draw code, UI interaction, some event adapters,
+  and experimental-toggle-off path remain. Do not delete functional legacy
+  code before corresponding full XAML parity and runtime regression testing.
+
+### Compile-only acceptance for this phase
+
+- Check Windhawk C++ compilation for the projected WinRT controls and explicit
+  `Windows.Storage.Streams` / `Windows.UI.Input` headers.
+- Ensure model/layout/controller code compiles without XAML types (their
+  namespaces should not depend on `Windows.UI.Xaml`).
+- Confirm all presenters can build a model and the typed controller handles
+  volume/native/DDC actions without relying on a visual `LevelKind`.
+- Runtime tests **are deferred**: expanded USB lists, clipboard images,
+  lock underline animation, audio/brightness controls, host teardown,
+  monitor/DPI movement and asynchronous DDC write completion.
+
 ## Migration gates
 
-1. **Host viability:** Windows compilation, Island activation, show/hide, transparency behavior, DPI, multimonitor placement, nonactivation and clean unloading.
-2. **Backend separation:** define `OsdViewModel` and backend-neutral layout/visual state contracts. Prevent XAML objects or HWNDs from leaking across apartment boundaries; exchange only immutable, owned snapshots.
-3. **First real migration:** move a single noninteractive notification surface; retain GDI+ fallback. Confirm icon/text fidelity, opacity and expiry handling.
-4. **Controls:** volume/brightness with mouse, wheel and drag; then Mixer and SMTC, sharing layout with hit testing.
-5. **Regression:** Win11 build variance, Explorer restarting, Windhawk unload/reload, UWP/XAML startup timing, OS theme changes, mixed DPI/HDR/SDR, CPU/GPU/working set, event floods and shutdown.
+1. **Compile first:** verify the current self-contained branch in Windhawk,
+   including all WinRT projections, type contracts and XAML control APIs.
+   Compilation passing is **not** runtime validation.
+2. **Finish category parity:** migrate SMTC, Mixer and all their buttons,
+   sliders, scroll/seek gestures, visual states and display placement;
+   keep monitoring/hardware operations behind the typed control boundary.
+3. **Retire migrated GDI+ paths:** when verified, remove obsolete
+   `UpdateLayeredWindow` category painters, legacy hit-test HWNDs,
+   duplicate animation timers and rendering-only state; retain any
+   necessary Win32 hooks, clipboard pixel capture and control adapters.
+4. **Runtime regression:** verify Windows 11 versions, Explorer restart,
+   Windhawk unload/reload, XAML startup timing, theme, DDC and multi-monitor
+   behavior, mixed DPI/HDR/SDR, CPU/GPU/memory, event floods and shutdown.
+5. **Finalize:** restore production module identity only after feature,
+   memory and unload parity, then merge to `fluent-osd`.
 
-**Do not merge to `fluent-osd` until stages are functionally complete and verified on Windows.**
+**No permanent dual renderer and no silent GDI+ fallback once the
+XAML path for a category is selected. Do not merge to `fluent-osd`
+before runtime validation.**
