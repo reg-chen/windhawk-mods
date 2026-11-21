@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.18)
+## XAML migration experiment (v1.0.19)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -32,8 +32,8 @@ merging the renderer back into the production branch.
 Branch-only native XAML Island renderer for migrated categories:
 **system volume, native brightness and per-target DDC/CI brightness**.
 The existing XAML toggle selects the migrated renderer (no GDI+ fallback).
-Opacity inherits the original background-opacity setting; Win32 input
-surfaces relay clicks/drags/wheels to the existing audio and brightness
+Opacity inherits the original background-opacity setting; Native XAML pointer gestures
+relay clicks/drags/wheels to the existing audio and brightness
 workers. DDC targets have independent XAML hosts and their original
 monitor identity. Media/mixer/notifications remain GDI+ until migrated.
 
@@ -690,6 +690,7 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #include <winrt/Windows.UI.Xaml.Hosting.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
+#include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.Shapes.h>
 #include <winrt/Windows.Media.h>
@@ -742,6 +743,7 @@ DWORD PercentToRaw(DWORD minimum, DWORD maximum, int percent) {
 namespace xaml_osd {
 namespace wx = winrt::Windows::UI::Xaml;
 namespace controls = winrt::Windows::UI::Xaml::Controls;
+namespace xinput = winrt::Windows::UI::Xaml::Input;
 namespace media = winrt::Windows::UI::Xaml::Media;
 namespace shapes = winrt::Windows::UI::Xaml::Shapes;
 namespace hosting = winrt::Windows::UI::Xaml::Hosting;
@@ -767,6 +769,7 @@ constexpr UINT kShowMessage = WM_APP + 680;
 constexpr UINT kHideMessage = WM_APP + 681;
 constexpr UINT kInputMessage = WM_APP + 690; // To existing Explorer UI receiver.
 constexpr UINT_PTR kHideTimer = 683;
+constexpr UINT_PTR kFadeTimer = 684;
 constexpr int kWidth = 354, kHeight = 49; // Default horizontal card pixels.
 
 std::atomic<HWND> g_ready{nullptr};
@@ -791,6 +794,9 @@ struct Snapshot {
     bool brightness = false;
     bool showIcon = true;
     BYTE backgroundAlpha = 255;
+    bool borderless = true, fadeEnabled = false;
+    int cornerRadius = 17;
+    DWORD fadeDurationMs = 160;
     DWORD durationMs = 3000;
     RECT anchor{};          // Existing placement canvas in physical pixels.
     float scale = 1.0f;     // Monitor DPI * user-defined size.
@@ -824,8 +830,10 @@ std::vector<InputCommand> TakeInputs() {
 
 struct State {
     HWND host = nullptr, island = nullptr;
-    HWND barInput = nullptr, iconInput = nullptr;
-    bool dragging = false, iconPressed = false;
+    bool dragging = false, iconPressed = false, pointerActive = false;
+    uint32_t activePointerId = 0;
+    bool fading = false, fadeOut = false;
+    ULONGLONG fadeStart = 0;
     int wheelRemainder = 0;
     double trackX = 0, trackY = 0, trackW = 0, trackH = 0;
     double iconX = 0, iconY = 0, iconW = 0, iconH = 0;
@@ -878,20 +886,19 @@ void SendInput(State& state, InputAction action, int value) {
     g_inputQueue.push_back(command);
     ReleaseSRWLockExclusive(&g_inputLock);
     if (!PostMessageW(state.current.receiver, kInputMessage, 0, 0)) {
-        Wh_Log(L"XAML v1.0.18: input post failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.19: input post failed (%lu)", GetLastError());
     }
 }
 
 void HideSurface(State& state) {
-    if (state.host) KillTimer(state.host, kHideTimer);
-    if (state.barInput) ShowWindow(state.barInput, SW_HIDE);
-    if (state.iconInput) ShowWindow(state.iconInput, SW_HIDE);
+    if (state.host) {
+        KillTimer(state.host, kHideTimer);
+        KillTimer(state.host, kFadeTimer);
+    }
+    if (state.canvas) state.canvas.ReleasePointerCaptures();
+    state.dragging = state.iconPressed = state.pointerActive = false;
+    state.fading = state.fadeOut = false;
     if (state.host) ShowWindow(state.host, SW_HIDE);
-    if ((state.barInput && GetCapture() == state.barInput) ||
-        (state.iconInput && GetCapture() == state.iconInput))
-        ReleaseCapture();
-    state.dragging = false;
-    state.iconPressed = false;
 }
 
 void HideAll(State& root) {
@@ -899,69 +906,8 @@ void HideAll(State& root) {
     for (auto& peer : root.peers) HideSurface(*peer.second);
 }
 
-// Window-based hit surfaces are independent of the legacy layered GDI+
-// hit targets; they do not draw any UI or own any COM/audio resources.
-void PositionInputs(State& state, int hostX, int hostY) {
-    if (!state.barInput || !state.iconInput) return;
-    const double scale = state.scale;
-    const double halo = std::max(6.0,
-        static_cast<double>(state.current.thumbDiameter) / 2.0 + 3.0);
-    auto place = [&](HWND window, double x, double y, double w, double h) {
-        if (w <= 0.0 || h <= 0.0) {
-            ShowWindow(window, SW_HIDE);
-            return;
-        }
-        const int px = hostX + static_cast<int>(std::lround(x * scale));
-        const int py = hostY + static_cast<int>(std::lround(y * scale));
-        const int pw = std::max(1, static_cast<int>(std::lround(w * scale)));
-        const int ph = std::max(1, static_cast<int>(std::lround(h * scale)));
-        SetWindowPos(window, HWND_TOPMOST, px, py, pw, ph,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    };
-    if (!state.current.valueKnown || state.trackW <= 0 || state.trackH <= 0)
-        ShowWindow(state.barInput, SW_HIDE);
-    else
-        place(state.barInput, state.trackX - halo, state.trackY - halo,
-              state.trackW + 2 * halo, state.trackH + 2 * halo);
-    if (state.current.kind == LevelKind::Volume && state.current.showIcon)
-        place(state.iconInput, state.iconX - halo, state.iconY - halo,
-              state.iconW + 2 * halo, state.iconH + 2 * halo);
-    else ShowWindow(state.iconInput, SW_HIDE);
-}
-
-void DragTrack(State& state, HWND hwnd, LPARAM lp) {
-    if (state.trackW <= 0 || state.trackH <= 0 ||
-        !state.current.valueKnown) return;
-    POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-    if (!ClientToScreen(hwnd, &pt)) return;
-    RECT rect{};
-    if (!GetWindowRect(state.host, &rect)) return;
-    const double x = (pt.x - rect.left) / state.scale;
-    const double y = (pt.y - rect.top) / state.scale;
-    const bool vertical = state.current.vertical;
-    const int percent = osd_input::TrackPercent(
-        vertical ? y : x,
-        vertical ? state.trackY : state.trackX,
-        vertical ? state.trackH : state.trackW,
-        vertical);
-    if (percent == state.current.percent) return;
-    state.current.percent = percent;
-    if (state.current.kind == LevelKind::DdcBrightness) {
-        const auto min = state.current.minimum;
-        const auto max = state.current.maximum;
-        state.current.rawValue = static_cast<int>(
-            osd_input::PercentToRaw(min, max, percent));
-    } else state.current.rawValue = percent;
-    SendInput(state, InputAction::SetPercent, percent);
-    // Keep the preview responsive even when a DDC/CI write is pending.
-    // Actual hardware writes are asynchronous through the existing worker.
-    const auto updated = state.current;
-    DrawSnapshot(state, updated);
-    if (state.host) KillTimer(state.host, kHideTimer);
-}
-
-// Shared Win32 gesture lifecycle for migrated XAML controls. Only the
-// action callback varies: a slider sets its value, an icon invokes a click.
+// XAML itself owns hit testing and pointer capture. No detached topmost
+// HWND can cover the Island (or another physical monitor's Island).
 void ArmInteractionTimer(State& state, bool active) {
     if (!state.host) return;
     KillTimer(state.host, kHideTimer);
@@ -971,88 +917,96 @@ void ArmInteractionTimer(State& state, bool active) {
             nullptr);
 }
 
-bool PointerInsideClient(HWND hwnd, LPARAM lp) {
-    RECT bounds{};
-    if (!GetClientRect(hwnd, &bounds)) return false;
-    const POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-    return PtInRect(&bounds, point) != FALSE;
+bool InHitRegion(double x, double y, double left, double top,
+                 double width, double height, double halo) {
+    return width > 0.0 && height > 0.0 &&
+        x >= left - halo && x <= left + width + halo &&
+        y >= top - halo && y <= top + height + halo;
 }
 
-void BeginInputGesture(State& state, HWND hwnd, bool slider, LPARAM lp) {
-    state.dragging = slider;
-    state.iconPressed = !slider;
-    SetCapture(hwnd);
+void DragTrack(State& state, double x, double y) {
+    if (!state.current.valueKnown || state.trackW <= 0.0 ||
+        state.trackH <= 0.0) return;
+    const bool vertical = state.current.vertical;
+    const int percent = osd_input::TrackPercent(
+        vertical ? y : x,
+        vertical ? state.trackY : state.trackX,
+        vertical ? state.trackH : state.trackW,
+        vertical);
+    if (percent == state.current.percent) return;
+    state.current.percent = percent;
+    if (state.current.kind == LevelKind::DdcBrightness)
+        state.current.rawValue = static_cast<int>(
+            osd_input::PercentToRaw(state.current.minimum,
+                state.current.maximum, percent));
+    else state.current.rawValue = percent;
+    SendInput(state, InputAction::SetPercent, percent);
+    const Snapshot updated = state.current;
+    DrawSnapshot(state, updated); // Preview, independent of hardware latency.
     ArmInteractionTimer(state, true);
-    if (slider) DragTrack(state, hwnd, lp);
 }
 
-void EndInputGesture(State& state, HWND hwnd, bool slider, LPARAM lp) {
-    const bool clicked = !slider && state.iconPressed &&
-        PointerInsideClient(hwnd, lp);
-    if (slider && state.dragging) DragTrack(state, hwnd, lp);
-    state.dragging = state.iconPressed = false;
-    if (GetCapture() == hwnd) ReleaseCapture();
-    if (clicked) SendInput(state, InputAction::ToggleMute, 0);
+void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
+    if (!state.canvas || !state.host) return;
+    const auto point = args.GetCurrentPoint(state.canvas);
+    if (!point.Properties().IsLeftButtonPressed()) return;
+    const auto pos = point.Position();
+    const double halo = std::max(6.0,
+        static_cast<double>(state.current.thumbDiameter) / 2.0 + 3.0);
+    const bool icon = state.current.kind == LevelKind::Volume &&
+        state.current.showIcon &&
+        InHitRegion(pos.X, pos.Y, state.iconX, state.iconY,
+                    state.iconW, state.iconH, halo);
+    const bool bar = state.current.valueKnown &&
+        InHitRegion(pos.X, pos.Y, state.trackX, state.trackY,
+                    state.trackW, state.trackH, halo);
+    if (!icon && !bar) return;
+    state.pointerActive = true;
+    state.activePointerId = args.Pointer().PointerId();
+    state.iconPressed = icon;
+    state.dragging = !icon && bar;
+    state.canvas.CapturePointer(args.Pointer());
+    ArmInteractionTimer(state, true);
+    if (state.dragging) DragTrack(state, pos.X, pos.Y);
+    args.Handled(true);
+}
+
+void PointerMoved(State& state, const xinput::PointerRoutedEventArgs& args) {
+    if (!state.pointerActive || !state.dragging || !state.canvas ||
+        args.Pointer().PointerId() != state.activePointerId) return;
+    const auto pos = args.GetCurrentPoint(state.canvas).Position();
+    DragTrack(state, pos.X, pos.Y);
+    args.Handled(true);
+}
+
+void PointerReleased(State& state, const xinput::PointerRoutedEventArgs& args) {
+    if (!state.pointerActive || !state.canvas ||
+        args.Pointer().PointerId() != state.activePointerId) return;
+    const auto pos = args.GetCurrentPoint(state.canvas).Position();
+    const bool click = state.iconPressed &&
+        InHitRegion(pos.X, pos.Y, state.iconX, state.iconY,
+                    state.iconW, state.iconH, 0.0);
+    if (state.dragging) DragTrack(state, pos.X, pos.Y);
+    state.pointerActive = state.dragging = state.iconPressed = false;
+    state.canvas.ReleasePointerCapture(args.Pointer());
+    if (click) SendInput(state, InputAction::ToggleMute, 0);
+    ArmInteractionTimer(state, false);
+    args.Handled(true);
+}
+
+void PointerCancelled(State& state) {
+    state.pointerActive = state.dragging = state.iconPressed = false;
     ArmInteractionTimer(state, false);
 }
 
-void CancelInputGesture(State& state, HWND hwnd, bool releaseCapture) {
-    state.dragging = state.iconPressed = false;
-    if (releaseCapture && GetCapture() == hwnd) ReleaseCapture();
+void PointerWheel(State& state, const xinput::PointerRoutedEventArgs& args) {
+    if (!state.current.valueKnown) return;
+    const int delta = args.GetCurrentPoint(state.canvas)
+        .Properties().MouseWheelDelta();
+    const int steps = osd_input::ConsumeWheelSteps(delta, state.wheelRemainder);
+    if (steps) SendInput(state, InputAction::Wheel, steps * WHEEL_DELTA);
     ArmInteractionTimer(state, false);
-}
-
-bool HandleInputWindow(State& state, HWND hwnd, UINT message,
-                       WPARAM wp, LPARAM lp, LRESULT& result) {
-    const bool bar = hwnd == state.barInput;
-    const bool icon = hwnd == state.iconInput;
-    if (!bar && !icon) return false;
-    switch (message) {
-        case WM_MOUSEACTIVATE: result = MA_NOACTIVATE; return true;
-        case WM_NCHITTEST: result = HTCLIENT; return true;
-        case WM_SETCURSOR:
-            SetCursor(LoadCursorW(nullptr, IDC_HAND));
-            result = TRUE;
-            return true;
-        case WM_LBUTTONDOWN:
-            BeginInputGesture(state, hwnd, bar, lp);
-            result = 0; return true;
-        case WM_MOUSEMOVE:
-            if (bar && state.dragging) DragTrack(state, hwnd, lp);
-            result = 0; return true;
-        case WM_LBUTTONUP:
-            EndInputGesture(state, hwnd, bar, lp);
-            result = 0; return true;
-        case WM_MOUSEWHEEL:
-            if (bar) {
-                const int steps = osd_input::ConsumeWheelSteps(
-                    GET_WHEEL_DELTA_WPARAM(wp), state.wheelRemainder);
-                if (steps)
-                    SendInput(state, InputAction::Wheel, steps * WHEEL_DELTA);
-                ArmInteractionTimer(state, false);
-            }
-            result = 0; return true;
-        case WM_CAPTURECHANGED:
-            CancelInputGesture(state, hwnd, false);
-            result = 0; return true;
-        case WM_CANCELMODE:
-            CancelInputGesture(state, hwnd, true);
-            result = 0; return true;
-        case WM_ERASEBKGND: result = TRUE; return true;
-        case WM_PAINT: {
-            // Layered input HWND needs opaque source pixels so Windows
-            // hit-tests it; LWA_ALPHA=1 leaves it visually imperceptible.
-            PAINTSTRUCT ps{};
-            HDC dc = BeginPaint(hwnd, &ps);
-            if (dc) {
-                FillRect(dc, &ps.rcPaint,
-                    reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
-                EndPaint(hwnd, &ps);
-            }
-            result = 0; return true;
-        }
-    }
-    return false;
+    args.Handled(true);
 }
 
 // Dynamic-font measurement, but stable across all runtime values.
@@ -1116,6 +1070,7 @@ void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
     }
 }
 void DrawSnapshot(State& state, const Snapshot& value) {
+    const bool wasVisible = state.host && IsWindowVisible(state.host);
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
         !state.fillClip || !state.thumb) return;
@@ -1143,6 +1098,14 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     state.canvas.Width(bodyW);
     state.canvas.Height(bodyH);
     state.card.Background(Brush(value.background, value.backgroundAlpha));
+    const double radius = static_cast<double>(
+        std::clamp(value.cornerRadius, 0, 34));
+    state.card.CornerRadius(wx::CornerRadius{
+        radius, radius, radius, radius});
+    state.card.BorderBrush(Brush(value.track));
+    const double border = value.borderless ? 0.0 : 1.0;
+    state.card.BorderThickness(wx::Thickness{
+        border, border, border, border});
     state.icon.Foreground(Brush(value.text));
     state.value.Foreground(Brush(value.text));
     state.track.Fill(Brush(value.track));
@@ -1330,13 +1293,21 @@ void DrawSnapshot(State& state, const Snapshot& value) {
 
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.18: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.19: show failed (%lu)", GetLastError());
         return;
     }
-    PositionInputs(state, x, y);
-    KillTimer(state.host, kHideTimer);
-    SetTimer(state.host, kHideTimer,
-        std::clamp(value.durationMs, DWORD(500), DWORD(20000)), nullptr);
+    if (!wasVisible) {
+        state.fading = value.fadeEnabled;
+        state.fadeOut = false;
+        state.fadeStart = GetTickCount64();
+        state.card.Opacity(value.fadeEnabled ? 0.0 : 1.0);
+        if (state.fading) SetTimer(state.host, kFadeTimer, 16, nullptr);
+    } else if (!value.fadeEnabled && state.fading) {
+        state.fading = false;
+        KillTimer(state.host, kFadeTimer);
+        state.card.Opacity(1.0);
+    }
+    ArmInteractionTimer(state, state.dragging || state.iconPressed);
 }
 void DeliverPending(State& root); // Defined after native/XAML host creation.
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1348,23 +1319,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     auto* state = reinterpret_cast<State*>(
         GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    if (state) {
-        LRESULT overlayResult = 0;
-        if (HandleInputWindow(*state, hwnd, msg, wp, lp, overlayResult))
-            return overlayResult;
-    }
     switch (msg) {
         case kShowMessage:
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.18: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.19: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.18: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.19: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
@@ -1384,7 +1350,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         case WM_TIMER:
-            if (wp == kHideTimer && state) HideSurface(*state);
+            if (state && hwnd == state->host) {
+                if (wp == kHideTimer) {
+                    KillTimer(hwnd, kHideTimer);
+                    if (state->current.fadeEnabled && state->card) {
+                        state->fading = state->fadeOut = true;
+                        state->fadeStart = GetTickCount64();
+                        SetTimer(hwnd, kFadeTimer, 16, nullptr);
+                    } else HideSurface(*state);
+                } else if (wp == kFadeTimer && state->fading && state->card) {
+                    const auto elapsed = GetTickCount64() - state->fadeStart;
+                    const double duration = static_cast<double>(
+                        std::max<DWORD>(1, state->current.fadeDurationMs));
+                    const double t = std::clamp(
+                        static_cast<double>(elapsed) / duration, 0.0, 1.0);
+                    const double ease = t * t * (3.0 - 2.0 * t);
+                    state->card.Opacity(state->fadeOut ? 1.0 - ease : ease);
+                    if (t >= 1.0) {
+                        KillTimer(hwnd, kFadeTimer);
+                        state->fading = false;
+                        if (state->fadeOut) HideSurface(*state);
+                    }
+                }
+            }
             return 0;
         case WM_ERASEBKGND: return TRUE;
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
@@ -1413,6 +1401,8 @@ void CreateContent(State& state) {
     card.Background(Brush(0x232327));
 
     controls::Canvas canvas;
+    // A transparent background still participates in XAML hit testing.
+    canvas.Background(Brush(0, 0));
     canvas.Width(354.0);
     canvas.Height(49.0);
 
@@ -1466,6 +1456,30 @@ void CreateContent(State& state) {
     state.fillClip = fillClip;
     state.thumb = thumb;
     state.value = value;
+    canvas.PointerPressed([&state](auto const&, const xinput::PointerRoutedEventArgs& e) {
+        PointerPressed(state, e);
+    });
+    canvas.PointerMoved([&state](auto const&, const xinput::PointerRoutedEventArgs& e) {
+        PointerMoved(state, e);
+    });
+    canvas.PointerReleased([&state](auto const&, const xinput::PointerRoutedEventArgs& e) {
+        PointerReleased(state, e);
+    });
+    canvas.PointerCanceled([&state](auto const&, auto const&) {
+        PointerCancelled(state);
+    });
+    canvas.PointerCaptureLost([&state](auto const&, auto const&) {
+        PointerCancelled(state);
+    });
+    canvas.PointerWheelChanged([&state](auto const&, const xinput::PointerRoutedEventArgs& e) {
+        PointerWheel(state, e);
+    });
+    canvas.PointerEntered([&state](auto const&, auto const&) {
+        ArmInteractionTimer(state, true);
+    });
+    canvas.PointerExited([&state](auto const&, auto const&) {
+        if (!state.pointerActive) ArmInteractionTimer(state, false);
+    });
 }
 void CreateSurface(State& state, HINSTANCE instance) {
     state.host = CreateWindowExW(
@@ -1475,7 +1489,8 @@ void CreateSurface(State& state, HINSTANCE instance) {
     if (!state.host)
         winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
 
-    const DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
+    // XAML Border owns configurable corner radius; avoid double-clipping.
+    const DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_DONOTROUND;
     const COLORREF noBorder = DWMWA_COLOR_NONE;
     const HRESULT rounded = DwmSetWindowAttribute(
         state.host, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -1487,7 +1502,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     // remains non-layered so its compositor-anti-aliased corners work.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
-    Wh_Log(L"XAML v1.0.18: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+    Wh_Log(L"XAML v1.0.19: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
         static_cast<unsigned long>(rounded),
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
@@ -1505,36 +1520,10 @@ void CreateSurface(State& state, HINSTANCE instance) {
         winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
     CreateContent(state);
 
-    // Independent native hit targets; unlike the old GDI+ overlays
-    // these follow XAML track bounds and have their own HWND instances
-    // for each physical DDC target.
-    auto makeInput = [&]() -> HWND {
-        HWND window = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-                WS_EX_LAYERED,
-            kClass, L"", WS_POPUP, 0, 0, 1, 1,
-            nullptr, nullptr, instance, &state);
-        if (!window) return nullptr;
-        if (!SetLayeredWindowAttributes(window, 0, 1, LWA_ALPHA)) {
-            DestroyWindow(window);
-            return nullptr;
-        }
-        return window;
-    };
-    state.barInput = makeInput();
-    state.iconInput = makeInput();
-    if (!state.barInput || !state.iconInput)
-        Wh_Log(L"XAML v1.0.18: an input overlay could not be created");
 }
 
 void CloseSurface(State& state) {
     HideSurface(state);
-    if (state.barInput && GetCapture() == state.barInput) ReleaseCapture();
-    if (state.iconInput && GetCapture() == state.iconInput) ReleaseCapture();
-    if (state.barInput) DestroyWindow(state.barInput);
-    if (state.iconInput) DestroyWindow(state.iconInput);
-    state.barInput = state.iconInput = nullptr;
-
     state.thumb = nullptr;
     state.fillClip = nullptr;
     state.fill = nullptr;
@@ -1546,7 +1535,7 @@ void CloseSurface(State& state) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.18: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.19: island close failed"); }
         state.source = nullptr;
     }
     state.island = nullptr;
@@ -1581,7 +1570,7 @@ void DeliverPending(State& root) {
             try {
                 CreateSurface(*fresh, GetModuleHandleW(nullptr));
             } catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.18: DDC target create failed 0x%08lX",
+                Wh_Log(L"XAML v1.0.19: DDC target create failed 0x%08lX",
                     static_cast<unsigned long>(ex.code()));
                 CloseSurface(*fresh);
                 continue;
@@ -1606,7 +1595,7 @@ void TryEnableIslandTransparency() {
     try {
         auto currentWindow = wx::Window::Current();
         if (!currentWindow) {
-            Wh_Log(L"XAML v1.0.18: Window.Current unavailable for transparency");
+            Wh_Log(L"XAML v1.0.19: Window.Current unavailable for transparency");
             return;
         }
         ComPtr<IXamlSourceTransparency> transparency;
@@ -1615,10 +1604,10 @@ void TryEnableIslandTransparency() {
             reinterpret_cast<void**>(transparency.GetAddressOf()));
         if (SUCCEEDED(hr) && transparency)
             hr = transparency->put_IsBackgroundTransparent(1);
-        Wh_Log(L"XAML v1.0.18: Island transparency HRESULT=0x%08lX",
+        Wh_Log(L"XAML v1.0.19: Island transparency HRESULT=0x%08lX",
             static_cast<unsigned long>(hr));
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.18: transparency initialization exception 0x%08lX",
+        Wh_Log(L"XAML v1.0.19: transparency initialization exception 0x%08lX",
             static_cast<unsigned long>(ex.code()));
     }
 }
@@ -1651,7 +1640,7 @@ DWORD WINAPI ThreadProc(void*) {
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.18: renderer ready (per-display DDC)");
+                Wh_Log(L"XAML v1.0.19: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -1660,11 +1649,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.18: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.19: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.18: unexpected startup exception");
+        Wh_Log(L"XAML v1.0.19: unexpected startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -1673,7 +1662,7 @@ DWORD WINAPI ThreadProc(void*) {
     CloseSurface(root);
     if (root.manager) {
         try { root.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.18: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.19: manager close failed"); }
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
@@ -1687,7 +1676,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.18: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.19: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -5310,6 +5299,10 @@ xaml_osd::Snapshot MakeXamlSnapshot(
     const bool light = IsLightTheme();
     data.background = OsdBackgroundRgb(light);
     data.backgroundAlpha = OsdBackgroundAlpha();
+    data.borderless = g_ddcBorderless.load();
+    data.cornerRadius = g_cornerRadius.load();
+    data.fadeEnabled = g_fadeEnabled.load();
+    data.fadeDurationMs = static_cast<DWORD>(g_fadeDuration.load());
     data.text = OsdTextRgb(light);
     data.accent = OsdAccentRgb();
     data.track = OsdTrackRgb(light);
@@ -5359,7 +5352,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
                 FindMonitorByDeviceName(target.event.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
-                Wh_Log(L"XAML v1.0.18: unresolved DDC display '%s'",
+                Wh_Log(L"XAML v1.0.19: unresolved DDC display '%s'",
                        target.event.device);
                 continue;
             }
@@ -5372,13 +5365,13 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
             push(master, anchor, g_scale);
     }
     if (batch.empty()) {
-        Wh_Log(L"XAML v1.0.18: no resolvable DDC snapshots");
+        Wh_Log(L"XAML v1.0.19: no resolvable DDC snapshots");
         xaml_osd::Hide();
         return false;
     }
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.18: DDC batch not delivered; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.19: DDC batch not delivered; NO GDI+ fallback");
     return ok;
 }
 
@@ -7754,7 +7747,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     HideGdiLevelForXaml();
     RECT target{};
     if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-        Wh_Log(L"Fluent OSD v1.0.18: XAML %s missing anchor",
+        Wh_Log(L"Fluent OSD v1.0.19: XAML %s missing anchor",
                brightness ? L"brightness" : L"volume");
         return;
     }
@@ -7764,13 +7757,13 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     const int index = brightness ? 1 : 0;
     if (xaml_osd::Show(snapshot)) {
         if (!routeLogged[index]) {
-            Wh_Log(L"Fluent OSD v1.0.18: native %s -> XAML only",
+            Wh_Log(L"Fluent OSD v1.0.19: native %s -> XAML only",
                    brightness ? L"brightness" : L"volume");
             routeLogged[index] = true;
         }
         unavailableLogged[index] = false;
     } else if (!unavailableLogged[index]) {
-        Wh_Log(L"Fluent OSD v1.0.18: XAML %s unavailable; NO GDI+ fallback",
+        Wh_Log(L"Fluent OSD v1.0.19: XAML %s unavailable; NO GDI+ fallback",
                brightness ? L"brightness" : L"volume");
         unavailableLogged[index] = true;
     }
@@ -8096,7 +8089,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     _wcsicmp(g_visible.device,
                               g_xamlPendingDdcWrite.device) == 0)
                     g_visible.value = g_xamlPendingDdcPrevious;
-                Wh_Log(L"XAML v1.0.18: DDC write failed for '%s' index %lu",
+                Wh_Log(L"XAML v1.0.19: DDC write failed for '%s' index %lu",
                     g_xamlPendingDdcWrite.device,
                     g_xamlPendingDdcWrite.physicalIndex);
                 if (g_popupKind == PopupKind::DdcBrightness)
@@ -8854,7 +8847,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.18 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.19 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
