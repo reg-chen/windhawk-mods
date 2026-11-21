@@ -2,7 +2,7 @@
 
 **Branch:** `fluent-osd-xaml`  
 **Baseline:** `fluent-osd` v1.0.1 (`8ff2d4352d8c081e78208266ff1561b5e5bfe31b`)  
-**Status:** standalone XAML Island probe v0.1.3 has passed the user's Windows rendering / DWM rounded-corner visual test; integrated Fluent OSD v1.0.2 is committed but **has not been compiled or runtime-tested**.
+**Status:** standalone XAML probe v0.1.3 passed the user's earlier host test; integrated experimental `fluent-osd-xaml` **v1.0.17** now includes XAML volume, native brightness and per-target DDC/CI, original background-opacity settings, and click/drag/wheel input. **v1.0.17 is not yet compiled or runtime-tested in Windhawk.**
 
 ## Goal / non-goals
 
@@ -411,6 +411,78 @@ Windhawk runtime test; no Windows compiler/runtime validation was run.
 6. Disable/re-enable Windhawk mod, review Explorer shutdown and
    `XAML v1.0.16` startup logs. This source is not yet
    Windows-compiled or runtime-tested by the assistant.
+
+## v1.0.17 — DDC/CI XAML, input and inherited opacity
+
+### Opacity and Window composition
+
+- The original `CustomOSD.Appearance.ddcBackgroundOpacity` setting
+  supplies the XAML card's **background alpha**, mapped from 0–100% to
+  0–255. Text, progress, and thumb remain independently opaque.
+- The Island STA requests the Microsoft
+  `IXamlSourceTransparency.IsBackgroundTransparent` interface on
+  `Windows.UI.Xaml.Window.Current` after creating the first source.
+  The host disables opaque Win32 erase and opts into full-client DWM
+  composition while retaining its existing DWM corner preference.
+- Look for `XAML v1.0.17: Island transparency HRESULT=...` and
+  `rounded=... border=... frame=...`. A successful HRESULT does not by
+  itself prove the desired visual blending: **verify 20%, 60%, 96%,
+  100% opacity over light and dark windows**. Watch for any return of
+  black corner artifacts.
+
+### Independent DDC monitor views
+
+- The same XAML setting now controls **volume, native brightness and
+  DDC/CI**. Individual `showDdcBrightness` is still required to enable
+  DDC notifications, independently of the native-brightness Show/Hide.
+- DDC notification batches still preserve the original display device,
+  physical monitor index, VCP min/max and raw value. For source and
+  all-monitor output modes, the XAML STA creates an independent
+  `DesktopWindowXamlSource`/HWND **per active DDC target** and places it
+  using that monitor's DPI and placement calculations. Stale targets
+  are hidden rather than mirroring another monitor's value.
+- In fixed primary/selected-monitor modes, the existing selected
+  master target appears on one output, preserving the previous policy.
+- The old mirrored layered GDI+ surfaces are **not created while XAML
+  DDC is enabled**. The other unported OSD categories still use GDI+.
+
+### Click, drag, wheel and mute
+
+- The old GDI+ hit windows never overlapped the XAML host, so they
+  could not process input. The new renderer owns a lightweight
+  near-invisible Win32 hit window for each XAML progress track and
+  volume icon, sized using the XAML layout's actual track/icon geometry.
+- Drag events and mouse wheel actions pass bounded commands through
+  the existing Explorer UI receiver, preserving COM/audio/WMI/DDC
+  writes on their original threads. DDC commands carry **both**
+  `device` and `physicalIndex` to avoid applying edits to the wrong
+  external display. Volume icon click toggles mute.
+- The DDC edit keeps its target alive during interaction and
+  rolls back only that target when the hardware write fails.
+  A per-event preview reflects the requested percentage immediately.
+- The input hit windows use `WS_EX_LAYERED` with alpha 1 only for
+  mouse capture; **the actual XAML popup is not a layered GDI+ window**.
+
+### Manual regression checklist
+
+1. Disable the production `fluent-osd`, load the independent
+   `fluent-osd-xaml` **v1.0.17** in Windhawk, enable the XAML switch.
+2. On the Claw + external monitor, enable `showDdcBrightness`,
+   then trigger a DDC/CI brightness change. Confirm the XAML card
+   appears on the **correct physical monitor** and shows its own
+   actual percentage. If two monitors support DDC, update both.
+3. Set background opacity to 20, 60, 96 and 100%, observing
+   the background versus the text/track opacity and all four corners.
+4. Try clicking the bar, dragging across 0–100%, using the mouse
+   wheel over the bar, and clicking the volume icon to mute.
+   Confirm actual hardware state changes, not only visual updates.
+5. Repeat on horizontal/vertical layouts, multiple DPI scales,
+   custom sizes, and 98→100% to confirm the underlying bar remains
+   constant in length.
+6. Disable/re-enable the mod, monitor Explorer cleanup and check
+   `XAML v1.0.17` logs. Compilation, visual compositing and hardware
+   interaction **require real Windows validation**; they have not
+   been verified in the developer environment used for these edits.
 
 ## Migration gates
 
