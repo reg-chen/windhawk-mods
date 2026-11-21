@@ -8023,11 +8023,9 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 Wh_Log(L"Native brightness wheel write failed; restored value");
             }
         } else if (g_xamlForMigrated.load() &&
-                   g_popupKind == PopupKind::DdcBrightness) {
-            // Roll back only the target whose write failed.
-            if (g_xamlPendingDdcGeneration != static_cast<DWORD>(wp))
-                return 0; Never replace
-            // another monitor's value with a global DDC confirmation.
+                   g_xamlPendingDdcGeneration == static_cast<DWORD>(wp)) {
+            // A DDC failure rolls back only its recorded physical target,
+            // even if a volume or native brightness event has since opened.
             const auto target = std::find_if(
                 g_ddcTargets.begin(), g_ddcTargets.end(),
                 [&](const DdcTargetState& item) {
@@ -8047,11 +8045,15 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 Wh_Log(L"XAML v1.0.17: DDC write failed for '%s' index %lu",
                     g_xamlPendingDdcWrite.device,
                     g_xamlPendingDdcWrite.physicalIndex);
-                (void)ShowXamlDdcTargets(g_visible);
+                if (g_popupKind == PopupKind::DdcBrightness)
+                    (void)ShowXamlDdcTargets(g_visible);
             } else if (target != g_ddcTargets.end()) {
                 g_lastConfirmedDdcBrightness = target->event.value;
             }
             g_xamlPendingDdcGeneration = 0;
+        } else if (g_xamlForMigrated.load()) {
+            // No matching XAML target: never apply GDI+'s global DDC
+            // rollback to a different display.
         } else {
             if (success) g_lastConfirmedDdcBrightness = g_visible.value;
             else {
