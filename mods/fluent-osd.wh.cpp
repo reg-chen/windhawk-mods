@@ -762,6 +762,7 @@ enum class Kind {
     Volume, NativeBrightness, DdcBrightness, LockStatus, NoticeStatus,
     NativeEvent, ClipboardImage, Mixer
 };
+enum class ChevronDirection { Left, Right, Up, Down };
 struct MixerRow {
     std::wstring title;
     int percent = 0;
@@ -800,6 +801,7 @@ struct Snapshot {
     std::vector<uint8_t> clipboardPixels; // Bounded 32-bit BGRA, no HBITMAP on STA.
     MixerModel mixer;
     bool mixerChevron = false;
+    ChevronDirection mixerDirection = ChevronDirection::Down;
     bool brightness = false;
     bool showIcon = true;
     BYTE backgroundAlpha = 255;
@@ -965,6 +967,32 @@ Frame LevelFrame(const osd_model::Snapshot& value) {
     const double y = value.vertical ? 6.0 : 10.0;
     return {x, y, std::max(28.0, w - 2.0 * x),
         std::max(28.0, h - (value.vertical ? 12.0 : 23.0))};
+}
+// Use the actual calculated panel and primary-card positions. The chevron
+// points toward the Mixer when closed and back toward the level when open.
+osd_model::ChevronDirection MixerChevronDirection(
+        const RECT& main, const RECT& panel, bool vertical, bool expanded) {
+    const int64_t mainCenter2 = vertical
+        ? int64_t(main.left) + main.right
+        : int64_t(main.top) + main.bottom;
+    const int64_t panelCenter2 = vertical
+        ? int64_t(panel.left) + panel.right
+        : int64_t(panel.top) + panel.bottom;
+    const bool pointsBefore = (panelCenter2 < mainCenter2) != expanded;
+    if (vertical)
+        return pointsBefore ? osd_model::ChevronDirection::Left
+                            : osd_model::ChevronDirection::Right;
+    return pointsBefore ? osd_model::ChevronDirection::Up
+                        : osd_model::ChevronDirection::Down;
+}
+const wchar_t* MixerChevronGlyph(osd_model::ChevronDirection direction) {
+    switch (direction) {
+        case osd_model::ChevronDirection::Left:  return L"\uE76B";
+        case osd_model::ChevronDirection::Right: return L"\uE76C";
+        case osd_model::ChevronDirection::Up:    return L"\uE70E";
+        case osd_model::ChevronDirection::Down:  return L"\uE70D";
+    }
+    return L"\uE70D";
 }
 struct MixerButton {
     bool visible = false;
@@ -1973,9 +2001,21 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         result.Content(winrt::box_value(winrt::hstring(title)));
         result.Width(std::max(16.0, width));
         result.Height(height);
+        result.MinWidth(0.0);
+        result.MinHeight(0.0);
         result.FontSize(std::clamp(data.fontSize - 1, 10, 18));
         result.Foreground(Brush(data.text));
         return result;
+    };
+    auto makeIconButton = [&](const std::wstring& glyph, double width) {
+        auto button = makeButton(glyph, width, 32.0);
+        button.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+        // The stock button's padding eats into 34px content bounds and
+        // crops both the close glyph and 20px application bitmaps.
+        button.Padding(wx::Thickness{0.0, 0.0, 0.0, 0.0});
+        button.HorizontalContentAlignment(wx::HorizontalAlignment::Center);
+        button.VerticalContentAlignment(wx::VerticalAlignment::Center);
+        return button;
     };
     // Header: title and a real, hit-tested close command.
     controls::StackPanel header;
@@ -1989,8 +2029,7 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     title.VerticalAlignment(wx::VerticalAlignment::Center);
     title.TextTrimming(wx::TextTrimming::CharacterEllipsis);
     header.Children().Append(title);
-    auto close = makeButton(L"\uE8BB", 34.0, 32.0);
-    close.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+    auto close = makeIconButton(L"\uE8BB", 34.0);
     close.Click([&state](auto const&, auto const&) {
         SendMixerInput(state, InputAction::CloseMixer, -1);
     });
@@ -2056,9 +2095,8 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         controls::StackPanel row;
         row.Orientation(controls::Orientation::Horizontal);
         row.Height(rowH);
-        auto mute = makeButton(item.muted ? L"\uE74F" : L"\uE767",
-                               muteW, 32.0);
-        mute.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+        auto mute = makeIconButton(
+            item.muted ? L"\uE74F" : L"\uE767", muteW);
         if (item.iconPixels.size() == 20u * 20u * 4u) {
             auto bitmap = BitmapFromPixels(20, 20, item.iconPixels);
             if (bitmap) {
@@ -2378,6 +2416,8 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     }
 
     if (mixerButton.visible) {
+        state.mixerChevron.Content(winrt::box_value(
+            winrt::hstring(osd_layout::MixerChevronGlyph(value.mixerDirection))));
         state.mixerChevron.Width(mixerButton.size);
         state.mixerChevron.Height(mixerButton.size);
         controls::Canvas::SetLeft(state.mixerChevron, mixerButton.x);
@@ -3938,6 +3978,7 @@ void ShowNotice(std::wstring, std::wstring, DurationKind, NoticeIcon);
 void ShowMigratedXamlDeviceNotice(DurationKind);
 void ShowMigratedXamlClipboardNotice();
 void ResetXamlMixerController();
+bool BuildMixerPanelAnchors(RECT& main, RECT& panel, float scale);
 std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot();
 namespace bt_monitor {
     void Start();
@@ -9127,7 +9168,13 @@ void ShowMigratedXamlLevel(PopupKind kind) {
                brightness ? L"brightness" : L"volume");
         return;
     }
-    const auto snapshot = MakeXamlSnapshot(kind, target, g_scale);
+    auto snapshot = MakeXamlSnapshot(kind, target, g_scale);
+    if (!brightness && snapshot.mixerChevron) {
+        RECT plannedMain{}, plannedPanel{};
+        if (BuildMixerPanelAnchors(plannedMain, plannedPanel, g_scale))
+            snapshot.mixerDirection = osd_layout::MixerChevronDirection(
+                plannedMain, plannedPanel, snapshot.vertical, false);
+    }
     static bool routeLogged[2]{};
     static bool unavailableLogged[2]{};
     const int index = brightness ? 1 : 0;
@@ -9479,6 +9526,8 @@ void ShowXamlMixerPanel() {
     auto volume = MakeXamlSnapshot(
         PopupKind::NativeVolume, main, g_scale);
     volume.mixerChevron = g_showMixerArrow.load();
+    volume.mixerDirection = osd_layout::MixerChevronDirection(
+        main, panel, volume.vertical, true);
     volume.durationMs = OsdDuration(DurationKind::Interactive);
     auto mixer = MakeXamlSnapshot(
         PopupKind::NativeVolume, panel, g_scale);
