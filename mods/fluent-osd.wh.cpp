@@ -30,14 +30,15 @@ Explorer functions. Restore the official `@id fluent-osd` only when
 merging the renderer back into the production branch.
 
 Branch-only native XAML Island renderer for migrated categories:
-**system volume, native brightness, per-target DDC/CI brightness, lock-key status and passive USB/Bluetooth/network notices**.
+**system volume, native brightness, per-target DDC/CI brightness, lock-key status, and complete USB/Bluetooth/network notices (including expanded details)**.
 The existing XAML toggle selects the migrated renderer (no GDI+ fallback).
 Opacity inherits the original background-opacity setting; Native XAML pointer gestures
 relay clicks/drags/wheels to the existing audio and brightness
 workers. DDC targets have independent XAML hosts and their original
 monitor identity. Caps/Num/Scroll/Insert now use a shared XAML status card.
-Single-item USB/Bluetooth/network notices use system Fluent glyphs on XAML;
-aggregated clickable notices, media/mixer/clipboard remain GDI+ until migrated.
+Both single-item and aggregated USB/Bluetooth/network notices now use native
+XAML with click-to-expand details and ScrollViewer. Remaining GDI+ paths are
+transitional for unported categories and will be deleted as migration finishes.
 
 ## Features
 
