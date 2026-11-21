@@ -9,7 +9,7 @@
 // @include         explorer.exe
 // @include         Twinkle Tray.exe
 // @architecture    x86-64
-// @compilerOptions -lgdi32 -luser32 -lgdiplus -lshcore -ladvapi32 -lole32 -luuid -lshell32 -lsetupapi -liphlpapi -loleaut32 -lruntimeobject -lwindowsapp -ldwmapi
+// @compilerOptions -lgdi32 -luser32 -lshcore -ladvapi32 -lole32 -luuid -lshell32 -lsetupapi -liphlpapi -loleaut32 -lruntimeobject -lwindowsapp -ldwmapi
 // @license         GPL-3.0
 // ==/WindhawkMod==
 
@@ -666,7 +666,6 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #include <cwchar>
 #include <cstring>
 #include <cmath>
-#include <gdiplus.h>
 #include <wincodec.h>
 #include <dwmapi.h>
 #include <shellscalingapi.h>
@@ -3808,7 +3807,6 @@ enum class DurationKind : int {
 enum class NoticeCategory { Usb, Bluetooth, Network };
 enum class NoticeIcon { Clipboard, Usb, Bluetooth, Network };
 enum class NoticeAction { Connected, Disconnected, Removed, NetworkChanged };
-enum class PanelMode { None, Media, Mixer, Details };
 enum class PopupKind { DdcBrightness, NativeBrightness, NativeVolume, NativeEvent, LockStatus, Notification };
 enum class FlyoutDirection { Left, Right, Up, Down };
 
@@ -4157,9 +4155,6 @@ std::atomic<DWORD> g_customTrack{0};
 std::atomic<bool> g_validCustomTrack{false};
 std::atomic<int> g_backgroundOpacity{96};
 std::atomic<int> g_cornerRadius{17};
-// The optional legacy GDI+ backend retains the prior fixed appearance.
-constexpr float kLegacyTrackThickness = 8.0f;
-constexpr float kLegacyThumbDiameter = 11.0f;
 std::atomic<int> g_fontSize{15};
 std::atomic<int> g_iconSize{16};
 std::atomic<int> g_iconStrokeWidth{2};
@@ -4180,28 +4175,6 @@ HANDLE g_uiThread = nullptr;
 HANDLE g_uiReady = nullptr;
 DWORD g_uiThreadId = 0;
 HWND g_receiveWnd = nullptr;
-HWND g_popupWnd = nullptr;
-struct MirrorOutput {
-    HWND popup = nullptr;
-    HWND panel = nullptr;
-    HMONITOR monitor = nullptr;
-    RECT work{}, monitorBounds{}, popupBounds{};
-    float scale = 1.0f;
-};
-std::vector<MirrorOutput> g_mirrorOutputs; // UI thread only
-HWND g_panelWnd = nullptr;
-HWND g_arrowWnd = nullptr;
-// Hover and press state belong to the Explorer UI thread, like the flyouts.
-bool g_arrowHovered = false;
-bool g_arrowPressed = false;
-HWND g_speakerHitWnd = nullptr; // Hit target above the main-volume speaker.
-bool g_speakerPressed = false;  // Dedicated OSD UI thread only.
-HWND g_barWheelWnd = nullptr; // Minimal hit surface over the main OSD's bar.
-// Owned by the UI thread. The same small surface now supports wheel,
-// click-to-position and continuous dragging, without making the OSD opaque.
-bool g_mainBarDragging = false;
-int g_mainBarDragKind = -1; // static_cast<int>(PopupKind) on mouse-down
-// Only the UI thread mutates confirmed/optimistic values.
 DWORD g_wheelWriteGeneration = 0;
 int g_lastConfirmedNativeBrightness = -1;
 DWORD g_lastConfirmedDdcBrightness = 0;
@@ -4211,12 +4184,6 @@ HMODULE g_networkDll = nullptr;
 HANDLE g_networkNotification = nullptr;
 std::atomic<int> g_networkPreviousLevel{-1};
 std::atomic<HWND> g_networkReceiver{nullptr};
-bool g_fadeActive = false;
-bool g_fadeOut = false;
-DWORD g_fadeStart = 0;
-int g_fadeFrom = 255;
-int g_fadeTo = 255;
-int g_fadeAlpha = 255;
 std::atomic<bool> g_closing{false};
 std::wstring g_noticeTitle;
 std::wstring g_noticeBody;
@@ -4271,23 +4238,6 @@ struct MediaSnapshot {
 SRWLOCK g_mediaLock = SRWLOCK_INIT;
 MediaSnapshot g_mediaPending;
 MediaSnapshot g_mediaCurrent;             // Explorer UI thread only
-// Keep decoded artwork alive (together with its backing IStream), rather
-// than decoding the album cover on every progress-animation frame.
-std::vector<BYTE> g_cachedArtworkBytes;
-[[clang::no_destroy]] Microsoft::WRL::ComPtr<IStream> g_cachedArtworkStream;
-[[clang::no_destroy]] std::unique_ptr<Gdiplus::Bitmap> g_cachedArtwork;
-// All media positioning and dragging is owned by Explorer's OSD UI thread.
-bool g_mediaSeeking = false;
-INT64 g_mediaPreviewPosition = 0;
-ULONGLONG g_mediaSeekHoldUntil = 0;
-int g_mediaPressedIndex = -1;
-bool g_mediaPressedInside = false;
-bool g_mediaCyclePressed = false; // Album-cover session selector, UI thread.
-bool g_mediaCycleInside = false;
-int g_extraPressedAction = 0; // UI thread only, 5=shuffle, 6=repeat
-bool g_extraPressedInside = false;
-int g_mediaFeedbackIndex = -1;
-ULONGLONG g_mediaFeedbackTick = 0;
 ULONGLONG g_mediaLastRefreshTick = 0;
 HANDLE g_mediaWake = nullptr;
 HANDLE g_mediaThread = nullptr;
@@ -4299,14 +4249,7 @@ struct MediaCommand {
 };
 std::vector<MediaCommand> g_mediaCommands; // Bounded, worker-owned after swap.
 
-PanelMode g_panelMode = PanelMode::None;  // Explorer UI thread only
 float g_scale = 1.0f;
-int g_panelWidth = 0;
-int g_panelHeight = 0;
-int g_mixerScroll = 0;
-bool g_mixerDrag = false;
-int g_mixerMutePressedIndex = -1; // clicked icon; validate again on mouse-up
-int g_mixerDragIndex = -1;
 struct MixerEntry {
     std::wstring title;
     HICON appIcon = nullptr; // owned; released before clear
@@ -4318,10 +4261,6 @@ struct MixerEntry {
 std::vector<uint8_t> MixerIconPixels(HICON);
 [[clang::no_destroy]] std::vector<MixerEntry> g_mixerEntries;    // Explorer UI thread only
 [[clang::no_destroy]] Microsoft::WRL::ComPtr<IAudioEndpointVolume> g_mixerMaster;
-int g_mixerWheelRemainder = 0;
-int g_mixerWheelIndex = -1;
-int g_barWheelRemainder = 0;
-int g_barWheelKind = -1;
 float g_mixerMasterLevel = 0;
 bool g_mixerMasterMuted = false;
 // UI-thread controller state; XAML visual tree never owns Core Audio pointers.
@@ -4331,11 +4270,7 @@ uint32_t g_xamlMixerGeneration = 1, g_xamlMediaGeneration = 1;
 struct AudioOutputOption { std::wstring id; std::wstring name; };
 [[clang::no_destroy]] std::vector<AudioOutputOption> g_mixerOutputOptions; // UI thread only
 [[clang::no_destroy]] std::wstring g_mixerOutputId;
-bool g_mixerOutputExpanded = false;
 bool g_mixerOutputSwitchFailed = false;
-int g_mixerOutputScroll = 0;
-int g_mixerOutputHoveredRow = -1; // UI thread; index in device list
-bool g_mixerOutputHeaderHovered = false;
 // Endpoint listener is registered only while the interactive mixer is open.
 class MixerOutputNotifications final : public IMMNotificationClient {
     std::atomic<ULONG> refs_{1};
@@ -4426,7 +4361,6 @@ bool g_nativePercentKnown = false;              // UI thread only
 bool g_nativeMuted = false;                     // UI thread only
 int g_width = kLogicalWidth;
 int g_height = kLogicalHeight;
-ULONG_PTR g_gdiplusToken = 0;
 
 // ============================================================
 // Shared helpers: localization, settings, UI state and geometry
@@ -4497,25 +4431,6 @@ PCWSTR NoticeActionLabel(NoticeAction action) {
         case NoticeAction::NetworkChanged: return Tr(OsdText::NetworkChanged);
     }
     return L"";
-}
-float MixerTrackLength() {
-    if (g_panelWidth <= 0 || g_scale <= 0.0f) return kMixerTrackLength;
-    const float w = g_panelWidth / g_scale;
-    // Keep room at the right for the volume number and scrollbar.
-    return std::max(110.0f, w -
-        (g_verticalVolumeBrightness.load() ? 124.0f : 120.0f));
-}
-int MixerVisibleRows() {
-    if (g_panelHeight <= 0) return 1;
-    const float h = g_panelHeight / g_scale;
-    const int byHeight = std::max(1, static_cast<int>((h - 50.0f) / kMixerRowStep));
-    return std::min(g_mixerMaxRows.load(), byHeight);
-}
-int MixerMaximumScroll() {
-    return std::max(0, static_cast<int>(g_mixerEntries.size()) + 1 - MixerVisibleRows());
-}
-void ClampMixerScroll() {
-    g_mixerScroll = std::clamp(g_mixerScroll, 0, MixerMaximumScroll());
 }
 bool IsCustomMode(PCWSTR name) {
     PCWSTR value = Wh_GetStringSetting(name);
@@ -4657,29 +4572,6 @@ PanelAttachment GetPanelAttachment(bool vertical, FlyoutDirection direction,
                    : mainHeight - bottom + gap - top};
 }
 
-bool IsExpandedVolumePanel() {
-    return g_popupKind == PopupKind::NativeVolume &&
-           (g_panelMode == PanelMode::Media || g_panelMode == PanelMode::Mixer);
-}
-bool NeedsCompositeCentering() {
-    if (!IsExpandedVolumePanel()) return false;
-    const int position = g_position.load(std::memory_order_relaxed);
-    return g_verticalVolumeBrightness.load(std::memory_order_relaxed)
-        ? PositionCentersX(position) : PositionCentersY(position);
-}
-
-FlyoutDirection GetFlyoutDirection() {
-    const bool vertical = g_verticalVolumeBrightness.load(
-        std::memory_order_relaxed);
-    RECT main{};
-    MONITORINFO mi{sizeof(mi)};
-    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &main) ||
-        !GetMonitorInfoW(MonitorFromWindow(g_popupWnd,
-                                         MONITOR_DEFAULTTONEAREST), &mi))
-        return vertical ? FlyoutDirection::Right : FlyoutDirection::Down;
-    return DirectionForPopup(main, mi.rcWork,
-        g_position.load(std::memory_order_relaxed), vertical);
-}
 struct FindDisplay {
     WCHAR name[CCHDEVICENAME]{};
     HMONITOR monitor = nullptr;
@@ -4706,41 +4598,11 @@ HMONITOR FindMonitorByDeviceName(PCWSTR device) {
     return result.monitor;
 }
 
-bool PublishArgbLayer(HWND window, HDC screen, HDC memory,
-                      int width, int height) {
-    SIZE size{width, height};
-    POINT origin{0, 0};
-    BLENDFUNCTION blend{AC_SRC_OVER, 0,
-                        static_cast<BYTE>(g_fadeAlpha), AC_SRC_ALPHA};
-    return UpdateLayeredWindow(window, screen, nullptr, &size,
-                               memory, &origin, 0, &blend, ULW_ALPHA) != FALSE;
-}
-
 // ============================================================
 // Forward declarations: cross-feature callbacks and UI entrypoints
 // ============================================================
-void DrawText(Gdiplus::Graphics&, const std::wstring&, float, float, float,
-              float, float, Gdiplus::Color, bool = false, bool = false);
-void DrawHorizontalVolume(Gdiplus::Graphics&);
-void DrawLockStatus(Gdiplus::Graphics&);
-void DrawNotification(Gdiplus::Graphics&);
-void DrawExpandChevron(Gdiplus::Graphics&, float, float, Gdiplus::Color);
-void ShowPopupAnimated();
-void RenderPopup();
-void RenderPanel();
-void RenderMirroredFrame(HDC, void*, int, int, bool);
-void RenderDdcTargetPeers();
 void MovePopupToDisplay(const BrightnessEvent&);
-void SetPopupInteractive(bool);
-void ResetHideTimer(UINT);
-void ResetHideTimerFor(DurationKind);
-void ClosePanel();
-void HideMirroredWindows(bool);
-void DestroyMirroredWindows();
-void UpdateArrowHitWindow();
-void UpdateSpeakerHitWindow();
 void FlushNoticeBatch();
-void ShowPanel();
 void ShowNotice(std::wstring, std::wstring, DurationKind, NoticeIcon);
 void ShowMigratedXamlDeviceNotice(DurationKind);
 void ShowMigratedXamlClipboardNotice();
@@ -5322,11 +5184,6 @@ DWORD SystemAccentRgb() {
            (DWORD(GetGValue(fallback)) << 8) | DWORD(GetBValue(fallback));
 }
 
-Gdiplus::Color ToGdiColor(DWORD rgb, BYTE alpha = 255) {
-    return Gdiplus::Color(alpha, (rgb >> 16) & 255,
-                          (rgb >> 8) & 255, rgb & 255);
-}
-
 bool IsLightTheme() {
     const int setting = g_ddcTheme.load(std::memory_order_relaxed);
     if (setting == 1) return true;
@@ -5364,37 +5221,6 @@ DWORD OsdTrackRgb(bool light, bool mixer = false) {
 DWORD OsdAccentRgb() {
     return g_accentMode.load() && g_validCustomAccent.load()
         ? g_customAccent.load() : SystemAccentRgb();
-}
-
-void AddRoundedRect(Gdiplus::GraphicsPath& path, float x, float y,
-                    float width, float height, float radius) {
-    radius = std::clamp(radius, 0.0f,
-                        std::min(width, height) / 2.0f);
-    if (radius <= 0.0f) {
-        path.AddRectangle(Gdiplus::RectF(x, y, width, height));
-        return;
-    }
-    const float d = radius * 2.0f;
-    path.AddArc(x, y, d, d, 180.0f, 90.0f);
-    path.AddArc(x + width - d, y, d, d, 270.0f, 90.0f);
-    path.AddArc(x + width - d, y + height - d, d, d, 0.0f, 90.0f);
-    path.AddArc(x, y + height - d, d, d, 90.0f, 90.0f);
-    path.CloseFigure();
-}
-
-void DrawTrackThumb(Gdiplus::Graphics& gfx, float x, float centerY,
-                    Gdiplus::Color accent, bool light) {
-    const float diameter = kLegacyThumbDiameter;
-    if (diameter <= 0.0f) return;
-    const float radius = diameter / 2.0f;
-    Gdiplus::SolidBrush fill(light
-        ? Gdiplus::Color(255, 255, 255, 255)
-        : Gdiplus::Color(255, 27, 27, 31));
-    Gdiplus::Pen outline(accent, 2.0f);
-    gfx.FillEllipse(&fill, x - radius, centerY - radius,
-                    diameter, diameter);
-    gfx.DrawEllipse(&outline, x - radius, centerY - radius,
-                    diameter, diameter);
 }
 
 int BrightnessPercent(const BrightnessEvent& brightness, bool* known) {
@@ -5453,32 +5279,6 @@ bool ReadDefaultAudioVolume(int& percent, bool& muted) {
     return ok;
 }
 
-bool AdjustDefaultAudioWheel(int steps) {
-    if (!steps) return false;
-    Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
-    if (!OpenDefaultAudioEndpointVolume(volume)) return false;
-    float level = 0;
-    BOOL muted = FALSE;
-    bool ok = SUCCEEDED(volume->GetMasterVolumeLevelScalar(&level));
-    if (ok) {
-        const float next = std::clamp(level +
-            steps * (kWheelStepPercent / 100.0f), 0.0f, 1.0f);
-        ok = SUCCEEDED(volume->SetMasterVolumeLevelScalar(next, nullptr));
-        if (ok) {
-            volume->GetMasterVolumeLevelScalar(&level);
-            volume->GetMute(&muted);
-        }
-    }
-    if (ok) {
-        g_nativePercent = static_cast<int>(std::lround(level * 100.0f));
-        g_nativeMuted = muted != FALSE;
-        g_nativePercentKnown = true;
-        RenderPopup();
-        ResetHideTimerFor(DurationKind::Volume);
-    }
-    return ok;
-}
-
 // Absolute set for click/drag of the main volume track. Do not unmute: mute
 // is a separate user state, and moving the track should not silently clear it.
 bool SetDefaultAudioBarPercent(int percent) {
@@ -5499,7 +5299,6 @@ bool SetDefaultAudioBarPercent(int percent) {
     g_nativePercent = static_cast<int>(std::lround(
         std::clamp(actual, 0.0f, 1.0f) * 100.0f));
     g_nativeMuted = muted != FALSE;
-    RenderPopup();
     return true;
 }
 
@@ -5522,12 +5321,7 @@ bool ToggleDefaultAudioMute() {
         g_nativePercentKnown = true;
     }
     g_nativeMuted = actual != FALSE;
-    if (g_panelMode == PanelMode::Mixer) {
-        g_mixerMasterMuted = g_nativeMuted;
-        RenderPanel();
-    }
-    RenderPopup();
-    ResetHideTimerFor(g_activeDurationKind);
+    if (g_xamlMixerOpen) g_mixerMasterMuted = g_nativeMuted;
     return true;
 }
 
@@ -5538,213 +5332,6 @@ bool ToggleDefaultAudioMute() {
 // ============================================================
 // Shared vector drawing and main OSD painters
 // ============================================================
-void DrawUniformStatusIcon(Gdiplus::Graphics& gfx,
-                           Gdiplus::Color color,
-                           float centerX, float centerY,
-                           PopupKind kind, int percent, bool muted) {
-    const float size = static_cast<float>(g_iconSize.load());
-    const float unit = size / 20.0f;
-    const float left = centerX - size / 2.0f;
-    const float top = centerY - size / 2.0f;
-    const auto X = [left, unit](float x) { return left + x * unit; };
-    const auto Y = [top, unit](float y) { return top + y * unit; };
-    Gdiplus::Pen pen(color,
-        static_cast<float>(g_iconStrokeWidth.load()));
-    pen.SetStartCap(Gdiplus::LineCapRound);
-    pen.SetEndCap(Gdiplus::LineCapRound);
-    pen.SetLineJoin(Gdiplus::LineJoinRound);
-
-    if (kind == PopupKind::NativeVolume) {
-        Gdiplus::PointF points[] = {
-            {X(2.2f), Y(8.0f)}, {X(5.7f), Y(8.0f)},
-            {X(10.0f), Y(4.7f)}, {X(10.0f), Y(15.3f)},
-            {X(5.7f), Y(12.0f)}, {X(2.2f), Y(12.0f)}
-        };
-        Gdiplus::GraphicsPath speaker;
-        speaker.AddLines(points, ARRAYSIZE(points));
-        speaker.CloseFigure();
-        gfx.DrawPath(&pen, &speaker);
-        if (muted || percent == 0) {
-            gfx.DrawLine(&pen, X(13.0f), Y(7.7f),
-                           X(17.3f), Y(12.3f));
-            gfx.DrawLine(&pen, X(17.3f), Y(7.7f),
-                           X(13.0f), Y(12.3f));
-        } else {
-            // Medium and high volume are differentiated, but never enlarge
-            // the speaker icon; its maximum envelope matches the sun icon.
-            gfx.DrawArc(&pen, X(10.5f), Y(6.5f),
-                        4.3f * unit, 7.0f * unit, -65.0f, 130.0f);
-            if (percent >= 50)
-                gfx.DrawArc(&pen, X(9.5f), Y(3.4f),
-                            8.2f * unit, 13.2f * unit, -62.0f, 124.0f);
-        }
-    } else {
-        gfx.DrawEllipse(&pen, X(7.1f), Y(7.1f),
-                        5.8f * unit, 5.8f * unit);
-        for (int i = 0; i < 8; ++i) {
-            const float angle = kTau * static_cast<float>(i) / 8.0f;
-            const float dx = std::cos(angle), dy = std::sin(angle);
-            gfx.DrawLine(&pen,
-                X(10.0f + dx * 6.0f), Y(10.0f + dy * 6.0f),
-                X(10.0f + dx * 8.0f), Y(10.0f + dy * 8.0f));
-        }
-    }
-}
-
-// One renderer is shared by volume, native brightness and DDC/CI brightness.
-// This is an upright bar (bottom-to-top), not a rotated bitmap. It deliberately
-// does not add taskbar widgets or depend on a separate UI framework.
-void DrawExpandChevron(Gdiplus::Graphics& gfx, float x, float y,
-                       Gdiplus::Color color);
-// Shared painted icon and hit-target anchor, including vertical size settings.
-void MainVolumeIconCenter(float& x, float& y) {
-    if (g_verticalVolumeBrightness.load()) {
-        const float logicalH = MainLogicalHeight();
-        const float glyph = static_cast<float>(g_iconSize.load());
-        x = MainLogicalWidth() / 2.0f;
-        y = g_showMixerArrow.load() ?
-            logicalH - 42.0f - glyph / 2.0f :
-            logicalH - 6.0f - static_cast<float>(g_innerPadding.load()) -
-                glyph / 2.0f;
-    } else {
-        x = 49.0f;
-        y = MainCenterY();
-    }
-}
-
-void DrawVerticalPopup(Gdiplus::Graphics& gfx, const BrightnessEvent& brightness) {
-    const bool light = IsLightTheme();
-    const DWORD backgroundRgb = OsdBackgroundRgb(light);
-    const DWORD textRgb = OsdTextRgb(light);
-    const DWORD trackRgb = OsdTrackRgb(light);
-    const DWORD accentRgb = OsdAccentRgb();
-    const BYTE opacity = OsdBackgroundAlpha();
-    const Gdiplus::Color foreground = ToGdiColor(textRgb);
-    const Gdiplus::Color accent = ToGdiColor(accentRgb);
-    const Gdiplus::Color trackColor = ToGdiColor(trackRgb);
-    const bool borderless = g_ddcBorderless.load();
-    const float corner = static_cast<float>(g_cornerRadius.load());
-
-    // Configurable vertical canvas; keep 7px side / 6px top/bottom margins.
-    const float logicalW = MainLogicalWidth();
-    const float logicalH = MainLogicalHeight();
-    const float edge = static_cast<float>(g_innerPadding.load());
-    const float cardHeight = logicalH - 12.0f;
-    const float cardWidth = logicalW - 14.0f;
-    const float centerX = logicalW / 2.0f;
-    if (!borderless) {
-        for (int layer = 5; layer >= 1; --layer) {
-            const float grow = static_cast<float>(layer);
-            Gdiplus::GraphicsPath shadow;
-            AddRoundedRect(shadow, 7.0f - grow * 0.35f,
-                           6.0f + grow * 0.45f,
-                           cardWidth + grow * 0.7f,
-                           cardHeight + grow * 0.55f,
-                           corner + grow * 0.25f);
-            Gdiplus::SolidBrush sb(Gdiplus::Color(
-                static_cast<BYTE>(light ? 6 : 12), 0, 0, 0));
-            gfx.FillPath(&sb, &shadow);
-        }
-    }
-    Gdiplus::GraphicsPath body;
-    AddRoundedRect(body, 7.0f, 6.0f, cardWidth, cardHeight, corner);
-    Gdiplus::SolidBrush bg(ToGdiColor(backgroundRgb, opacity));
-    gfx.FillPath(&bg, &body);
-    if (!borderless) {
-        Gdiplus::Pen outline(light
-            ? Gdiplus::Color(255, 213, 215, 220)
-            : Gdiplus::Color(255, 81, 82, 87), 0.8f);
-        gfx.DrawPath(&outline, &body);
-    }
-
-    const bool showIcon = (g_popupKind == PopupKind::NativeVolume) ||
-                          g_showSun.load();
-    const bool showValue = g_showValue.load();
-    bool known = false;
-    int percent = 0;
-    DWORD raw = 0;
-    if (g_popupKind == PopupKind::DdcBrightness) {
-        percent = BrightnessPercent(brightness, &known);
-        raw = brightness.value;
-    } else {
-        known = g_nativePercentKnown;
-        percent = g_nativePercent;
-        raw = static_cast<DWORD>(std::max(g_nativePercent, 0));
-    }
-    percent = std::clamp(percent, 0, 100);
-
-    if (showValue) {
-        WCHAR number[48]{};
-        if (known) swprintf_s(number, L"%d%%", percent);
-        else swprintf_s(number, L"%lu", raw);
-        Gdiplus::Font font(L"Segoe UI Variable Text",
-            static_cast<float>(g_fontSize.load()),
-            Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-        Gdiplus::Font fallback(L"Segoe UI",
-            static_cast<float>(g_fontSize.load()),
-            Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-        Gdiplus::SolidBrush textBrush(foreground);
-        Gdiplus::StringFormat format;
-        format.SetAlignment(Gdiplus::StringAlignmentCenter);
-        format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-        gfx.DrawString(number, -1,
-            font.GetLastStatus() == Gdiplus::Ok ? &font : &fallback,
-            Gdiplus::RectF(8.0f, 6.0f + edge, logicalW - 16.0f, 22.0f),
-            &format, &textBrush);
-    }
-
-    const float thick = kLegacyTrackThickness;
-    const float y = showValue ? 34.0f + edge : 9.0f + edge;
-    const bool hasChevron =
-        g_popupKind == PopupKind::NativeVolume && g_showMixerArrow.load();
-    // Preserve the gap above the expand button at any custom main height.
-    const float iconBottom = hasChevron ? logicalH - 42.0f : logicalH - 27.0f;
-    const float glyphSize = static_cast<float>(g_iconSize.load());
-    const float thumbRadius = kLegacyThumbDiameter / 2.0f;
-    const float bottom = hasChevron
-        ? std::min(logicalH - 57.0f, iconBottom - glyphSize -
-                           std::max(8.0f, thumbRadius + 4.0f))
-        : (showIcon ? logicalH - 34.0f - edge : logicalH - 9.0f - edge);
-    const float height = std::max(1.0f, bottom - y);
-    const float x = centerX - thick / 2.0f;
-    Gdiplus::GraphicsPath track;
-    AddRoundedRect(track, x, y, thick, height, thick / 2.0f);
-    Gdiplus::SolidBrush trackBrush(trackColor);
-    gfx.FillPath(&trackBrush, &track);
-    if (known && percent > 0) {
-        const float filled = height * percent / 100.0f;
-        // Clip the full track to keep both ends curved.
-        Gdiplus::GraphicsPath fill;
-        AddRoundedRect(fill, x, y, thick, height, thick / 2.0f);
-        Gdiplus::GraphicsState previousClip = gfx.Save();
-        gfx.SetClip(Gdiplus::RectF(x, bottom - filled, thick, filled));
-        Gdiplus::SolidBrush accentBrush(accent);
-        gfx.FillPath(&accentBrush, &fill);
-        gfx.Restore(previousClip);
-    }
-    // Legacy GDI+ preserves its fixed original Thumb size.
-    if (known)
-        DrawTrackThumb(gfx, centerX,
-                       bottom - height * percent / 100.0f, accent, light);
-
-    if (showIcon) {
-        // Put the volume icon ABOVE its dedicated bottom chevron, while
-        // retaining the same size and stroke as the brightness icon.
-        float iconX = centerX;
-        float iconY = hasChevron
-            ? (iconBottom - glyphSize / 2.0f)
-            : (logicalH - 6.0f - edge - glyphSize / 2.0f);
-        if (g_popupKind == PopupKind::NativeVolume)
-            MainVolumeIconCenter(iconX, iconY);
-        DrawUniformStatusIcon(gfx, foreground, iconX, iconY,
-                              g_popupKind, percent, g_nativeMuted);
-    }
-    if (hasChevron)
-        DrawExpandChevron(gfx, VerticalChevronX(),
-                          VerticalChevronY(), foreground);
-}
-
-// --- Event notifications & shared animation state ---
 void ClearClipboardThumbnail() {
     if (g_clipboardThumbnail) {
         DeleteObject(g_clipboardThumbnail);
@@ -5755,413 +5342,6 @@ void ClearClipboardThumbnail() {
 // All text/status notifications share exactly the same canvas and card/tile
 // geometry. A separate, image-first clipboard layout intentionally uses its
 // own canvas so image previews can preserve their aspect ratio.
-void DrawStatusNoticeChrome(Gdiplus::Graphics& gfx, bool light) {
-    Gdiplus::GraphicsPath card;
-    AddRoundedRect(card, 8.0f, 7.0f,
-                   kStatusNoticeWidth - 16.0f, kStatusNoticeHeight - 15.0f,
-                   static_cast<float>(g_cornerRadius.load()));
-    Gdiplus::SolidBrush background(ToGdiColor(
-        OsdBackgroundRgb(light), OsdBackgroundAlpha()));
-    gfx.FillPath(&background, &card);
-    Gdiplus::GraphicsPath tile;
-    AddRoundedRect(tile, kStatusIconX, kStatusIconY,
-                   kStatusIconSize, kStatusIconSize, 10.0f);
-    Gdiplus::SolidBrush tileBrush(light
-        ? Gdiplus::Color(255, 234, 236, 240)
-        : Gdiplus::Color(255, 66, 68, 72));
-    gfx.FillPath(&tileBrush, &tile);
-}
-
-// Keep typography and text insets identical across event sources.
-void DrawStatusNoticeLabels(Gdiplus::Graphics& gfx,
-                            const std::wstring& title,
-                            const std::wstring& detail,
-                            Gdiplus::Color fg,
-                            bool hasAction = false) {
-    const Gdiplus::Color quiet(195, fg.GetR(), fg.GetG(), fg.GetB());
-    DrawText(gfx, title, kStatusTextX, 22.0f,
-             hasAction ? 177.0f : 188.0f, 25.0f, 15.0f, fg, false);
-    DrawText(gfx, detail, kStatusTextX, 48.0f,
-             188.0f, 23.0f, 12.0f, quiet, false);
-}
-
-// Compact icon-and-state OSD for HardwareConfirmator categories that do not
-// have a meaningful volume/brightness slider. Values come from the native
-// display request itself, not from polling device state.
-void DrawNativeEvent(Gdiplus::Graphics& gfx) {
-    const bool light = IsLightTheme();
-    const Gdiplus::Color fg = ToGdiColor(OsdTextRgb(light));
-    DrawStatusNoticeChrome(gfx, light);
-    Gdiplus::Pen symbol(ToGdiColor(OsdAccentRgb()), 2.0f);
-    symbol.SetStartCap(Gdiplus::LineCapRound);
-    symbol.SetEndCap(Gdiplus::LineCapRound);
-    const NativeEventInfo& ev = g_nativeEventCurrent;
-    std::wstring title, detail;
-    switch (ev.kind) {
-        case Kind::Keyboard: {
-            title = Tr(OsdText::KeyboardBacklight);
-            detail = ev.value >= 0 && ev.value <= 100
-                ? std::to_wstring(ev.value) + L"%" :
-                  std::wstring(Tr(OsdText::Level)) + std::to_wstring(ev.value);
-            Gdiplus::GraphicsPath kb;
-            AddRoundedRect(kb, 28.0f, 33.0f, 32.0f, 23.0f, 4.0f);
-            gfx.DrawPath(&symbol, &kb);
-            for (int row = 0; row < 2; ++row)
-                for (int col = 0; col < 4; ++col)
-                    gfx.DrawLine(&symbol, 33.0f + col * 7.0f,
-                                 40.0f + row * 7.0f,
-                                 36.0f + col * 7.0f,
-                                 40.0f + row * 7.0f);
-            break;
-        }
-        case Kind::Airplane:
-            title = Tr(OsdText::AirplaneMode);
-            detail = ev.value ? Tr(OsdText::Enabled) : Tr(OsdText::Disabled);
-            gfx.DrawLine(&symbol, 30.0f, 55.0f, 57.0f, 31.0f);
-            gfx.DrawLine(&symbol, 44.0f, 42.0f, 28.0f, 37.0f);
-            gfx.DrawLine(&symbol, 44.0f, 42.0f, 54.0f, 58.0f);
-            gfx.DrawLine(&symbol, 34.0f, 49.0f, 33.0f, 56.0f);
-            break;
-        case Kind::Camera: {
-            const bool access = ev.variant == 1;
-            title = access ? Tr(OsdText::CameraAccess) : Tr(OsdText::Camera);
-            detail = access ? (ev.value ? Tr(OsdText::Allowed) : Tr(OsdText::Blocked))
-                            : (ev.value ? Tr(OsdText::Enabled) : Tr(OsdText::Disabled));
-            Gdiplus::GraphicsPath camera;
-            AddRoundedRect(camera, 28.0f, 35.0f, 32.0f, 22.0f, 4.0f);
-            gfx.DrawPath(&symbol, &camera);
-            gfx.DrawEllipse(&symbol, 40.0f, 40.0f, 11.0f, 11.0f);
-            break;
-        }
-        case Kind::Microphone: {
-            title = Tr(OsdText::Microphone);
-            // The non-public API uses an integer state; do not invent device
-            // state semantics for values other than conventional 0/1.
-            detail = ev.value == 0 ? Tr(OsdText::Unmuted) :
-                     ev.value == 1 ? Tr(OsdText::Muted) : Tr(OsdText::StatusChanged);
-            Gdiplus::GraphicsPath capsule;
-            AddRoundedRect(capsule, 38.0f, 30.0f, 13.0f, 23.0f, 6.5f);
-            gfx.DrawPath(&symbol, &capsule);
-            gfx.DrawArc(&symbol, 33.0f, 38.0f, 23.0f, 20.0f, 0.0f, 180.0f);
-            gfx.DrawLine(&symbol, 44.0f, 58.0f, 44.0f, 62.0f);
-            gfx.DrawLine(&symbol, 38.0f, 62.0f, 50.0f, 62.0f);
-            if (ev.value == 1)
-                gfx.DrawLine(&symbol, 32.0f, 59.0f, 56.0f, 33.0f);
-            break;
-        }
-        case Kind::Desktop: {
-            title = Tr(OsdText::VirtualDesktop);
-            detail = ev.text.empty() ? Tr(OsdText::DesktopSwitched) : ev.text;
-            Gdiplus::GraphicsPath desktop;
-            AddRoundedRect(desktop, 27.0f, 33.0f, 34.0f, 24.0f, 3.0f);
-            gfx.DrawPath(&symbol, &desktop);
-            gfx.DrawLine(&symbol, 44.0f, 58.0f, 44.0f, 62.0f);
-            gfx.DrawLine(&symbol, 37.0f, 62.0f, 51.0f, 62.0f);
-            break;
-        }
-        case Kind::Text:
-            title = Tr(OsdText::SystemNotice);
-            detail = ev.text.empty() ? Tr(OsdText::StatusChanged) : ev.text;
-            gfx.DrawLine(&symbol, 31.0f, 34.0f, 57.0f, 34.0f);
-            gfx.DrawLine(&symbol, 44.0f, 34.0f, 44.0f, 59.0f);
-            gfx.DrawLine(&symbol, 37.0f, 59.0f, 51.0f, 59.0f);
-            break;
-        default:
-            title = Tr(OsdText::SystemStatus);
-            detail = Tr(OsdText::StatusChanged);
-            break;
-    }
-    DrawStatusNoticeLabels(gfx, title, detail, fg);
-}
-
-// The notice category is explicit state, not inferred from localized titles
-// or device names. Keep all symbols within the shared 52x52 status tile.
-void DrawNoticeCategoryIcon(Gdiplus::Graphics& gfx, NoticeIcon icon) {
-    const Gdiplus::Color accent = ToGdiColor(OsdAccentRgb());
-    Gdiplus::Pen stroke(accent, 2.2f);
-    stroke.SetStartCap(Gdiplus::LineCapRound);
-    stroke.SetEndCap(Gdiplus::LineCapRound);
-    stroke.SetLineJoin(Gdiplus::LineJoinRound);
-    Gdiplus::SolidBrush solid(accent);
-    switch (icon) {
-        case NoticeIcon::Bluetooth:
-            // Standard Bluetooth angular rune: upper and lower forks.
-            gfx.DrawLine(&stroke, 44.0f, 29.0f, 44.0f, 61.0f);
-            gfx.DrawLine(&stroke, 44.0f, 29.0f, 55.0f, 38.0f);
-            gfx.DrawLine(&stroke, 55.0f, 38.0f, 34.0f, 54.0f);
-            gfx.DrawLine(&stroke, 34.0f, 36.0f, 55.0f, 52.0f);
-            gfx.DrawLine(&stroke, 55.0f, 52.0f, 44.0f, 61.0f);
-            break;
-        case NoticeIcon::Usb: {
-            // USB trident: triangular head, branch terminal and dot.
-            gfx.DrawLine(&stroke, 44.0f, 36.0f, 44.0f, 59.0f);
-            gfx.DrawLine(&stroke, 44.0f, 49.0f, 34.0f, 49.0f);
-            gfx.DrawLine(&stroke, 34.0f, 49.0f, 34.0f, 55.0f);
-            gfx.DrawLine(&stroke, 44.0f, 42.0f, 54.0f, 42.0f);
-            gfx.DrawLine(&stroke, 54.0f, 42.0f, 54.0f, 35.0f);
-            Gdiplus::PointF triangle[] = {
-                {44.0f, 28.0f}, {39.5f, 36.0f}, {48.5f, 36.0f}
-            };
-            gfx.DrawPolygon(&stroke, triangle, 3);
-            gfx.DrawEllipse(&stroke, 31.0f, 55.0f, 6.0f, 6.0f);
-            gfx.DrawRectangle(&stroke, 51.0f, 29.0f, 6.0f, 6.0f);
-            gfx.FillEllipse(&solid, 41.0f, 57.0f, 6.0f, 6.0f);
-            break;
-        }
-        case NoticeIcon::Network:
-            // Interface/network topology, not a globe implying Internet
-            // availability (which connectivity-hint events cannot prove).
-            gfx.DrawLine(&stroke, 44.0f, 37.0f, 44.0f, 46.0f);
-            gfx.DrawLine(&stroke, 44.0f, 46.0f, 33.0f, 55.0f);
-            gfx.DrawLine(&stroke, 44.0f, 46.0f, 55.0f, 55.0f);
-            gfx.FillEllipse(&solid, 40.0f, 29.0f, 8.0f, 8.0f);
-            gfx.FillEllipse(&solid, 40.0f, 42.0f, 8.0f, 8.0f);
-            gfx.FillEllipse(&solid, 29.0f, 53.0f, 8.0f, 8.0f);
-            gfx.FillEllipse(&solid, 51.0f, 53.0f, 8.0f, 8.0f);
-            break;
-        case NoticeIcon::Clipboard: {
-            // Replace the generic dot with a clipboard; image previews
-            // continue using their separate full-image layout.
-            Gdiplus::GraphicsPath board;
-            AddRoundedRect(board, 33.0f, 33.0f, 22.0f, 29.0f, 3.0f);
-            gfx.DrawPath(&stroke, &board);
-            Gdiplus::GraphicsPath clip;
-            AddRoundedRect(clip, 39.0f, 29.0f, 10.0f, 7.0f, 2.0f);
-            gfx.FillPath(&solid, &clip);
-            gfx.DrawLine(&stroke, 38.0f, 46.0f, 50.0f, 46.0f);
-            gfx.DrawLine(&stroke, 38.0f, 52.0f, 48.0f, 52.0f);
-            break;
-        }
-    }
-}
-
-void DrawNotification(Gdiplus::Graphics& gfx) {
-    // OSD text is ephemeral and never written to disk or Windhawk logs.
-    const bool light = IsLightTheme();
-    const DWORD bg = OsdBackgroundRgb(light);
-    const DWORD fgRgb = OsdTextRgb(light);
-    const Gdiplus::Color fg = ToGdiColor(fgRgb);
-    // Image-first clipboard notice: the image occupies nearly the whole
-    // canvas. Do not crop or distort portrait/panoramic clipboard images.
-    if (g_clipboardThumbnail) {
-        Gdiplus::GraphicsPath card;
-        AddRoundedRect(card, 8.0f, 7.0f,
-                       kClipboardImageCanvasW - 16.0f,
-                       kClipboardImageCanvasH - 14.0f,
-                       static_cast<float>(g_cornerRadius.load()));
-        Gdiplus::SolidBrush background(ToGdiColor(bg,
-            OsdBackgroundAlpha()));
-        gfx.FillPath(&background, &card);
-
-        constexpr float left = 20.0f;
-        constexpr float top = 18.0f;
-        const float previewW = kClipboardImageMaxW;
-        const float previewH = kClipboardImageMaxH;
-        Gdiplus::GraphicsPath preview;
-        AddRoundedRect(preview, left, top, previewW, previewH, 9.0f);
-        Gdiplus::SolidBrush placeholder(light
-            ? Gdiplus::Color(255, 235, 236, 240)
-            : Gdiplus::Color(255, 55, 56, 61));
-        gfx.FillPath(&placeholder, &preview);
-
-        Gdiplus::Bitmap bitmap(g_clipboardThumbnail, nullptr);
-        if (bitmap.GetLastStatus() == Gdiplus::Ok &&
-            bitmap.GetWidth() && bitmap.GetHeight()) {
-            const float imageScale = std::min(
-                previewW / bitmap.GetWidth(),
-                previewH / bitmap.GetHeight());
-            const float imageW = bitmap.GetWidth() * imageScale;
-            const float imageH = bitmap.GetHeight() * imageScale;
-            const float x = left + (previewW - imageW) * 0.5f;
-            const float y = top + (previewH - imageH) * 0.5f;
-            const auto state = gfx.Save();
-            gfx.SetClip(&preview);
-            gfx.DrawImage(&bitmap, x, y, imageW, imageH);
-            gfx.Restore(state);
-        }
-        // Only a small caption remains; the picture is the primary UI.
-        DrawText(gfx, g_noticeTitle, 20.0f, 190.0f,
-                 224.0f, 18.0f, 12.0f, fg, true);
-        return;
-    }
-    DrawStatusNoticeChrome(gfx, light);
-    DrawNoticeCategoryIcon(gfx, g_noticeIcon);
-    DrawStatusNoticeLabels(gfx, g_noticeTitle, g_noticeBody,
-                           fg, g_noticeClickable);
-    if (g_noticeClickable) DrawText(gfx, L"›", 269, 34, 17, 20, 20, fg, true);
-}
-
-// Windows 11 layered GDI+ windows use UpdateLayeredWindow (premultiplied
-// alpha). NEVER mix SetLayeredWindowAttributes on the popup/panel: doing so
-// would break subsequent UpdateLayeredWindow calls.
-// ============================================================
-// Popup lifetime, hide/fade and input geometry
-// ============================================================
-void FinishPopupHide() {
-    HideMirroredWindows(false);
-    g_ddcTargets.clear(); // Release per-monitor values after visibility ends.
-    g_fadeActive = false;
-    g_fadeAlpha = 255;
-    if (g_popupWnd) ShowWindow(g_popupWnd, SW_HIDE);
-    if (g_arrowWnd) ShowWindow(g_arrowWnd, SW_HIDE);
-    g_arrowHovered = false;
-    g_arrowPressed = false;
-    if (g_arrowWnd && GetCapture() == g_arrowWnd) ReleaseCapture();
-    if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
-    if (g_speakerHitWnd) ShowWindow(g_speakerHitWnd, SW_HIDE);
-    g_speakerPressed = false;
-    if (g_speakerHitWnd && GetCapture() == g_speakerHitWnd) ReleaseCapture();
-    g_mainBarDragging = false;
-    g_mainBarDragKind = -1;
-    if (g_barWheelWnd && GetCapture() == g_barWheelWnd) ReleaseCapture();
-    ClosePanel();
-    ClearClipboardThumbnail();
-    g_noticeTitle.clear();
-    g_noticeBody.clear();
-    g_noticeIcon = NoticeIcon::Clipboard;
-    g_noticeClickable = false;
-    g_noticeDetails.clear();
-    g_noticeScroll = 0;
-    // Revert to a passthrough OSD after any interactive event notification.
-    SetWindowLongPtrW(g_popupWnd, GWL_EXSTYLE,
-        GetWindowLongPtrW(g_popupWnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT);
-}
-
-void BeginFade(bool out) {
-    if (!g_popupWnd) return;
-    KillTimer(g_popupWnd, kFadeTimer);
-    g_fadeActive = false;
-    if (!g_fadeEnabled.load()) {
-        g_fadeAlpha = out ? 0 : 255;
-        if (out) FinishPopupHide();
-        else { RenderPopup(); if (g_panelMode != PanelMode::None) RenderPanel(); }
-        return;
-    }
-    g_fadeOut = out;
-    g_fadeFrom = g_fadeAlpha;
-    g_fadeTo = out ? 0 : 255;
-    if (g_fadeFrom == g_fadeTo) {
-        if (out) FinishPopupHide();
-        return;
-    }
-    g_fadeStart = GetTickCount();
-    g_fadeActive = true;
-    if (!SetTimer(g_popupWnd, kFadeTimer, 16, nullptr)) {
-        g_fadeActive = false;
-        g_fadeAlpha = g_fadeTo;
-        if (out) FinishPopupHide();
-    }
-}
-
-// The painted track (not the hit halo) defines the 0..100% mapping.
-// This matches DrawVerticalPopup, DrawHorizontalVolume, and the horizontal
-// brightness renderer, including user-defined OSD canvas dimensions.
-struct MainBarRect { float x, y, w, h; };
-bool MainBarTrackGeometry(MainBarRect& bar) {
-    if (g_popupKind != PopupKind::NativeVolume &&
-        g_popupKind != PopupKind::NativeBrightness &&
-        g_popupKind != PopupKind::DdcBrightness) return false;
-    if (g_popupKind == PopupKind::DdcBrightness &&
-        g_visible.maximum <= g_visible.minimum) return false;
-    if (g_popupKind != PopupKind::DdcBrightness &&
-        !g_nativePercentKnown) return false;
-    const float thick = kLegacyTrackThickness;
-    if (g_verticalVolumeBrightness.load()) {
-        const float edge = static_cast<float>(g_innerPadding.load());
-        const float glyph = static_cast<float>(g_iconSize.load());
-        const float thumb = kLegacyThumbDiameter / 2.0f;
-        const bool showIcon = g_popupKind == PopupKind::NativeVolume ||
-                              g_showSun.load();
-        const bool chevron = g_popupKind == PopupKind::NativeVolume &&
-                             g_showMixerArrow.load();
-        const float top = g_showValue.load() ? 34.0f + edge : 9.0f + edge;
-        const float logicalH = MainLogicalHeight();
-        const float bottom = chevron ?
-            std::min(logicalH - 57.0f, logicalH - 42.0f - glyph -
-                           std::max(8.0f, thumb + 4.0f))
-            : (showIcon ? logicalH - 34.0f - edge : logicalH - 9.0f - edge);
-        if (bottom <= top) return false;
-        bar = {MainLogicalWidth() / 2.0f - thick / 2.0f,
-               top, thick, bottom - top};
-    } else if (g_popupKind == PopupKind::NativeVolume) {
-        const float width = MainLogicalWidth() -
-            (g_showMixerArrow.load() ? 191.0f : 169.0f);
-        // Horizontal volume preserves its original fixed 8px track.
-        bar = {76.0f, MainCenterY() - 4.0f, width, 8.0f};
-    } else {
-        const float left = g_showSun.load() ? 80.0f : 38.0f;
-        const float right = MainLogicalWidth() -
-            (g_showValue.load() ? 79.0f : 30.0f);
-        bar = {left, MainCenterY() - thick / 2.0f,
-               right - left, thick};
-    }
-    return bar.w > 0.0f && bar.h > 0.0f;
-}
-
-// Keep the existing small, invisible input surface: unrelated parts of the
-// layered OSD remain fully mouse-transparent.
-bool MainBarWheelGeometry(MainBarRect& bar) {
-    MainBarRect track{};
-    if (!MainBarTrackGeometry(track)) return false;
-    if (g_verticalVolumeBrightness.load()) {
-        const float haloWidth = std::max(24.0f, track.w + 14.0f);
-        bar = {track.x + track.w / 2.0f - haloWidth / 2.0f,
-               track.y - 9.0f, haloWidth, track.h + 18.0f};
-    } else {
-        bar = {track.x - 7.0f, track.y + track.h / 2.0f - 12.0f,
-               track.w + 14.0f, 24.0f};
-    }
-    return true;
-}
-void UpdateBarWheelWindow() {
-    if (!g_barWheelWnd || !g_popupWnd || !IsWindowVisible(g_popupWnd)) {
-        if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
-        return;
-    }
-    MainBarRect b{};
-    if (!MainBarWheelGeometry(b) || g_scale <= 0.0f) {
-        ShowWindow(g_barWheelWnd, SW_HIDE);
-        return;
-    }
-    RECT main{};
-    if (!GetWindowRect(g_popupWnd, &main)) return;
-    const int x = main.left + static_cast<int>(std::lround(b.x * g_scale));
-    const int y = main.top + static_cast<int>(std::lround(b.y * g_scale));
-    const int width = std::max(8, static_cast<int>(std::lround(b.w * g_scale)));
-    const int height = std::max(8, static_cast<int>(std::lround(b.h * g_scale)));
-    SetWindowPos(g_barWheelWnd, HWND_TOPMOST, x, y, width, height,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-}
-
-void ShowPopupAnimated() {
-    // Never leave a previous XAML volume popup over a GDI+ event.
-    xaml_osd::Hide();
-    if (!g_popupWnd) return;
-    const bool wasVisible = IsWindowVisible(g_popupWnd) != FALSE;
-    const bool reversingFade = g_fadeActive && g_fadeOut;
-    if (!wasVisible) g_fadeAlpha = g_fadeEnabled.load() ? 0 : 255;
-    if (!g_fadeEnabled.load()) g_fadeAlpha = 255;
-    ShowWindow(g_popupWnd, SW_SHOWNOACTIVATE);
-    if (!wasVisible || reversingFade) BeginFade(false);
-    // Repeated volume-key events must not perpetually restart fade-in.
-    RenderPopup();
-    UpdateBarWheelWindow();
-    UpdateSpeakerHitWindow();
-}
-
-void SetNoticeHitTesting(bool enabled) {
-    if (!g_popupWnd) return;
-    LONG_PTR flags = GetWindowLongPtrW(g_popupWnd, GWL_EXSTYLE);
-    const LONG_PTR wanted = enabled ? (flags & ~WS_EX_TRANSPARENT)
-                                       : (flags | WS_EX_TRANSPARENT);
-    if (flags != wanted) {
-        SetWindowLongPtrW(g_popupWnd, GWL_EXSTYLE, wanted);
-        SetWindowPos(g_popupWnd, nullptr, 0, 0, 0, 0,
-            SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    }
-}
-
-// Input is a single event group, not a new connection check or repeated poll.
 void AddNoticeEvent(NoticeCategory category, NoticeAction action,
                     std::wstring identity, std::wstring label) {
     if (!g_receiveWnd || g_closing.load()) return;
@@ -6760,212 +5940,6 @@ void Drain() {
 // ============================================================
 // No DDC or monitor I/O, timers or extra worker threads in this renderer.
 // Draw to premultiplied BGRA pixels before publishing a layered surface.
-struct PopupFrame {
-    HWND window = nullptr;
-    int width = 0, height = 0;
-    float scale = 1.0f;
-    BrightnessEvent brightness{};
-};
-// One GDI+ painter is shared by the master popup and all DDC-target peers.
-// A peer never mutates the global HWND, brightness snapshot or DPI state.
-bool RenderPopupFrame(const PopupFrame& frame, bool publishMirrors) {
-    if (!frame.window || !g_gdiplusToken || frame.width <= 0 ||
-        frame.height <= 0 || frame.width > 4096 || frame.height > 4096 ||
-        static_cast<uint64_t>(frame.width) * frame.height > 8388608ULL)
-        return false;
-    HDC screen = GetDC(nullptr);
-    if (!screen) return false;
-    HDC memory = CreateCompatibleDC(screen);
-    if (!memory) { ReleaseDC(nullptr, screen); return false; }
-    bool published = false;
-
-    void* pixels = nullptr;
-    HBITMAP bitmap = CreateArgbDib(screen, frame.width, frame.height, &pixels);
-    if (bitmap && pixels) {
-        HGDIOBJ previous = SelectObject(memory, bitmap);
-        {
-            Gdiplus::Bitmap surface(frame.width, frame.height, frame.width * 4,
-                                    PixelFormat32bppPARGB,
-                                    static_cast<BYTE*>(pixels));
-            Gdiplus::Graphics gfx(&surface);
-            gfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-            gfx.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-            gfx.Clear(Gdiplus::Color(0, 0, 0, 0));
-            gfx.ScaleTransform(frame.scale, frame.scale);
-            if (g_popupKind == PopupKind::LockStatus) {
-                DrawLockStatus(gfx);
-            } else if (g_popupKind == PopupKind::Notification) {
-                DrawNotification(gfx);
-            } else if (g_popupKind == PopupKind::NativeEvent) {
-                DrawNativeEvent(gfx);
-            } else if (g_verticalVolumeBrightness.load(std::memory_order_relaxed)) {
-                DrawVerticalPopup(gfx, frame.brightness);
-            } else if (g_popupKind == PopupKind::NativeVolume) {
-                DrawHorizontalVolume(gfx);
-            } else {
-
-            const bool light = IsLightTheme();
-            const DWORD backgroundRgb =
-                OsdBackgroundRgb(light);
-            const DWORD textRgb =
-                OsdTextRgb(light);
-            const DWORD trackRgb =
-                OsdTrackRgb(light);
-            const DWORD accentRgb =
-                OsdAccentRgb();
-            const BYTE backgroundAlpha = OsdBackgroundAlpha();
-            const Gdiplus::Color card =
-                ToGdiColor(backgroundRgb, backgroundAlpha);
-            const Gdiplus::Color foreground = ToGdiColor(textRgb);
-            const Gdiplus::Color accent = ToGdiColor(accentRgb);
-            const Gdiplus::Color trackColor = ToGdiColor(trackRgb);
-            const float corner = static_cast<float>(g_cornerRadius.load());
-            const float logicalW = MainLogicalWidth();
-            const float logicalH = MainLogicalHeight();
-            const float centerY = MainCenterY();
-
-            // Notification Center Styler's Borderless theme suppresses
-            // XAML border thickness and shadows. Our popup is independent
-            // GDI+, so replicate just these two appearance choices without
-            // interfering with that mod or its settings.
-            const bool borderless =
-                g_ddcBorderless.load(std::memory_order_relaxed);
-            if (!borderless) {
-                // Legacy Fluent-style soft shadow.
-                for (int layer = 5; layer >= 1; --layer) {
-                    Gdiplus::GraphicsPath shadow;
-                    const float grow = static_cast<float>(layer);
-                    AddRoundedRect(shadow, 13.0f - grow * 0.4f,
-                                   10.0f + grow * 0.5f,
-                                   (logicalW - 26.0f) + grow * 0.8f,
-                                   (logicalH - 23.0f) + grow * 0.8f,
-                                   corner + grow * 0.25f);
-                    Gdiplus::SolidBrush brush(Gdiplus::Color(
-                        static_cast<BYTE>(light ? 6 : 12), 0, 0, 0));
-                    gfx.FillPath(&brush, &shadow);
-                }
-            }
-            Gdiplus::GraphicsPath body;
-            AddRoundedRect(body, 13.0f, 10.0f, logicalW - 26.0f, logicalH - 23.0f, corner);
-            Gdiplus::SolidBrush background(card);
-            gfx.FillPath(&background, &body);
-            if (!borderless) {
-                Gdiplus::Pen outline(light
-                    ? Gdiplus::Color(255, 213, 215, 220)
-                    : Gdiplus::Color(255, 81, 82, 87), 0.8f);
-                gfx.DrawPath(&outline, &body);
-            }
-
-            // Fluent-like sun icon; geometry is independent of installed
-            // symbol fonts, so it stays consistent across Windows builds.
-            if (g_showSun.load(std::memory_order_relaxed)) {
-            Gdiplus::Pen sunPen(foreground, 1.85f);
-            sunPen.SetStartCap(Gdiplus::LineCapRound);
-            sunPen.SetEndCap(Gdiplus::LineCapRound);
-            gfx.DrawEllipse(&sunPen, 44.5f, centerY - 6.0f, 12.0f, 12.0f);
-            for (int i = 0; i < 8; ++i) {
-                const float a = kTau * i / 8.0f;
-                const float sx = std::cos(a), sy = std::sin(a);
-                gfx.DrawLine(&sunPen, 50.5f + sx * 9.6f,
-                             centerY + sy * 9.6f,
-                             50.5f + sx * 12.0f,
-                             centerY + sy * 12.0f);
-            }
-
-            }
-            bool known = false;
-            int percent = 0;
-            DWORD rawBrightness = frame.brightness.value;
-            if (g_popupKind == PopupKind::NativeBrightness) {
-                known = g_nativePercentKnown;
-                percent = std::clamp(g_nativePercent, 0, 100);
-                rawBrightness = static_cast<DWORD>(std::max(g_nativePercent, 0));
-            } else {
-                percent = BrightnessPercent(frame.brightness, &known);
-            }
-            const bool showValue = g_showValue.load();
-            const float barX = g_showSun.load() ? 80.0f : 38.0f;
-            const float barRight = logicalW - (showValue ? 79.0f : 30.0f);
-            const float barW = barRight - barX;
-            const float barH = kLegacyTrackThickness;
-            const float barMid = centerY;
-            const float barY = barMid - barH / 2.0f;
-            Gdiplus::GraphicsPath track;
-            AddRoundedRect(track, barX, barY, barW, barH, barH / 2.0f);
-            Gdiplus::SolidBrush trackBrush(trackColor);
-            gfx.FillPath(&trackBrush, &track);
-            if (known && percent > 0) {
-                const float filled = barW * percent / 100.0f;
-                // A real clipped rounded bar prevents rectangular ends.
-                Gdiplus::GraphicsPath fill;
-                AddRoundedRect(fill, barX, barY,
-                               std::max(barH, filled), barH, barH / 2.0f);
-                gfx.SetClip(Gdiplus::RectF(barX, barY, filled, barH));
-                Gdiplus::SolidBrush accentBrush(accent);
-                gfx.FillPath(&accentBrush, &fill);
-                gfx.ResetClip();
-            }
-            if (known)
-                DrawTrackThumb(gfx, barX + barW * percent / 100.0f,
-                               barMid, accent, light);
-
-            if (showValue) {
-            WCHAR number[48]{};
-            if (known) swprintf_s(number, L"%d%%", percent);
-            else swprintf_s(number, L"%lu", rawBrightness);
-            Gdiplus::Font font(L"Segoe UI Variable Text",
-                               static_cast<float>(g_fontSize.load()),
-                               Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-            if (font.GetLastStatus() != Gdiplus::Ok) {
-                Gdiplus::Font fallback(L"Segoe UI",
-                                       static_cast<float>(g_fontSize.load()),
-                                       Gdiplus::FontStyleBold,
-                                       Gdiplus::UnitPixel);
-                Gdiplus::SolidBrush textBrush(foreground);
-                Gdiplus::StringFormat format;
-                format.SetAlignment(Gdiplus::StringAlignmentFar);
-                format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-                gfx.DrawString(number, -1, &fallback,
-                               Gdiplus::RectF(logicalW - 72.0f, centerY - 17.5f, 42.0f, 36.0f),
-                               &format, &textBrush);
-            } else {
-                Gdiplus::SolidBrush textBrush(foreground);
-                Gdiplus::StringFormat format;
-                format.SetAlignment(Gdiplus::StringAlignmentFar);
-                format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-                gfx.DrawString(number, -1, &font,
-                               Gdiplus::RectF(logicalW - 72.0f, centerY - 17.5f, 42.0f, 36.0f),
-                               &format, &textBrush);
-            }
-            } // g_showValue
-            } // horizontal renderer
-        }
-        if (!PublishArgbLayer(frame.window, screen, memory,
-                              frame.width, frame.height)) {
-            Wh_Log(L"UpdateLayeredWindow failed: %lu", GetLastError());
-        } else {
-            published = true;
-        }
-        if (publishMirrors && published &&
-            g_displayOutputMode.load(std::memory_order_relaxed) == 3 &&
-            g_popupKind != PopupKind::DdcBrightness)
-            RenderMirroredFrame(screen, pixels, frame.width, frame.height, false);
-        SelectObject(memory, previous);
-        DeleteObject(bitmap);
-    }
-    DeleteDC(memory);
-    ReleaseDC(nullptr, screen);
-    return published;
-}
-void RenderPopup() {
-    PopupFrame master{g_popupWnd, g_width, g_height, g_scale, g_visible};
-    if (!RenderPopupFrame(master, true)) return;
-    if (g_popupKind == PopupKind::DdcBrightness) {
-        const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
-        if (mode == 0 || mode == 3) RenderDdcTargetPeers();
-    }
-}
-
 struct PopupPlacement {
     float scale = 1.0f;
     int width = 0, height = 0;
@@ -7043,55 +6017,11 @@ bool CalculatePopupPlacement(HMONITOR monitor, PopupPlacement& p) {
     }
     x += static_cast<int>(std::lround(g_offsetX.load() * dpiScale));
     y += static_cast<int>(std::lround(g_offsetY.load() * dpiScale));
-    // A visible SMTC/Mixer panel is a separate HWND. For the central anchors,
-    // center the union of both HWND bounds, not the main OSD alone. The same
-    // per-monitor calculation also positions DDC/all-screen mirror surfaces.
     const int position = g_position.load(std::memory_order_relaxed);
-    bool centerGroupX = false, centerGroupY = false;
-    int groupMinX = 0, groupMaxX = p.width;
-    int groupMinY = 0, groupMaxY = p.height;
-    if (IsExpandedVolumePanel()) {
-        const int panelWidth = vertical ? static_cast<int>(std::lround(
-            (g_panelMode == PanelMode::Media ? g_verticalSmtcWidth.load() :
-                                               g_verticalMixerWidth.load()) * p.scale))
-                                        : p.width;
-        const int panelHeight = vertical ? p.height : static_cast<int>(std::lround(
-            (g_panelMode == PanelMode::Media ? g_horizontalSmtcHeight.load() :
-                                               g_horizontalMixerHeight.load()) * p.scale));
-        const RECT unshifted{x, y, x + p.width, y + p.height};
-        const auto direction = DirectionForPopup(unshifted, work, position, vertical);
-        const auto attached = GetPanelAttachment(vertical, direction, p.scale,
-            p.width, p.height, panelWidth, panelHeight);
-        if (vertical && PositionCentersX(position)) {
-            centerGroupX = true;
-            groupMinX = std::min(0, attached.x);
-            groupMaxX = std::max(p.width, attached.x + panelWidth);
-            x += (p.width - groupMinX - groupMaxX) / 2;
-        } else if (!vertical && PositionCentersY(position)) {
-            centerGroupY = true;
-            groupMinY = std::min(0, attached.y);
-            groupMaxY = std::max(p.height, attached.y + panelHeight);
-            y += (p.height - groupMinY - groupMaxY) / 2;
-        }
-    }
-    // Clamp the entire centered pair where possible, not just its main HWND.
-    // Anchored axes still use rcWork for taskbar avoidance.
-    if (centerGroupX) {
-        const int minX = static_cast<int>(display.left) - groupMinX;
-        const int maxX = static_cast<int>(display.right) - groupMaxX;
-        x = std::clamp(x, minX, std::max(minX, maxX));
-    }
-    else
-        x = ClampPopupAxis(x, p.width,
-            PositionCentersX(position) ? display : work, true);
-    if (centerGroupY) {
-        const int minY = static_cast<int>(display.top) - groupMinY;
-        const int maxY = static_cast<int>(display.bottom) - groupMaxY;
-        y = std::clamp(y, minY, std::max(minY, maxY));
-    }
-    else
-        y = ClampPopupAxis(y, p.height,
-            PositionCentersY(position) ? display : work, false);
+    x = ClampPopupAxis(x, p.width,
+        PositionCentersX(position) ? display : work, true);
+    y = ClampPopupAxis(y, p.height,
+        PositionCentersY(position) ? display : work, false);
     p.work = work;
     p.monitorBounds = display;
     p.bounds = RECT{x, y, x + p.width, y + p.height};
@@ -7104,93 +6034,6 @@ BOOL CALLBACK FindMirrorCallback(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
         scan->peers.push_back(monitor);
     return TRUE;
 }
-void HideMirroredWindows(bool onlyPanel) {
-    for (auto& display : g_mirrorOutputs) {
-        if (display.panel) ShowWindow(display.panel, SW_HIDE);
-        if (!onlyPanel && display.popup) ShowWindow(display.popup, SW_HIDE);
-    }
-}
-void DestroyMirroredWindows() {
-    for (auto& display : g_mirrorOutputs) {
-        if (display.panel) DestroyWindow(display.panel);
-        if (display.popup) DestroyWindow(display.popup);
-    }
-    g_mirrorOutputs.clear();
-}
-HWND CreateMirrorSurface() {
-    return CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-        WS_EX_LAYERED | WS_EX_TRANSPARENT,
-        kWindowClass, L"", WS_POPUP, 0, 0, 1, 1,
-        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-}
-void RefreshMirrorOutputs(HMONITOR master) {
-    // Every migrated popup owns its XAML Island; do not allocate unused
-    // GDI+ replica HWNDs only to hide them immediately afterward.
-    // XAML all-monitor mode now creates native read-only peer Islands.
-    const bool xamlPopup = g_popupKind == PopupKind::DdcBrightness ||
-        g_popupKind == PopupKind::NativeBrightness ||
-        g_popupKind == PopupKind::NativeVolume ||
-        g_popupKind == PopupKind::LockStatus ||
-        g_popupKind == PopupKind::NativeEvent ||
-        g_popupKind == PopupKind::Notification;
-    if (xamlPopup) {
-        DestroyMirroredWindows();
-        return;
-    }
-    const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
-    const bool targetDisplayMode = mode == 0 &&
-        g_popupKind == PopupKind::DdcBrightness && !g_ddcTargets.empty();
-    if (mode != 3 && !targetDisplayMode) {
-        DestroyMirroredWindows();
-        return;
-    }
-    MirrorScan scan{master, {}};
-    EnumDisplayMonitors(nullptr, nullptr, FindMirrorCallback,
-                        reinterpret_cast<LPARAM>(&scan));
-    while (g_mirrorOutputs.size() < scan.peers.size()) {
-        MirrorOutput display{};
-        display.popup = CreateMirrorSurface();
-        display.panel = CreateMirrorSurface();
-        if (!display.popup || !display.panel) {
-            if (display.popup) DestroyWindow(display.popup);
-            if (display.panel) DestroyWindow(display.panel);
-            Wh_Log(L"OSD mirror creation failed: %lu", GetLastError());
-            break;
-        }
-        g_mirrorOutputs.push_back(display);
-    }
-    for (size_t i = 0; i < g_mirrorOutputs.size(); ++i) {
-        MirrorOutput& display = g_mirrorOutputs[i];
-        if (i >= scan.peers.size()) {
-            if (display.popup) ShowWindow(display.popup, SW_HIDE);
-            if (display.panel) ShowWindow(display.panel, SW_HIDE);
-            display.monitor = nullptr;
-            continue;
-        }
-        PopupPlacement place{};
-        if (!CalculatePopupPlacement(scan.peers[i], place)) {
-            display.monitor = nullptr;
-            if (display.popup) ShowWindow(display.popup, SW_HIDE);
-            if (display.panel) ShowWindow(display.panel, SW_HIDE);
-            continue;
-        }
-        // A visible replica may still contain the *previous* monitor's
-        // bitmap. Hide it before moving to another physical display.
-        if (display.monitor != scan.peers[i] &&
-            IsWindowVisible(display.popup))
-            ShowWindow(display.popup, SW_HIDE);
-        display.monitor = scan.peers[i];
-        display.work = place.work;
-        display.monitorBounds = place.monitorBounds;
-        display.popupBounds = place.bounds;
-        display.scale = place.scale;
-        SetWindowPos(display.popup, HWND_TOPMOST,
-            place.bounds.left, place.bounds.top,
-            place.width, place.height, SWP_NOACTIVATE);
-    }
-}
-
 void MovePopupToDisplay(const BrightnessEvent& ev) {
     WCHAR device[CCHDEVICENAME]{};
     const int outputMode = g_displayOutputMode.load(std::memory_order_relaxed);
@@ -7220,151 +6063,6 @@ void MovePopupToDisplay(const BrightnessEvent& ev) {
 // Reapply anchor placement only when opening/closing a panel changes the
 // expected composite bounds. This also keeps the bar/chevron/speaker input
 // windows aligned with the relocated main popup.
-void RefreshCompositePlacementIfChanged() {
-    if (!g_popupWnd || !IsWindowVisible(g_popupWnd) || g_closing.load())
-        return;
-    RECT current{};
-    if (!GetWindowRect(g_popupWnd, &current)) return;
-    PopupPlacement expected{};
-    if (!CalculatePopupPlacement(
-            MonitorFromWindow(g_popupWnd, MONITOR_DEFAULTTONEAREST), expected))
-        return;
-    if (EqualRect(&current, &expected.bounds)) return;
-    BrightnessEvent none{};
-    MovePopupToDisplay(none);
-    RenderPopup();
-    UpdateBarWheelWindow();
-    UpdateArrowHitWindow();
-    UpdateSpeakerHitWindow();
-}
-
-// Paint each target's actual DDC value on its own screen. This method uses
-// the existing renderer but temporarily swaps ONLY paint state on the same
-// Explorer UI thread; it never repositions the master or changes controls.
-// The guard prevents nested rendering from recursively rendering more peers.
-void RenderDdcTargetPeers() {
-    if (g_mirrorOutputs.empty()) return;
-    const ULONGLONG now = GetTickCount64();
-    for (auto& output : g_mirrorOutputs) {
-        if (!output.monitor || !output.popup) continue;
-        MONITORINFOEXW info{sizeof(info)};
-        if (!GetMonitorInfoW(output.monitor, &info)) {
-            ShowWindow(output.popup, SW_HIDE);
-            continue;
-        }
-        const auto item = std::find_if(g_ddcTargets.begin(),
-            g_ddcTargets.end(), [&](const DdcTargetState& target) {
-                return target.expiresAt > now &&
-                       _wcsicmp(target.event.device, info.szDevice) == 0;
-            });
-        if (item == g_ddcTargets.end()) {
-            // Never mirror another display's DDC percentage to this one.
-            ShowWindow(output.popup, SW_HIDE);
-            continue;
-        }
-        const int width = output.popupBounds.right -
-                          output.popupBounds.left;
-        const int height = output.popupBounds.bottom -
-                           output.popupBounds.top;
-        if (width <= 0 || height <= 0 || width > 4096 ||
-            height > 4096 || output.scale <= 0.0f) {
-            ShowWindow(output.popup, SW_HIDE);
-            continue;
-        }
-        PopupFrame frame{output.popup, width, height, output.scale,
-                         item->event};
-        if (RenderPopupFrame(frame, false))
-            ShowWindow(output.popup, SW_SHOWNOACTIVATE);
-        else
-            ShowWindow(output.popup, SW_HIDE);
-    }
-}
-
-// All replica HWNDs are view-only. The master premultiplied-alpha DIB is
-// scaled to each monitor's independent effective DPI on the same UI thread.
-// No new media/DDC worker, hooks, animation timers or network requests.
-void RenderMirroredFrame(HDC screen, void* pixels, int sourceWidth,
-                         int sourceHeight, bool panel) {
-    if (!screen || !pixels || sourceWidth <= 0 || sourceHeight <= 0 ||
-        g_scale <= 0.0f) return;
-    Gdiplus::Bitmap source(sourceWidth, sourceHeight, sourceWidth * 4,
-                          PixelFormat32bppPARGB, static_cast<BYTE*>(pixels));
-    if (source.GetLastStatus() != Gdiplus::Ok) return;
-    RECT mainPopup{}, mainPanel{};
-    if (!GetWindowRect(g_popupWnd, &mainPopup)) return;
-    if (panel && (!g_panelWnd || g_panelMode == PanelMode::None ||
-                  !GetWindowRect(g_panelWnd, &mainPanel))) return;
-    for (auto& output : g_mirrorOutputs) {
-        if (!output.monitor) continue;
-        HWND mirror = panel ? output.panel : output.popup;
-        if (!mirror) continue;
-        const float ratio = output.scale / g_scale;
-        if (ratio <= 0.0f || ratio > 4.0f) continue;
-        const int width = std::max(1, static_cast<int>(
-            std::lround(sourceWidth * ratio)));
-        const int height = std::max(1, static_cast<int>(
-            std::lround(sourceHeight * ratio)));
-        // Bound per-frame allocations inside explorer.exe.
-        if (width > 4096 || height > 4096 ||
-            static_cast<uint64_t>(width) * height > 8388608ULL) continue;
-        if (panel) {
-            int x = output.popupBounds.left + static_cast<int>(std::lround(
-                (mainPanel.left - mainPopup.left) * ratio));
-            int y = output.popupBounds.top + static_cast<int>(std::lround(
-                (mainPanel.top - mainPopup.top) * ratio));
-            const int position = g_position.load(std::memory_order_relaxed);
-            const bool vertical = g_verticalVolumeBrightness.load();
-            if (IsExpandedVolumePanel()) {
-                // A peer display can have a taskbar on the opposite edge.
-                // Resolve its own flyout side instead of copying the master
-                // panel offset, which would break composite centering there.
-                const auto direction = DirectionForPopup(
-                    output.popupBounds, output.work, position, vertical);
-                const auto attached = GetPanelAttachment(vertical, direction,
-                    output.scale,
-                    output.popupBounds.right - output.popupBounds.left,
-                    output.popupBounds.bottom - output.popupBounds.top,
-                    width, height);
-                x = output.popupBounds.left + attached.x;
-                y = output.popupBounds.top + attached.y;
-            }
-            // Preserve centered-axis alignment of the mirrored popup/panel.
-            x = ClampPopupAxis(x, width,
-                vertical || !PositionCentersX(position)
-                    ? output.work : output.monitorBounds, true);
-            y = ClampPopupAxis(y, height,
-                !vertical || !PositionCentersY(position)
-                    ? output.work : output.monitorBounds, false);
-            SetWindowPos(mirror, HWND_TOPMOST, x, y, width, height,
-                         SWP_NOACTIVATE);
-        }
-        HDC targetDC = CreateCompatibleDC(screen);
-        if (!targetDC) continue;
-        void* targetPixels = nullptr;
-        HBITMAP bitmap = CreateArgbDib(screen, width, height, &targetPixels);
-        if (bitmap && targetPixels) {
-            HGDIOBJ previous = SelectObject(targetDC, bitmap);
-            {
-                Gdiplus::Bitmap dst(width, height, width * 4,
-                    PixelFormat32bppPARGB, static_cast<BYTE*>(targetPixels));
-                Gdiplus::Graphics graphics(&dst);
-                graphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
-                graphics.SetInterpolationMode(
-                    Gdiplus::InterpolationModeHighQualityBicubic);
-                graphics.DrawImage(&source, Gdiplus::Rect(0, 0, width, height));
-            }
-            if (PublishArgbLayer(mirror, screen, targetDC,
-                                 width, height))
-                ShowWindow(mirror, SW_SHOWNOACTIVATE);
-            SelectObject(targetDC, previous);
-            DeleteObject(bitmap);
-        } else if (bitmap) {
-            DeleteObject(bitmap);
-        }
-        DeleteDC(targetDC);
-    }
-}
-
 // Shared properties of all migrated XAML level indicators; the source
 // value, event identity and monitor placement remain category-specific.
 xaml_osd::Snapshot MakeXamlSnapshot(
@@ -7534,34 +6232,13 @@ xaml_osd::Snapshot MakeXamlStatusSnapshot(
         category, OsdDuration(duration), fluentIcon);
 }
 
-void HideGdiLevelForXaml() {
-    if (g_popupKind != PopupKind::NativeVolume && g_xamlMixerOpen)
+// Category changes are controller state, never rendering side effects.
+void PrepareXamlCategory() {
+    if (g_popupKind != PopupKind::NativeVolume) {
         ResetXamlMixerController();
-    if (g_popupKind != PopupKind::NativeVolume && g_xamlMediaOpen)
         ResetXamlMediaController();
-    if (g_popupWnd) {
-        KillTimer(g_popupWnd, kHideTimer);
-        KillTimer(g_popupWnd, kFadeTimer);
-        KillTimer(g_popupWnd, kMediaAnimationTimer);
-        g_fadeActive = false;
-        ShowWindow(g_popupWnd, SW_HIDE);
     }
-    HideMirroredWindows(false);
-    if ((g_xamlMixerOpen || g_xamlMediaOpen) &&
-        g_popupKind == PopupKind::NativeVolume) {
-        // A rendering-backend hide must not perform a Mixer close:
-        // ClosePanel also destroys the endpoint/session snapshot.
-        if (g_panelWnd) ShowWindow(g_panelWnd, SW_HIDE);
-    } else {
-        ClosePanel();
-    }
-    if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
-    UpdateArrowHitWindow();
-    UpdateSpeakerHitWindow();
 }
-
-// All valid DDC targets can render simultaneously on their actual displays.
-// Fixed-output modes preserve the previous single-output behavior instead.
 bool ShowXamlDdcTargets(const BrightnessEvent& master) {
     const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
     std::vector<xaml_osd::Snapshot> batch;
@@ -7638,8 +6315,8 @@ void DisplayDdcBatch() {
     // This prevents the master window bouncing when write order varies.
     bool pinnedMaster = false;
     if ((mode == 0 || mode == 3) &&
-        g_popupKind == PopupKind::DdcBrightness && g_popupWnd &&
-        IsWindowVisible(g_popupWnd) && g_visible.device[0]) {
+        g_popupKind == PopupKind::DdcBrightness &&
+        xaml_osd::IsPrimaryVisible() && g_visible.device[0]) {
         auto current = std::find_if(events.begin(), events.end(),
             [&](const BrightnessEvent& event) {
                 return event.physicalIndex == g_visible.physicalIndex &&
@@ -7717,7 +6394,7 @@ void DisplayDdcBatch() {
     g_lastConfirmedDdcBrightness = master.value;
     g_popupKind = PopupKind::DdcBrightness;
     MovePopupToDisplay(master);
-    HideGdiLevelForXaml();
+    PrepareXamlCategory();
     (void)ShowXamlDdcTargets(master);
 }
 
@@ -7906,110 +6583,6 @@ DWORD WINAPI BrightnessWheelThreadProc(void*) {
     }
     if (comReady) CoUninitialize();
     return 0;
-}
-
-void AdjustBrightnessWheel(int steps) {
-    if (!steps || !g_wheelWriteWake) return;
-    BrightnessWheelTask task{};
-    task.generation = ++g_wheelWriteGeneration;
-    if (g_popupKind == PopupKind::NativeBrightness) {
-        if (!g_nativePercentKnown) return;
-        if (g_lastConfirmedNativeBrightness < 0)
-            g_lastConfirmedNativeBrightness = g_nativePercent;
-        task.native = true;
-        task.value = std::clamp(g_nativePercent +
-            steps * kWheelStepPercent, 0, 100);
-        g_nativePercent = task.value; // Temporary preview; reverted on failure.
-        ResetHideTimerFor(DurationKind::NativeBrightness);
-    } else if (g_popupKind == PopupKind::DdcBrightness) {
-        if (g_visible.maximum <= g_visible.minimum) return;
-        task.monitor = g_visible;
-        const DWORD range = g_visible.maximum - g_visible.minimum;
-        const DWORD singleStep = std::max<DWORD>(1,
-            static_cast<DWORD>(std::lround(range *
-            (kWheelStepPercent / 100.0))));
-        const INT64 next = static_cast<INT64>(g_visible.value) +
-            static_cast<INT64>(steps) * singleStep;
-        if (!g_lastConfirmedDdcBrightness)
-            g_lastConfirmedDdcBrightness = g_visible.value;
-        task.value = static_cast<int>(std::clamp<INT64>(next,
-            g_visible.minimum, g_visible.maximum));
-        g_visible.value = static_cast<DWORD>(task.value);
-        ResetHideTimerFor(DurationKind::DdcBrightness);
-    } else return;
-    QueueBrightnessWheelTask(task);
-    RenderPopup();
-}
-
-// Absolute brightness from the main track. The UI thread only updates an
-// optimistic preview; the worker performs WMI/DDC writes and posts results.
-void SetBrightnessBarPercent(int percent) {
-    if (!g_wheelWriteWake) return;
-    percent = std::clamp(percent, 0, 100);
-    BrightnessWheelTask task{};
-    if (g_popupKind == PopupKind::NativeBrightness) {
-        if (!g_nativePercentKnown || percent == g_nativePercent) return;
-        if (g_lastConfirmedNativeBrightness < 0)
-            g_lastConfirmedNativeBrightness = g_nativePercent;
-        task.native = true;
-        task.value = percent;
-        g_nativePercent = percent;
-    } else if (g_popupKind == PopupKind::DdcBrightness) {
-        if (g_visible.maximum <= g_visible.minimum) return;
-        const DWORD range = g_visible.maximum - g_visible.minimum;
-        const DWORD next = osd_input::PercentToRaw(
-            g_visible.minimum, g_visible.maximum, percent);
-        if (next == g_visible.value) return;
-        if (!g_lastConfirmedDdcBrightness)
-            g_lastConfirmedDdcBrightness = g_visible.value;
-        task.monitor = g_visible;
-        task.value = static_cast<int>(next);
-        g_visible.value = next;
-    } else return;
-    task.generation = ++g_wheelWriteGeneration;
-    QueueBrightnessWheelTask(task);
-    RenderPopup();
-}
-
-// Convert hit-window client coordinates to the actual painted bar in main
-// popup logical coordinates, not to the expanded 24px mouse-hit halo.
-void SetMainBarFromPointer(HWND hwnd, LPARAM lp) {
-    if (!g_popupWnd || !g_barWheelWnd || hwnd != g_barWheelWnd ||
-        !IsWindowVisible(g_popupWnd) || g_scale <= 0.0f) return;
-    MainBarRect track{};
-    if (!MainBarTrackGeometry(track)) return;
-    POINT screenPoint{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-    if (!ClientToScreen(hwnd, &screenPoint)) return;
-    RECT popup{};
-    if (!GetWindowRect(g_popupWnd, &popup)) return;
-    const float x = (screenPoint.x - popup.left) / g_scale;
-    const float y = (screenPoint.y - popup.top) / g_scale;
-    const bool vertical = g_verticalVolumeBrightness.load();
-    const int percent = osd_input::TrackPercent(
-        vertical ? y : x,
-        vertical ? track.y : track.x,
-        vertical ? track.h : track.w,
-        vertical);
-    if (g_popupKind == PopupKind::NativeVolume)
-        SetDefaultAudioBarPercent(percent);
-    else
-        SetBrightnessBarPercent(percent);
-}
-
-void HandleMainBarWheel(int delta) {
-    if (!delta || g_scale <= 0.0f) return;
-    if (g_barWheelKind != static_cast<int>(g_popupKind)) {
-        g_barWheelKind = static_cast<int>(g_popupKind);
-        g_barWheelRemainder = 0;
-    }
-    const int steps = osd_input::ConsumeWheelSteps(
-        delta, g_barWheelRemainder);
-    if (!steps) return;
-    if (g_popupKind == PopupKind::NativeVolume)
-        AdjustDefaultAudioWheel(steps);
-    else if (g_popupKind == PopupKind::NativeBrightness ||
-             g_popupKind == PopupKind::DdcBrightness)
-        AdjustBrightnessWheel(steps);
 }
 
 // -- SMTC: C++/WinRT projections. Restricted to the private MTA worker.
@@ -8613,72 +7186,12 @@ void RefreshMixer() {
         g_mixerEntries.emplace_back(std::move(entry));
     }
     sessions->Release();
-    ClampMixerScroll();
-}
-
-Gdiplus::RectF MixerOutputHeader() {
-    const float w = g_panelWidth / std::max(0.01f, g_scale);
-    const float left = std::max(132.0f, w * 0.43f);
-    return Gdiplus::RectF(left, kOutputPickerTop,
-                          std::max(60.0f, w - left - 22.0f),
-                          kOutputPickerHeight);
-}
-
-int MixerOutputRows() {
-    const float h = g_panelHeight / std::max(0.01f, g_scale);
-    const int fit = std::max(0, static_cast<int>(
-        (h - kOutputPickerMenuTop - 12.0f) / kOutputPickerRowHeight));
-    return std::min({kOutputPickerMaxRows, fit,
-                     static_cast<int>(g_mixerOutputOptions.size())});
-}
-
-Gdiplus::RectF MixerOutputMenuRect() {
-    const auto header = MixerOutputHeader();
-    return Gdiplus::RectF(header.X, kOutputPickerMenuTop, header.Width,
-                          MixerOutputRows() * kOutputPickerRowHeight + 6.0f);
-}
-
-Gdiplus::RectF MixerOutputRowRect(int row) {
-    const auto menu = MixerOutputMenuRect();
-    return Gdiplus::RectF(menu.X + 3.0f,
-                          menu.Y + 3.0f + row * kOutputPickerRowHeight,
-                          menu.Width - 6.0f, kOutputPickerRowHeight);
-}
-
-bool MixerOutputHeaderHit(float x, float y) {
-    auto r = MixerOutputHeader();
-    return x >= r.X && x < r.X + r.Width &&
-           y >= r.Y && y < r.Y + r.Height;
-}
-
-int MixerOutputRowHit(float x, float y) {
-    if (!g_mixerOutputExpanded) return -1;
-    const int count = MixerOutputRows();
-    for (int row = 0; row < count; ++row) {
-        const auto bounds = MixerOutputRowRect(row);
-        if (x >= bounds.X && x < bounds.X + bounds.Width &&
-            y >= bounds.Y && y < bounds.Y + bounds.Height)
-            return row + g_mixerOutputScroll;
-    }
-    return -1;
-}
-
-bool UpdateMixerOutputHover(float x, float y) {
-    const bool header = MixerOutputHeaderHit(x, y);
-    const int row = MixerOutputRowHit(x, y);
-    const bool changed = header != g_mixerOutputHeaderHovered ||
-                         row != g_mixerOutputHoveredRow;
-    g_mixerOutputHeaderHovered = header;
-    g_mixerOutputHoveredRow = row;
-    return changed;
 }
 
 void SelectMixerOutput(int index) {
     if (index < 0 || index >= static_cast<int>(g_mixerOutputOptions.size()))
         return;
     const std::wstring target = g_mixerOutputOptions[index].id;
-    g_mixerOutputExpanded = false;
-    g_mixerOutputHoveredRow = -1;
     g_mixerOutputSwitchFailed = false;
     if (target != g_mixerOutputId) {
         const HRESULT hr = SetWindowsDefaultPlaybackEndpoint(target,
@@ -8692,10 +7205,6 @@ void SelectMixerOutput(int index) {
             // Endpoint notifications also catch asynchronous Windows changes.
             RefreshMixer();
         }
-    }
-    if (g_panelMode == PanelMode::Mixer) {
-        RenderPanel();
-        ResetHideTimerFor(DurationKind::Interactive);
     }
 }
 
@@ -8716,75 +7225,6 @@ bool SetMixerPercent(int index, int percent) {
         return false;
     entry.scalar = value;
     return true;
-}
-
-void SetMixerSlider(float x, float /* y */) {
-    // Lock the target audio session for the whole drag. Crossing rows can
-    // never accidentally modify a different app's volume.
-    int index = g_mixerDragIndex;
-    if (index < 0 || index > static_cast<int>(g_mixerEntries.size())) return;
-    const int percent = static_cast<int>(std::lround(100.0f *
-        std::clamp((x - kMixerTrackStart) / MixerTrackLength(),
-                   0.0f, 1.0f)));
-    (void)SetMixerPercent(index, percent);
-}
-
-// The per-session wheel targets the same full-width track used by dragging.
-// Wheel events elsewhere continue to scroll the mixer list.
-int MixerTrackHitTest(float x, float y) {
-    if (x < kMixerTrackStart - 8.0f ||
-        x > kMixerTrackStart + MixerTrackLength() + 8.0f) return -1;
-    const int total = static_cast<int>(g_mixerEntries.size()) + 1;
-    for (int row = 0; row < MixerVisibleRows(); ++row) {
-        const int index = row + g_mixerScroll;
-        if (index >= total) break;
-        const float centerY = kMixerFirstRowY + row * kMixerRowStep +
-                              1.0f + kMixerTrackHeight / 2.0f;
-        if (std::fabs(y - centerY) <= 11.0f) return index;
-    }
-    return -1;
-}
-
-bool AdjustMixerVolumeWheel(int index, int steps) {
-    if (!steps || index < 0 ||
-        index > static_cast<int>(g_mixerEntries.size())) return false;
-    const float change = steps * (kWheelStepPercent / 100.0f);
-    if (!index) {
-        if (!g_mixerMaster) return false;
-        float current = 0;
-        if (FAILED(g_mixerMaster->GetMasterVolumeLevelScalar(&current)))
-            return false;
-        const float wanted = std::clamp(current + change, 0.0f, 1.0f);
-        if (FAILED(g_mixerMaster->SetMasterVolumeLevelScalar(wanted, nullptr)))
-            return false;
-        g_mixerMaster->GetMasterVolumeLevelScalar(&g_mixerMasterLevel);
-    } else {
-        auto& entry = g_mixerEntries[index - 1];
-        if (!entry.volume) return false;
-        float current = 0;
-        if (FAILED(entry.volume->GetMasterVolume(&current))) return false;
-        const float wanted = std::clamp(current + change, 0.0f, 1.0f);
-        if (FAILED(entry.volume->SetMasterVolume(wanted, nullptr))) return false;
-        entry.volume->GetMasterVolume(&entry.scalar);
-    }
-    RenderPanel();
-    ResetHideTimerFor(DurationKind::Interactive);
-    return true;
-}
-
-// Icon click targets match the painted icons, not the track. Scroll offsets
-// are resolved on every event; the same target must be pressed and released.
-int MixerIconHitTest(float x, float y) {
-    const float iconX = !g_verticalVolumeBrightness.load() ? 28.0f : 25.0f;
-    if (x < iconX - 4.0f || x > iconX + 24.0f) return -1;
-    const int total = static_cast<int>(g_mixerEntries.size()) + 1;
-    for (int row = 0; row < MixerVisibleRows(); ++row) {
-        const int index = row + g_mixerScroll;
-        if (index >= total) break;
-        const float centerY = kMixerFirstRowY + row * kMixerRowStep + 1.5f;
-        if (std::fabs(y - centerY) <= 12.5f) return index;
-    }
-    return -1;
 }
 
 void ToggleMixerMute(int index) {
@@ -8811,1114 +7251,10 @@ void ToggleMixerMute(int index) {
             entry.muted = actual != FALSE;
         }
     }
-    if (g_panelMode == PanelMode::Mixer) {
-        RenderPanel();
-        ResetHideTimerFor(DurationKind::Interactive);
-    }
 }
 
 // ============================================================
 // Expanded media/mixer/details panel rendering
-// ============================================================
-void DrawText(Gdiplus::Graphics& gfx, const std::wstring& str,
-              float x, float y, float w, float h, float size,
-              Gdiplus::Color color, bool centered,
-              bool rightAligned) {
-    Gdiplus::Font font(L"Segoe UI Variable Text", size,
-        Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    Gdiplus::Font fallback(L"Segoe UI", size,
-        Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    Gdiplus::StringFormat format;
-    format.SetAlignment(rightAligned ? Gdiplus::StringAlignmentFar :
-                        centered ? Gdiplus::StringAlignmentCenter :
-                                   Gdiplus::StringAlignmentNear);
-    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-    format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-    Gdiplus::SolidBrush brush(color);
-    gfx.DrawString(str.c_str(), -1,
-        font.GetLastStatus() == Gdiplus::Ok ? &font : &fallback,
-        Gdiplus::RectF(x, y, w, h), &format, &brush);
-}
-
-// Shared SMTC-style button appearance for media controls and expanders.
-// Controls may differ in radius to fit their host without changing the palette.
-Gdiplus::Color ControlButtonFill(bool light, bool pressed = false,
-                                 bool active = false, bool hovered = false) {
-    if (pressed) return ToGdiColor(OsdAccentRgb(), 96);
-    if (active) return ToGdiColor(OsdAccentRgb(), 65);
-    if (hovered) return ToGdiColor(OsdAccentRgb(), 40);
-    return light ? Gdiplus::Color(255, 233, 234, 238)
-                 : Gdiplus::Color(255, 67, 68, 74);
-}
-
-// Draw every button from the same geometry, including pressed/feedback states.
-// In square mode the radius is specified in logical px and capped by size.
-void FillControlButtonShape(Gdiplus::Graphics& gfx, float x, float y,
-                            float radius, Gdiplus::Color color) {
-    Gdiplus::SolidBrush fill(color);
-    if (!g_controlButtonSquare.load()) {
-        gfx.FillEllipse(&fill, x - radius, y - radius,
-                        radius * 2.0f, radius * 2.0f);
-    } else {
-        Gdiplus::GraphicsPath path;
-        const float corner = std::min(radius,
-            static_cast<float>(g_controlButtonCornerRadius.load()));
-        AddRoundedRect(path, x - radius, y - radius,
-                       radius * 2.0f, radius * 2.0f, corner);
-        gfx.FillPath(&fill, &path);
-    }
-}
-
-void DrawControlButtonOutline(Gdiplus::Graphics& gfx, float x, float y,
-                              float radius, Gdiplus::Pen& pen) {
-    if (!g_controlButtonSquare.load()) {
-        gfx.DrawEllipse(&pen, x - radius, y - radius,
-                        radius * 2.0f, radius * 2.0f);
-    } else {
-        Gdiplus::GraphicsPath path;
-        const float corner = std::min(radius,
-            static_cast<float>(g_controlButtonCornerRadius.load()));
-        AddRoundedRect(path, x - radius, y - radius,
-                       radius * 2.0f, radius * 2.0f, corner);
-        gfx.DrawPath(&pen, &path);
-    }
-}
-
-void DrawControlButtonSurface(Gdiplus::Graphics& gfx, float x, float y,
-                              float radius, bool light, bool pressed = false,
-                              bool active = false, bool hovered = false) {
-    FillControlButtonShape(gfx, x, y, radius,
-                           ControlButtonFill(light, pressed, active, hovered));
-}
-
-void DrawControlChevron(Gdiplus::Graphics& gfx, float x, float y,
-                        Gdiplus::Color color, FlyoutDirection direction,
-                        float extent = 4.5f) {
-    Gdiplus::Pen pen(color, 1.8f);
-    pen.SetStartCap(Gdiplus::LineCapRound);
-    pen.SetEndCap(Gdiplus::LineCapRound);
-    pen.SetLineJoin(Gdiplus::LineJoinRound);
-    switch (direction) {
-        case FlyoutDirection::Up:
-            gfx.DrawLine(&pen, x - extent, y + extent / 2.0f,
-                         x, y - extent / 2.0f);
-            gfx.DrawLine(&pen, x, y - extent / 2.0f,
-                         x + extent, y + extent / 2.0f);
-            break;
-        case FlyoutDirection::Down:
-            gfx.DrawLine(&pen, x - extent, y - extent / 2.0f,
-                         x, y + extent / 2.0f);
-            gfx.DrawLine(&pen, x, y + extent / 2.0f,
-                         x + extent, y - extent / 2.0f);
-            break;
-        case FlyoutDirection::Left:
-            gfx.DrawLine(&pen, x + extent / 2.0f, y - extent,
-                         x - extent / 2.0f, y);
-            gfx.DrawLine(&pen, x - extent / 2.0f, y,
-                         x + extent / 2.0f, y + extent);
-            break;
-        case FlyoutDirection::Right:
-            gfx.DrawLine(&pen, x - extent / 2.0f, y - extent,
-                         x + extent / 2.0f, y);
-            gfx.DrawLine(&pen, x + extent / 2.0f, y,
-                         x - extent / 2.0f, y + extent);
-            break;
-    }
-}
-
-// Draw tiny Fluent-like transport controls at one fixed visual scale.
-// Glyphs use the exact same user scale as the button's hit box.
-// At the default 100%, circles are 32px logical and symbols ~13px.
-void DrawMediaControl(Gdiplus::Graphics& gfx, float cx, float cy,
-                      int action, bool playing, Gdiplus::Color color,
-                      float pressScale = 1.0f) {
-    const float scale = g_mediaControlSizePercent.load() / 100.0f * pressScale;
-    Gdiplus::SolidBrush brush(color);
-    Gdiplus::Pen pen(color, 1.8f * scale);
-    pen.SetStartCap(Gdiplus::LineCapRound);
-    pen.SetEndCap(Gdiplus::LineCapRound);
-    pen.SetLineJoin(Gdiplus::LineJoinRound);
-    if (action == 2 && playing) {
-        gfx.FillRectangle(&brush, cx - 5.3f * scale, cy - 6.1f * scale,
-                          3.1f * scale, 12.2f * scale);
-        gfx.FillRectangle(&brush, cx + 2.2f * scale, cy - 6.1f * scale,
-                          3.1f * scale, 12.2f * scale);
-    } else {
-        const float d = action == 1 ? -1.0f : 1.0f;
-        Gdiplus::PointF pts[] = {
-            {cx - d * 5.4f * scale, cy - 6.0f * scale},
-            {cx + d * 5.0f * scale, cy},
-            {cx - d * 5.4f * scale, cy + 6.0f * scale}
-        };
-        gfx.FillPolygon(&brush, pts, 3);
-        if (action != 2)
-            gfx.DrawLine(&pen, cx + d * 6.0f * scale,
-                          cy - 6.0f * scale,
-                          cx + d * 6.0f * scale,
-                          cy + 6.0f * scale);
-    }
-}
-
-Gdiplus::Color PanelBorderColor(bool light) {
-    return light ? Gdiplus::Color(170, 190, 190, 195)
-                 : Gdiplus::Color(170, 90, 90, 97);
-}
-
-void DrawPanelCard(Gdiplus::Graphics& gfx, float width, float height,
-                   bool alignToMainVolume = false) {
-    bool light = IsLightTheme();
-    DWORD bg = OsdBackgroundRgb(light);
-    BYTE alpha = OsdBackgroundAlpha();
-    const bool vertical = g_verticalVolumeBrightness.load();
-    const float topInset = vertical ? 6.0f : 10.0f;
-    const float bottomInset = vertical ? 6.0f : 13.0f;
-    // The horizontal main volume card uses 13px side insets at every width.
-    // Match painted edges, not merely the window bounds.
-    const float sideInset = alignToMainVolume && !vertical ? 13.0f : 4.0f;
-    Gdiplus::GraphicsPath path;
-    AddRoundedRect(path, sideInset, topInset, width - sideInset * 2.0f,
-                   height - topInset - bottomInset,
-                   static_cast<float>(g_cornerRadius.load()));
-    Gdiplus::SolidBrush brush(ToGdiColor(bg, alpha));
-    gfx.FillPath(&brush, &path);
-    if (!g_ddcBorderless.load()) {
-        Gdiplus::Pen border(PanelBorderColor(light), .8f);
-        gfx.DrawPath(&border, &path);
-    }
-}
-
-// Panels are drawn in their own focus-free layered window, independently of the
-// tiny vertically laid out main OSD. This keeps vertical bar dimensions stable.
-
-// SMTC painting, seeking and transport button hit-tests must use the exact
-// same geometry. All visible content is inside the card's common 14px inset.
-// The cover grows with panel height rather than stopping at a hard-coded
-// 132px cap. Where the panel is too narrow for a square cover at full height
-// AND a readable transport column, center the entire cover/control group
-// vertically instead of clipping or distorting the artwork.
-bool MediaExtraControlsVisible() {
-    return g_showMediaControls.load() &&
-        ((g_mediaCurrent.canShuffle && g_mediaCurrent.shuffleKnown) ||
-         (g_mediaCurrent.canRepeat && g_mediaCurrent.repeatMode >= 0));
-}
-struct MediaLayout {
-    float artX, artY, artSize;
-    float textX, textWidth, titleY, artistY;
-    float controlsY, controlsX[3], buttonRadius;
-    float timelineY, timeY, timelineWidth;
-    float contentScale;  // Same scale for typography and transport glyphs.
-};
-MediaLayout ComputeMediaLayout(float h, float w) {
-    constexpr float inset = 14.0f;
-    const bool vertical = g_verticalVolumeBrightness.load();
-    // DrawPanelCard(..., alignToMainVolume=true) uses precisely these insets.
-    const float cardLeft = vertical ? 4.0f : 13.0f;
-    const float cardTop = vertical ? 6.0f : 10.0f;
-    const float cardBottom = vertical ? 6.0f : 13.0f;
-    const float contentLeft = cardLeft + inset;
-    const float contentRight = w - cardLeft - inset;
-    const float contentTop = cardTop + inset;
-    const float contentBottom = h - cardBottom - inset;
-    const float contentHeight = std::max(1.0f, contentBottom - contentTop);
-    const float artGap = vertical ? 16.0f : 12.0f;
-    const float usableWidth = contentRight - contentLeft - artGap;
-    const float baseRadius = 16.0f *
-        (g_mediaControlSizePercent.load() / 100.0f);
-
-    // Reserve an additional half-size column immediately before Previous.
-    // The three main controls remain on one baseline without a bottom row.
-    const bool hasExtra = MediaExtraControlsVisible();
-    auto controlScale = [](float art) {
-        return std::clamp(art / 125.0f, 0.78f, 1.45f);
-    };
-    auto fits = [&](float art) {
-        const float radius = baseRadius * controlScale(art);
-        // Three main buttons need 4px between adjacent surfaces. Reserve
-        // another 3px from the text boundary and a 10px auxiliary gap.
-        const float required = hasExtra
-            ? 7.0f * radius + kMediaExtraGroupGap + 11.0f
-            : 6.0f * radius + 8.0f;
-        return art + std::max(86.0f, required) <= usableWidth;
-    };
-    float lo = 1.0f;
-    float hi = contentHeight;
-    for (int i = 0; i < 18; ++i) {
-        const float candidate = (lo + hi) * 0.5f;
-        if (fits(candidate)) lo = candidate;
-        else hi = candidate;
-    }
-    const float artSize = std::max(1.0f, std::min(contentHeight, lo));
-    const float artX = contentLeft;
-    // At normal aspect ratios, artSize==contentHeight, so the cover has
-    // exactly inset pixels above, below and to its left. At constrained
-    // ratios, center the cover and the entire right-side group together.
-    const float artY = contentTop + (contentHeight - artSize) / 2.0f;
-    const float textX = artX + artSize + artGap;
-    const float textWidth = std::max(1.0f, contentRight - textX);
-    const float scale = controlScale(artSize);
-    const float radius = std::min(baseRadius * scale,
-        std::max(1.0f, hasExtra
-            ? (textWidth - kMediaExtraGroupGap - 11.0f) / 7.0f
-            : (textWidth - 8.0f) / 6.0f));
-    const float extraColumnWidth = hasExtra
-        ? radius + kMediaExtraGroupGap + 3.0f : 0.0f;
-    const float leftButtonX = textX + extraColumnWidth + radius;
-    const float rightButtonX = contentRight - radius;
-    // All vertical geometry is tied to the same artwork box, not to an
-    // unrelated 176px reference panel height or a second center offset.
-    return {
-        artX, artY, artSize,
-        textX, textWidth,
-        artY + artSize * 0.024f,
-        artY + artSize * 0.240f,
-        artY + artSize - radius,
-        {leftButtonX, (leftButtonX + rightButtonX) / 2.0f,
-         rightButtonX}, radius,
-        artY + artSize * 0.448f,
-        artY + artSize * 0.512f,
-        textWidth, scale
-    };
-}
-
-// The GDI+ stream backing an image must outlive the decoded bitmap.
-// Refresh this cache only after SMTC publishes a new artwork payload.
-void UpdateMediaArtworkCache() {
-    if (g_cachedArtworkBytes == g_mediaCurrent.artwork) return;
-    g_cachedArtwork.reset();
-    g_cachedArtworkStream.Reset();
-    g_cachedArtworkBytes = g_mediaCurrent.artwork;
-    if (g_cachedArtworkBytes.empty()) return;
-    HGLOBAL allocation = GlobalAlloc(GMEM_MOVEABLE, g_cachedArtworkBytes.size());
-    if (!allocation) return;
-    void* memory = GlobalLock(allocation);
-    if (!memory) { GlobalFree(allocation); return; }
-    memcpy(memory, g_cachedArtworkBytes.data(), g_cachedArtworkBytes.size());
-    GlobalUnlock(allocation);
-    IStream* stream = nullptr;
-    if (FAILED(CreateStreamOnHGlobal(allocation, TRUE, &stream))) {
-        GlobalFree(allocation);
-        return;
-    }
-    // The stream now owns the HGLOBAL; keep the stream until bitmap deletion.
-    g_cachedArtworkStream.Attach(stream);
-    g_cachedArtwork.reset(new Gdiplus::Bitmap(stream));
-    // Encoded bytes are limited in ReadArtwork, but a small compressed
-    // image can still describe a huge decoded bitmap.
-    const UINT artworkWidth = g_cachedArtwork->GetWidth();
-    const UINT artworkHeight = g_cachedArtwork->GetHeight();
-    if (g_cachedArtwork->GetLastStatus() != Gdiplus::Ok ||
-        !artworkWidth || !artworkHeight ||
-        artworkWidth > 4096 || artworkHeight > 4096 ||
-        static_cast<uint64_t>(artworkWidth) * artworkHeight > 8388608ULL) {
-        g_cachedArtwork.reset();
-        g_cachedArtworkStream.Reset();
-    }
-}
-
-void ClearMediaArtworkCache() {
-    g_cachedArtwork.reset();
-    g_cachedArtworkStream.Reset();
-    g_cachedArtworkBytes.clear();
-}
-
-// Extrapolation occurs only between SMTC snapshots while the player reports
-// Playing. Use a monotonic clock so UI animation is independent of clock
-// corrections. Never extrapolate beyond the SMTC-reported track bounds.
-INT64 MediaDisplayedPosition100ns(const MediaSnapshot& m,
-                                  ULONGLONG nowTick) {
-    if (!m.hasTimeline || m.timelineEnd <= m.timelineStart) return 0;
-    if (g_mediaSeeking || (g_mediaSeekHoldUntil &&
-        nowTick < g_mediaSeekHoldUntil))
-        return std::clamp(g_mediaPreviewPosition,
-                          m.timelineStart, m.timelineEnd);
-    INT64 pos = m.timelinePosition;
-    if (m.playing && nowTick >= m.timelineObservedTick) {
-        const ULONGLONG elapsed = std::min<ULONGLONG>(
-            nowTick - m.timelineObservedTick,
-            static_cast<ULONGLONG>((m.timelineEnd - pos) / 10000));
-        pos += static_cast<INT64>(elapsed * 10000);
-    }
-    return std::clamp(pos, m.timelineStart, m.timelineEnd);
-}
-
-std::wstring FormatMediaTime(INT64 span100ns) {
-    const UINT64 seconds = static_cast<UINT64>(std::max<INT64>(0, span100ns)) /
-        10000000ULL;
-    const std::wstring sec = (seconds % 60 < 10 ? L"0" : L"") +
-        std::to_wstring(seconds % 60);
-    if (seconds >= 3600) {
-        const UINT64 minute = (seconds / 60) % 60;
-        return std::to_wstring(seconds / 3600) + L":" +
-            (minute < 10 ? L"0" : L"") + std::to_wstring(minute) +
-            L":" + sec;
-    }
-    return std::to_wstring(seconds / 60) + L":" + sec;
-}
-
-// Two half-size buttons in a vertical column directly left of Previous.
-// Both paint and hit test use these same coordinates.
-struct MediaExtraLayout { float x, y[2], radius; };
-bool GetMediaExtraLayout(MediaExtraLayout& extra) {
-    if (!MediaExtraControlsVisible() || g_panelMode != PanelMode::Media ||
-        g_scale <= 0.0f) return false;
-    const MediaLayout layout = ComputeMediaLayout(
-        g_panelHeight / g_scale, g_panelWidth / g_scale);
-    extra.radius = layout.buttonRadius * 0.5f;
-    extra.x = layout.controlsX[0] - layout.buttonRadius -
-              extra.radius - kMediaExtraGroupGap;
-    const bool both = g_mediaCurrent.canShuffle &&
-                      g_mediaCurrent.shuffleKnown &&
-                      g_mediaCurrent.canRepeat &&
-                      g_mediaCurrent.repeatMode >= 0;
-    const float offset = both
-        ? extra.radius + kMediaExtraStackGap / 2.0f : 0.0f;
-    extra.y[0] = layout.controlsY - offset; // Shuffle above
-    extra.y[1] = layout.controlsY + offset; // Repeat below
-    return true;
-}
-bool ControlButtonHit(float dx, float dy, float radius) {
-    if (!g_controlButtonSquare.load()) return dx * dx + dy * dy <= radius * radius;
-    const float ax = std::abs(dx), ay = std::abs(dy);
-    if (ax > radius || ay > radius) return false;
-    const float corner = std::min(radius,
-        static_cast<float>(g_controlButtonCornerRadius.load()));
-    if (corner <= 0.0f) return true;
-    const float straight = radius - corner;
-    if (ax <= straight || ay <= straight) return true;
-    const float x = ax - straight, y = ay - straight;
-    return x * x + y * y <= corner * corner;
-}
-
-// Album-cover overlay: appears only when more than one SMTC session exists.
-// Independent of the SMTC transport-button size setting.
-bool MediaCycleGeometry(float& cx, float& cy, float& radius) {
-    if (g_panelMode != PanelMode::Media || g_scale <= 0.0f ||
-        g_mediaCurrent.sessionCount <= 1) return false;
-    const MediaLayout layout = ComputeMediaLayout(
-        g_panelHeight / g_scale, g_panelWidth / g_scale);
-    radius = std::clamp(layout.artSize * 0.10f, 10.0f, 14.0f);
-    constexpr float inset = 5.0f;
-    cx = layout.artX + layout.artSize - radius - inset;
-    cy = layout.artY + radius + inset;
-    return layout.artSize >= 2.0f * (radius + inset);
-}
-
-bool MediaCycleHitTest(float x, float y) {
-    float cx = 0.0f, cy = 0.0f, radius = 0.0f;
-    return MediaCycleGeometry(cx, cy, radius) &&
-        ControlButtonHit(x - cx, y - cy, radius);
-}
-
-int MediaExtraHitTest(float x, float y) {
-    MediaExtraLayout extra{};
-    if (!GetMediaExtraLayout(extra)) return 0;
-    const bool allowed[2] = {
-        g_mediaCurrent.canShuffle && g_mediaCurrent.shuffleKnown,
-        g_mediaCurrent.canRepeat && g_mediaCurrent.repeatMode >= 0
-    };
-    for (int i = 0; i < 2; ++i) {
-        const float dx = x - extra.x;
-        const float dy = y - extra.y[i];
-        if (allowed[i] && ControlButtonHit(dx, dy, extra.radius))
-            return i == 0 ? 5 : 6;
-    }
-    return 0;
-}
-int MediaButtonHitTest(float x, float y) {
-    if (g_panelMode != PanelMode::Media || !g_showMediaControls.load() ||
-        g_scale <= 0) return -1;
-    const MediaLayout layout = ComputeMediaLayout(
-        g_panelHeight / g_scale, g_panelWidth / g_scale);
-    const bool enabled[3]{g_mediaCurrent.canPrevious,
-        g_mediaCurrent.canToggle, g_mediaCurrent.canNext};
-    for (int i = 0; i < 3; ++i) {
-        const float dx = x - layout.controlsX[i];
-        const float dy = y - layout.controlsY;
-        if (enabled[i] && ControlButtonHit(dx, dy, layout.buttonRadius))
-            return i;
-    }
-    return -1;
-}
-
-bool MediaTimelineHitTest(float x, float y) {
-    if (g_panelMode != PanelMode::Media || !g_mediaCurrent.hasTimeline ||
-        !g_mediaCurrent.canSeek ||
-        g_mediaCurrent.timelineEnd <= g_mediaCurrent.timelineStart ||
-        g_scale <= 0.0f) return false;
-    const MediaLayout l = ComputeMediaLayout(
-        g_panelHeight / g_scale, g_panelWidth / g_scale);
-    // 5px drawn line, 19px accessible pointer target; clamp at endpoints.
-    return x >= l.textX - 8.0f &&
-           x <= l.textX + l.timelineWidth + 8.0f &&
-           std::fabs(y - (l.timelineY + 2.5f)) <= 9.5f;
-}
-
-void PreviewMediaSeek(float x) {
-    if (!g_mediaCurrent.hasTimeline || !g_mediaCurrent.canSeek ||
-        g_mediaCurrent.timelineEnd <= g_mediaCurrent.timelineStart ||
-        g_scale <= 0.0f) return;
-    const MediaLayout l = ComputeMediaLayout(
-        g_panelHeight / g_scale, g_panelWidth / g_scale);
-    const double fraction = std::clamp(
-        static_cast<double>((x - l.textX) / l.timelineWidth), 0.0, 1.0);
-    const INT64 span = g_mediaCurrent.timelineEnd -
-                       g_mediaCurrent.timelineStart;
-    g_mediaPreviewPosition = g_mediaCurrent.timelineStart +
-        static_cast<INT64>(std::llround(fraction * static_cast<double>(span)));
-    g_mediaPreviewPosition = std::clamp(g_mediaPreviewPosition,
-        g_mediaCurrent.timelineStart, g_mediaCurrent.timelineEnd);
-    RenderPanel();
-}
-
-void DrawMediaPanel(Gdiplus::Graphics& gfx) {
-    const float w = g_panelWidth / g_scale;
-    const float h = g_panelHeight / g_scale;
-    DrawPanelCard(gfx, w, h, true);
-    const MediaLayout layout = ComputeMediaLayout(h, w);
-    const bool light = IsLightTheme();
-    const DWORD rgb = OsdTextRgb(light);
-    const Gdiplus::Color fg = ToGdiColor(rgb);
-    const Gdiplus::Color quiet(190, fg.GetR(), fg.GetG(), fg.GetB());
-    const float imgW = layout.artSize;
-    const float imgX = layout.artX, imgY = layout.artY;
-    bool renderedArt = false;
-    if (g_showMediaArtwork.load() && g_cachedArtwork &&
-        g_cachedArtwork->GetLastStatus() == Gdiplus::Ok) {
-        Gdiplus::GraphicsPath clip;
-        AddRoundedRect(clip, imgX, imgY, imgW, imgW,
-                       std::clamp(imgW * 0.056f, 5.0f, 14.0f));
-        const auto saved = gfx.Save();
-        gfx.SetClip(&clip);
-        // Center-crop a non-square source instead of stretching cover art.
-        const float srcW = static_cast<float>(g_cachedArtwork->GetWidth());
-        const float srcH = static_cast<float>(g_cachedArtwork->GetHeight());
-        const float srcSide = std::min(srcW, srcH);
-        gfx.DrawImage(g_cachedArtwork.get(),
-                      Gdiplus::RectF(imgX, imgY, imgW, imgW),
-                      (srcW - srcSide) * 0.5f, (srcH - srcSide) * 0.5f,
-                      srcSide, srcSide, Gdiplus::UnitPixel);
-        gfx.Restore(saved);
-        renderedArt = true;
-    }
-    if (!renderedArt) {
-        Gdiplus::GraphicsPath placeholder;
-        AddRoundedRect(placeholder, imgX, imgY, imgW, imgW,
-                       std::clamp(imgW * 0.056f, 5.0f, 14.0f));
-        Gdiplus::SolidBrush fill(light ? Gdiplus::Color(255, 228,230,235)
-                                       : Gdiplus::Color(255,64,65,70));
-        gfx.FillPath(&fill, &placeholder);
-        DrawText(gfx, L"♫", imgX, imgY, imgW, imgW,
-                 32.0f * std::min(layout.contentScale, 1.35f), quiet, true);
-    }
-    // Semi-transparent Fluent-style chevron over the album's top-right.
-    // It switches the session shown by this card, not the Windows default.
-    float cycleX = 0.0f, cycleY = 0.0f, cycleRadius = 0.0f;
-    if (MediaCycleGeometry(cycleX, cycleY, cycleRadius)) {
-        const bool pressed = g_mediaCyclePressed && g_mediaCycleInside;
-        FillControlButtonShape(gfx, cycleX, cycleY, cycleRadius,
-            pressed ? Gdiplus::Color(188, 67, 91, 130)
-                    : Gdiplus::Color(166, 24, 27, 34));
-        DrawControlChevron(gfx, cycleX, cycleY,
-            Gdiplus::Color(250, 255, 255, 255), FlyoutDirection::Right,
-            cycleRadius * 0.34f);
-    }
-    DrawText(gfx, g_mediaCurrent.title.empty() ? Tr(OsdText::MediaPlayback) :
-             g_mediaCurrent.title, layout.textX, layout.titleY, layout.textWidth,
-             27.0f * layout.contentScale,
-             16.0f * std::min(layout.contentScale, 1.35f), fg);
-    DrawText(gfx, g_mediaCurrent.artist, layout.textX,
-             layout.artistY, layout.textWidth,
-             19.0f * layout.contentScale,
-             12.0f * std::min(layout.contentScale, 1.35f), quiet);
-    if (g_mediaCurrent.hasTimeline &&
-        g_mediaCurrent.timelineEnd > g_mediaCurrent.timelineStart) {
-        const DWORD trackRgb = OsdTrackRgb(light);
-        const DWORD accentRgb = OsdAccentRgb();
-        Gdiplus::GraphicsPath track;
-        AddRoundedRect(track, layout.textX, layout.timelineY,
-                       layout.timelineWidth, 5.0f, 2.5f);
-        Gdiplus::SolidBrush trackBrush(ToGdiColor(trackRgb));
-        gfx.FillPath(&trackBrush, &track);
-        const INT64 position = MediaDisplayedPosition100ns(
-            g_mediaCurrent, GetTickCount64());
-        const double fraction = static_cast<double>(
-            position - g_mediaCurrent.timelineStart) /
-            static_cast<double>(g_mediaCurrent.timelineEnd -
-                g_mediaCurrent.timelineStart);
-        const float fillWidth = static_cast<float>(
-            std::clamp(fraction, 0.0, 1.0) * layout.timelineWidth);
-        if (fillWidth >= 1.0f) {
-            Gdiplus::GraphicsPath progress;
-            AddRoundedRect(progress, layout.textX, layout.timelineY,
-                           fillWidth, 5.0f, std::min(2.5f, fillWidth / 2.0f));
-            Gdiplus::SolidBrush accent(ToGdiColor(accentRgb));
-            gfx.FillPath(&accent, &progress);
-        }
-        // The progress thumb uses the same geometry as the main OSD thumb.
-        // Its center is on the bar; the setting can disable thumbs globally.
-        DrawTrackThumb(gfx, layout.textX + fillWidth,
-                       layout.timelineY + 2.5f,
-                       ToGdiColor(accentRgb), light);
-        const float timeWidth = std::min(73.0f,
-                                         layout.timelineWidth * 0.48f);
-        const float timeHeight = 15.0f * layout.contentScale;
-        const float timeFont = 10.0f *
-            std::min(layout.contentScale, 1.35f);
-        DrawText(gfx, FormatMediaTime(position - g_mediaCurrent.timelineStart),
-                 layout.textX, layout.timeY, timeWidth, timeHeight,
-                 timeFont, quiet);
-        // End time shares the right-hand content boundary with the progress
-        // track and controls, regardless of expanded-panel width.
-        DrawText(gfx, FormatMediaTime(g_mediaCurrent.timelineEnd -
-                     g_mediaCurrent.timelineStart),
-                 layout.textX + layout.timelineWidth - timeWidth,
-                 layout.timeY, timeWidth, timeHeight,
-                 timeFont, quiet, false, true);
-    }
-    if (!g_showMediaControls.load()) return;
-    const bool allowed[3] = {g_mediaCurrent.canPrevious,
-                             g_mediaCurrent.canToggle, g_mediaCurrent.canNext};
-    const ULONGLONG now = GetTickCount64();
-    const bool feedback = g_mediaFeedbackIndex >= 0 &&
-        now >= g_mediaFeedbackTick &&
-        now - g_mediaFeedbackTick < kMediaFeedbackMs;
-    for (int i = 0; i < 3; ++i) {
-        const bool pressed = i == g_mediaPressedIndex && g_mediaPressedInside;
-        const bool tapped = feedback && i == g_mediaFeedbackIndex;
-        const float radius = layout.buttonRadius * (pressed ? 0.94f : 1.0f);
-        const DWORD accentRgb = OsdAccentRgb();
-        const Gdiplus::Color fill = pressed || tapped
-            ? ToGdiColor(accentRgb, pressed ? 96 : static_cast<BYTE>(
-                (kMediaFeedbackMs - (now - g_mediaFeedbackTick)) * 85 /
-                 kMediaFeedbackMs))
-            : ControlButtonFill(light);
-        FillControlButtonShape(gfx, layout.controlsX[i], layout.controlsY,
-                               radius, fill);
-        if (tapped) {
-            const float t = static_cast<float>(now - g_mediaFeedbackTick) /
-                static_cast<float>(kMediaFeedbackMs);
-            Gdiplus::Pen ring(ToGdiColor(accentRgb, static_cast<BYTE>(
-                (1.0f - t) * 145.0f)), 1.6f);
-            DrawControlButtonOutline(gfx, layout.controlsX[i],
-                layout.controlsY, radius * (0.75f + 0.3f*t), ring);
-        }
-        DrawMediaControl(gfx, layout.controlsX[i], layout.controlsY,
-                         i + 1, g_mediaCurrent.playing,
-                         allowed[i] ? fg : quiet,
-                         layout.contentScale * (pressed ? 0.90f : 1.0f));
-    }
-    MediaExtraLayout extra{};
-    if (GetMediaExtraLayout(extra)) {
-        const bool enabled[2] = {
-            g_mediaCurrent.canShuffle && g_mediaCurrent.shuffleKnown,
-            g_mediaCurrent.canRepeat && g_mediaCurrent.repeatMode >= 0
-        };
-        const bool active[2] = {g_mediaCurrent.shuffleActive,
-                                g_mediaCurrent.repeatMode > 0};
-        const DWORD accentRgb = OsdAccentRgb();
-        for (int i = 0; i < 2; ++i) {
-            if (!enabled[i]) continue;
-            const int action = 5 + i;
-            const bool pressed = g_extraPressedAction == action &&
-                                 g_extraPressedInside;
-            const bool tapped = feedback && g_mediaFeedbackIndex == action - 2;
-            const float radius = extra.radius * (pressed ? 0.95f : 1.0f);
-            const Gdiplus::Color background = pressed || tapped ?
-                ToGdiColor(accentRgb, 96) : active[i] ?
-                ToGdiColor(accentRgb, 65) :
-                ControlButtonFill(light);
-            FillControlButtonShape(gfx, extra.x, extra.y[i], radius, background);
-            Gdiplus::Pen pen(active[i] ? ToGdiColor(accentRgb) : fg, 1.6f);
-            pen.SetStartCap(Gdiplus::LineCapRound);
-            pen.SetEndCap(Gdiplus::LineCapRound);
-            // Both the circle and its symbol scale with Previous.
-            const Gdiplus::GraphicsState saved = gfx.Save();
-            gfx.TranslateTransform(extra.x, extra.y[i]);
-            gfx.ScaleTransform(extra.radius / 16.0f, extra.radius / 16.0f);
-            const float x = 0.0f, y = 0.0f;
-            if (i == 0) { // Shuffle: crossing paths with directional heads.
-                gfx.DrawLine(&pen, x - 6.0f, y - 4.5f, x - 2.0f, y - 4.5f);
-                gfx.DrawLine(&pen, x - 2.0f, y - 4.5f, x + 3.0f, y + 4.5f);
-                gfx.DrawLine(&pen, x + 3.0f, y + 4.5f, x + 6.0f, y + 4.5f);
-                gfx.DrawLine(&pen, x - 6.0f, y + 4.5f, x - 2.0f, y + 4.5f);
-                gfx.DrawLine(&pen, x - 2.0f, y + 4.5f, x + 3.0f, y - 4.5f);
-                gfx.DrawLine(&pen, x + 3.0f, y - 4.5f, x + 6.0f, y - 4.5f);
-                gfx.DrawLine(&pen, x + 3.5f, y - 7.0f, x + 6.0f, y - 4.5f);
-                gfx.DrawLine(&pen, x + 3.5f, y - 2.0f, x + 6.0f, y - 4.5f);
-                gfx.DrawLine(&pen, x + 3.5f, y + 2.0f, x + 6.0f, y + 4.5f);
-                gfx.DrawLine(&pen, x + 3.5f, y + 7.0f, x + 6.0f, y + 4.5f);
-            } else { // Repeat list / track, with "1" in track mode.
-                gfx.DrawLine(&pen, x - 6.0f, y - 4.5f, x + 5.0f, y - 4.5f);
-                gfx.DrawLine(&pen, x + 5.0f, y - 4.5f, x + 2.8f, y - 6.5f);
-                gfx.DrawLine(&pen, x + 5.0f, y - 4.5f, x + 2.8f, y - 2.5f);
-                gfx.DrawLine(&pen, x + 6.0f, y + 4.5f, x - 5.0f, y + 4.5f);
-                gfx.DrawLine(&pen, x - 5.0f, y + 4.5f, x - 2.8f, y + 6.5f);
-                gfx.DrawLine(&pen, x - 5.0f, y + 4.5f, x - 2.8f, y + 2.5f);
-                if (g_mediaCurrent.repeatMode == 1)
-                    DrawText(gfx, L"1", x - 4.0f, y - 4.0f,
-                             8.0f, 8.0f, 7.0f, fg, true);
-            }
-            gfx.Restore(saved);
-        }
-    }
-}
-
-int NoticeVisibleRows() {
-    if (g_panelHeight <= 0) return 1;
-    return std::max(1, static_cast<int>((g_panelHeight / g_scale - 47.0f) / 28.0f));
-}
-void DrawNoticeDetails(Gdiplus::Graphics& gfx) {
-    const float h = g_panelHeight / g_scale;
-    DrawPanelCard(gfx, 340.0f, h);
-    const bool light = IsLightTheme();
-    const Gdiplus::Color fg = ToGdiColor(
-        OsdTextRgb(light));
-    DrawText(gfx, Tr(OsdText::EventDetails), 16, 10, 290, 24, 15, fg);
-    const int visible = NoticeVisibleRows();
-    const int maxStart = std::max<int>(0, static_cast<int>(g_noticeDetails.size()) - visible);
-    g_noticeScroll = std::clamp(g_noticeScroll, 0, maxStart);
-    for (int i = 0; i < visible && i + g_noticeScroll < static_cast<int>(g_noticeDetails.size()); ++i)
-        DrawText(gfx, g_noticeDetails[i + g_noticeScroll], 18,
-                 42.0f + i * 28.0f, 304, 25, 13, fg);
-    if (maxStart > 0) {
-        const DWORD accent = OsdAccentRgb();
-        Gdiplus::SolidBrush b(ToGdiColor(accent));
-        const float travel = std::max(12.0f, h - 52.0f);
-        const float thumb = std::max(12.0f, travel * visible / g_noticeDetails.size());
-        const float offset = (travel - thumb) * g_noticeScroll / maxStart;
-        gfx.FillRectangle(&b, 332.0f, 41.0f + offset, 3.0f, thumb);
-    }
-}
-
-void DrawMixerOutputPicker(Gdiplus::Graphics& gfx, float width, float height,
-                           Gdiplus::Color fg, bool light, DWORD accentRgb) {
-    (void)width;
-    const auto header = MixerOutputHeader();
-    const float corner = std::clamp(
-        static_cast<float>(g_cornerRadius.load()), 0.0f, 12.0f);
-    // The header remains minimal until hovered/expanded, matching OSD controls.
-    if (g_mixerOutputHeaderHovered || g_mixerOutputExpanded) {
-        Gdiplus::GraphicsPath backdrop;
-        AddRoundedRect(backdrop, header.X, header.Y, header.Width,
-                       header.Height, corner);
-        Gdiplus::SolidBrush fill(ToGdiColor(accentRgb,
-            g_mixerOutputExpanded ? 36 : 22));
-        gfx.FillPath(&fill, &backdrop);
-    }
-    std::wstring selected = Tr(OsdText::NoAudioOutputs);
-    if (g_mixerOutputSwitchFailed) selected = Tr(OsdText::AudioSwitchFailed);
-    else for (const auto& output : g_mixerOutputOptions) {
-        if (output.id == g_mixerOutputId) {
-            selected = output.name;
-            break;
-        }
-    }
-    DrawText(gfx, selected, header.X + 7.0f, header.Y + 1.0f,
-             header.Width - 42.0f, header.Height - 2.0f, 11.5f, fg);
-    const float cx = header.X + header.Width - 14.0f;
-    const float cy = header.Y + header.Height / 2.0f;
-    DrawControlButtonSurface(gfx, cx, cy, 12.5f, light, false,
-                             g_mixerOutputExpanded, g_mixerOutputHeaderHovered);
-    DrawControlChevron(gfx, cx, cy, fg,
-                       g_mixerOutputExpanded ? FlyoutDirection::Up
-                                             : FlyoutDirection::Down, 4.2f);
-    if (!g_mixerOutputExpanded) return;
-    const int rows = MixerOutputRows();
-    if (!rows) return;
-    const auto bounds = MixerOutputMenuRect();
-    if (bounds.Y + bounds.Height > height) return;
-    Gdiplus::GraphicsPath menu;
-    AddRoundedRect(menu, bounds.X, bounds.Y, bounds.Width,
-                   bounds.Height, corner);
-    // Opaque over the underlying sliders, but honor the custom OSD background.
-    Gdiplus::SolidBrush panel(ToGdiColor(OsdBackgroundRgb(light)));
-    gfx.FillPath(&panel, &menu);
-    if (!g_ddcBorderless.load()) {
-        Gdiplus::Pen border(PanelBorderColor(light), .8f);
-        gfx.DrawPath(&border, &menu);
-    }
-    for (int row = 0; row < rows; ++row) {
-        const int index = row + g_mixerOutputScroll;
-        const auto& item = g_mixerOutputOptions[index];
-        const auto itemBounds = MixerOutputRowRect(row);
-        const bool current = item.id == g_mixerOutputId;
-        const bool hovered = index == g_mixerOutputHoveredRow;
-        if (current || hovered) {
-            Gdiplus::GraphicsPath tile;
-            AddRoundedRect(tile, itemBounds.X, itemBounds.Y,
-                           itemBounds.Width, itemBounds.Height,
-                           std::min(6.0f, corner));
-            Gdiplus::SolidBrush highlight(ToGdiColor(accentRgb,
-                current ? (light ? 34 : 60) : (light ? 20 : 34)));
-            gfx.FillPath(&highlight, &tile);
-        }
-        if (current)
-            DrawText(gfx, L"✓", itemBounds.X + 4.0f, itemBounds.Y, 16.0f,
-                     itemBounds.Height, 12.0f, ToGdiColor(accentRgb));
-        DrawText(gfx, item.name, itemBounds.X + 24.0f, itemBounds.Y,
-                 itemBounds.Width - 34.0f, itemBounds.Height, 11.5f, fg);
-    }
-    if (static_cast<int>(g_mixerOutputOptions.size()) > rows) {
-        Gdiplus::SolidBrush scroll(ToGdiColor(accentRgb, 160));
-        const float travel = bounds.Height - 10.0f;
-        const float thumb = std::max(8.0f, travel * rows /
-            static_cast<float>(g_mixerOutputOptions.size()));
-        const int maxOffset = static_cast<int>(g_mixerOutputOptions.size()) - rows;
-        const float y = bounds.Y + 5.0f +
-            (travel - thumb) * g_mixerOutputScroll / std::max(1, maxOffset);
-        gfx.FillRectangle(&scroll, bounds.X + bounds.Width - 4.0f,
-                          y, 2.0f, thumb);
-    }
-}
-
-void DrawMixerPanel(Gdiplus::Graphics& gfx) {
-    const float width = g_panelWidth / g_scale;
-    const float h = g_panelHeight / g_scale;
-    DrawPanelCard(gfx, width, h, true);
-    const bool horizontal = !g_verticalVolumeBrightness.load();
-    const bool light = IsLightTheme();
-    const DWORD textRgb = OsdTextRgb(light);
-    const DWORD accentRgb = OsdAccentRgb();
-    const DWORD trackRgb = OsdTrackRgb(light, true);
-    const Gdiplus::Color fg = ToGdiColor(textRgb);
-    Gdiplus::SolidBrush track(ToGdiColor(trackRgb));
-    Gdiplus::SolidBrush active(ToGdiColor(accentRgb));
-    DrawText(gfx, Tr(OsdText::VolumeMixer), horizontal ? 27.0f : 17.0f,
-             10.0f, MixerOutputHeader().X - (horizontal ? 31.0f : 21.0f),
-             30.0f, 15.0f, fg);
-    const int rows = MixerVisibleRows();
-    const int total = static_cast<int>(g_mixerEntries.size()) + 1;
-    ClampMixerScroll();
-    for (int row = 0; row < rows; ++row) {
-        const int index = row + g_mixerScroll;
-        if (index >= total) break;
-        const float value = index == 0 ? g_mixerMasterLevel :
-                            g_mixerEntries[index - 1].scalar;
-        const bool muted = index == 0 ? g_mixerMasterMuted :
-                           g_mixerEntries[index - 1].muted;
-        const float y = kMixerFirstRowY + row * kMixerRowStep;
-        // Stretch tracks with the independently configured panel width.
-        // Hittest/drag share MixerTrackLength(), preventing control drift.
-        const float iconX = horizontal ? 28.0f : 25.0f;
-        if (index > 0 && g_mixerEntries[index - 1].appIcon) {
-            Gdiplus::Bitmap bmp(g_mixerEntries[index - 1].appIcon);
-            if (bmp.GetLastStatus() == Gdiplus::Ok)
-                gfx.DrawImage(&bmp, iconX, y - 8.0f, 19.0f, 19.0f);
-        } else if (index == 0) {
-            DrawUniformStatusIcon(gfx, fg, iconX + 9.0f, y + 2.0f,
-                PopupKind::NativeVolume, static_cast<int>(value * 100), muted);
-        } else {
-            DrawText(gfx, L"◉", iconX - 2.0f, y - 9.0f,
-                     28.0f, 23.0f, 14.0f, fg, true);
-        }
-        // Muted app: preserve the recognizable process icon beneath a
-        // translucent tile and a compact diagonal mute mark.
-        if (muted && index > 0) {
-            Gdiplus::GraphicsPath overlay;
-            AddRoundedRect(overlay, iconX, y - 8.0f,
-                           19.0f, 19.0f, 4.0f);
-            Gdiplus::SolidBrush shade(light
-                ? Gdiplus::Color(165, 250, 250, 252)
-                : Gdiplus::Color(165, 22, 22, 26));
-            gfx.FillPath(&shade, &overlay);
-            Gdiplus::Pen slash(fg, 2.0f);
-            slash.SetStartCap(Gdiplus::LineCapRound);
-            slash.SetEndCap(Gdiplus::LineCapRound);
-            gfx.DrawLine(&slash, iconX + 4.5f, y + 7.0f,
-                         iconX + 14.5f, y - 4.5f);
-        }
-        Gdiplus::GraphicsPath back;
-        AddRoundedRect(back, kMixerTrackStart, y + 1.0f,
-                       MixerTrackLength(), kMixerTrackHeight,
-                       kMixerTrackHeight / 2.0f);
-        gfx.FillPath(&track, &back);
-        const float filled = MixerTrackLength() *
-            std::clamp(value, 0.0f, 1.0f);
-        if (filled > 0) {
-            auto state = gfx.Save();
-            gfx.SetClip(Gdiplus::RectF(kMixerTrackStart,
-                                      y + 1.0f, filled, kMixerTrackHeight));
-            gfx.FillPath(&active, &back);
-            gfx.Restore(state);
-        }
-        DrawTrackThumb(gfx, kMixerTrackStart + filled,
-                       y + 1.0f + kMixerTrackHeight / 2.0f,
-                       ToGdiColor(accentRgb), light);
-        DrawText(gfx, std::to_wstring(static_cast<int>(std::lround(value * 100))) + L"%",
-                 kMixerTrackStart + MixerTrackLength() + 11.0f,
-                 y - 7.0f, horizontal ? 34.0f : 41.0f,
-                 23.0f, 11.0f, fg);
-    }
-    if (total > rows) {
-        // A small scroll thumb rather than a footer that consumes a row.
-        Gdiplus::SolidBrush scrollbar(ToGdiColor(accentRgb, 190));
-        const float travel = std::max(4.0f, h - 55.0f);
-        const float thumb = std::max(12.0f, travel * rows / total);
-        const float offset = MixerMaximumScroll() > 0
-            ? (travel - thumb) * g_mixerScroll / MixerMaximumScroll() : 0;
-        gfx.FillRectangle(&scrollbar, width - (horizontal ? 21.0f : 10.0f),
-                          42.0f + offset, 3.0f, thumb);
-    }
-    // Draw last so the dropdown visually overlays the mixer tracks.
-    DrawMixerOutputPicker(gfx, width, h, fg, light, accentRgb);
-}
-
-void RenderPanel() {
-    if (!g_panelWnd || !g_gdiplusToken || g_panelMode == PanelMode::None) return;
-    const int w = g_panelWidth, h = g_panelHeight;
-    if (w <= 0 || h <= 0) return;
-    HDC screen = GetDC(nullptr);
-    if (!screen) return;
-    HDC memory = CreateCompatibleDC(screen);
-    if (!memory) { ReleaseDC(nullptr, screen); return; }
-    void* pixels = nullptr;
-    HBITMAP bmp = CreateArgbDib(screen, w, h, &pixels);
-    if (bmp && pixels) {
-        HGDIOBJ old = SelectObject(memory, bmp);
-        {
-            Gdiplus::Bitmap surface(w, h, w * 4,
-                PixelFormat32bppPARGB, static_cast<BYTE*>(pixels));
-            Gdiplus::Graphics gfx(&surface);
-            gfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-            gfx.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-            gfx.Clear(Gdiplus::Color(0,0,0,0));
-            gfx.ScaleTransform(g_scale, g_scale);
-            if (g_panelMode == PanelMode::Media) DrawMediaPanel(gfx);
-            else if (g_panelMode == PanelMode::Mixer) DrawMixerPanel(gfx);
-            else DrawNoticeDetails(gfx);
-        }
-        (void)PublishArgbLayer(g_panelWnd, screen, memory, w, h);
-        if (g_displayOutputMode.load(std::memory_order_relaxed) == 3)
-            RenderMirroredFrame(screen, pixels, w, h, true);
-        SelectObject(memory, old);
-        DeleteObject(bmp);
-    }
-    DeleteDC(memory);
-    ReleaseDC(nullptr, screen);
-}
-
-void ClosePanel() {
-    const bool hadCenteredPair = NeedsCompositeCentering();
-    StopMixerOutputNotifications();
-    g_mixerOutputExpanded = false;
-    g_mixerOutputHoveredRow = -1;
-    g_mixerOutputHeaderHovered = false;
-    g_mixerOutputSwitchFailed = false;
-    g_mixerOutputScroll = 0;
-    g_mixerOutputOptions.clear();
-    g_mixerOutputId.clear();
-    HideMirroredWindows(true);
-    if (g_popupWnd) KillTimer(g_popupWnd, kMediaAnimationTimer);
-    const bool heldCapture = g_mediaPressedIndex >= 0 ||
-        g_extraPressedAction != 0 || g_mediaCyclePressed ||
-        g_mixerDrag || g_mixerMutePressedIndex >= 0;
-    g_mediaPressedIndex = -1;
-    g_mediaPressedInside = false;
-    g_mediaCyclePressed = false;
-    g_mediaCycleInside = false;
-    g_extraPressedAction = 0;
-    g_extraPressedInside = false;
-    g_mediaSeeking = false;
-    g_mediaSeekHoldUntil = 0;
-    g_mediaFeedbackIndex = -1;
-    if (heldCapture && g_panelWnd && GetCapture() == g_panelWnd)
-        ReleaseCapture();
-    g_mixerMutePressedIndex = -1;
-    if (g_panelWnd) ShowWindow(g_panelWnd, SW_HIDE);
-    g_panelMode = PanelMode::None;
-    CleanupMixerIcons();
-    g_mixerEntries.clear();
-    g_mixerMaster.Reset();
-    g_mixerDrag = false;
-    g_mixerDragIndex = -1;
-    if (hadCenteredPair) RefreshCompositePlacementIfChanged();
-}
-
-
-void ShowPanel() {
-    if (!g_panelWnd || !g_popupWnd || g_panelMode == PanelMode::None) return;
-    const bool vertical = g_verticalVolumeBrightness.load();
-    const bool volumePanel = g_panelMode == PanelMode::Media ||
-                             g_panelMode == PanelMode::Mixer;
-    // Reposition first: monitor DPI may change the scale used for the panel.
-    if (NeedsCompositeCentering()) RefreshCompositePlacementIfChanged();
-    if (volumePanel) {
-        // Exact physical dimension inheritance avoids 1px rounding drift.
-        const bool media = g_panelMode == PanelMode::Media;
-        g_panelWidth = vertical ? static_cast<int>(std::lround(
-            (media ? g_verticalSmtcWidth.load() :
-                     g_verticalMixerWidth.load()) * g_scale)) : g_width;
-        g_panelHeight = vertical ? g_height : static_cast<int>(std::lround(
-            (media ? g_horizontalSmtcHeight.load() :
-                     g_horizontalMixerHeight.load()) * g_scale));
-    } else {
-        g_panelWidth = static_cast<int>(std::lround(340.0f * g_scale));
-        g_panelHeight = std::max(g_height,
-            static_cast<int>(std::lround(220.0f * g_scale)));
-    }
-    // SMTC/Mixer each inherit horizontal WIDTH or vertical HEIGHT, with
-    // independent heights/widths for the other axis. Details keep legacy.
-    ClampMixerScroll();
-    RECT main{};
-    if (!GetWindowRect(g_popupWnd, &main)) return;
-    MONITORINFO mi{sizeof(mi)};
-    if (!GetMonitorInfoW(MonitorFromWindow(g_popupWnd, MONITOR_DEFAULTTONEAREST), &mi))
-        return;
-    const RECT& work = mi.rcWork;
-    const int panelInset = static_cast<int>(std::lround(4.0f * g_scale));
-    const int sideInset = static_cast<int>(std::lround(
-        (vertical ? 7.0f : 13.0f) * g_scale));
-    const FlyoutDirection direction = GetFlyoutDirection();
-    const int position = g_position.load();
-    int x = main.left, y = main.top;
-    if (volumePanel) {
-        const auto attached = GetPanelAttachment(vertical, direction, g_scale,
-            main.right - main.left, main.bottom - main.top,
-            g_panelWidth, g_panelHeight);
-        x += attached.x;
-        y += attached.y;
-    } else if (vertical) {
-        // Preserve the legacy positioning of non-volume detail panels.
-        const int gap = static_cast<int>(std::lround(7.0f * g_scale));
-        x = direction == FlyoutDirection::Left
-            ? main.left + sideInset - gap + panelInset - g_panelWidth
-            : main.right - sideInset + gap - panelInset;
-    } else {
-        const int gap = static_cast<int>(std::lround(7.0f * g_scale));
-        const int topInset = static_cast<int>(std::lround(10.0f * g_scale));
-        const int bottomInset = static_cast<int>(std::lround(13.0f * g_scale));
-        y = direction == FlyoutDirection::Up
-            ? main.top + topInset - gap + bottomInset - g_panelHeight
-            : main.bottom - bottomInset + gap - topInset;
-        if (PositionIsLeft(position))
-            x = main.left + sideInset - panelInset;
-        else if (PositionIsRight(position))
-            x = main.right - sideInset + panelInset - g_panelWidth;
-        else
-            x = main.left + ((main.right - main.left) - g_panelWidth) / 2;
-    }
-    x = ClampPopupAxis(x, g_panelWidth,
-        !vertical && PositionCentersX(position) ? mi.rcMonitor : work, true);
-    y = ClampPopupAxis(y, g_panelHeight,
-        vertical && PositionCentersY(position) ? mi.rcMonitor : work, false);
-    SetWindowPos(g_panelWnd, HWND_TOPMOST, x, y, g_panelWidth, g_panelHeight,
-                 SWP_NOACTIVATE | SWP_NOREDRAW);
-    RenderPanel();
-    ShowWindow(g_panelWnd, SW_SHOWNOACTIVATE);
-    if (g_popupWnd) {
-        if (g_panelMode == PanelMode::Media)
-            SetTimer(g_popupWnd, kMediaAnimationTimer,
-                     kMediaAnimationIntervalMs, nullptr);
-        else
-            KillTimer(g_popupWnd, kMediaAnimationTimer);
-    }
-}
-
-void ShowVolumePanelIfReady() {
-    if (g_panelMode == PanelMode::Mixer) return;
-    if (g_showSmtcOnVolume.load() && g_mediaCurrent.available) {
-        g_panelMode = PanelMode::Media;
-        ShowPanel();
-    } else ClosePanel();
-}
-
-// Expand/collapse is a real, padded circular button. The painted button,
-// transparent hit target and direction use one set of constants; it never
-// depends on the native Hide switch or enables a custom volume popup itself.
-void DrawExpandChevron(Gdiplus::Graphics& gfx, float x, float y,
-                       Gdiplus::Color color) {
-    const bool vertical = g_verticalVolumeBrightness.load();
-    const bool expanded = g_panelMode == PanelMode::Mixer;
-    const bool pressed = g_arrowPressed;
-    const float radius = vertical ? kVerticalArrowRadius
-                                  : kHorizontalArrowRadius;
-    DrawControlButtonSurface(gfx, x, y, radius, IsLightTheme(), pressed,
-                             expanded, g_arrowHovered);
-    // Mirror the direction when the mixer is open, preserving flyout routing.
-    const FlyoutDirection dir = expanded
-        ? InverseDirection(GetFlyoutDirection()) : GetFlyoutDirection();
-    DrawControlChevron(gfx, x, y + (pressed ? 0.35f : 0.0f), color, dir);
-}
-
-void DrawHorizontalVolume(Gdiplus::Graphics& gfx) {
-    const float logicalW = MainLogicalWidth();
-    const float logicalH = MainLogicalHeight();
-    const float centerY = MainCenterY();
-    bool light = IsLightTheme();
-    DWORD bg = OsdBackgroundRgb(light);
-    DWORD fgRgb = OsdTextRgb(light);
-    DWORD accentRgb = OsdAccentRgb();
-    DWORD trackRgb = OsdTrackRgb(light);
-    Gdiplus::GraphicsPath body;
-    AddRoundedRect(body, 13.0f, 10.0f, logicalW - 26.0f,
-                   logicalH - 23.0f, static_cast<float>(g_cornerRadius.load()));
-    Gdiplus::SolidBrush base(ToGdiColor(bg,
-        OsdBackgroundAlpha()));
-    gfx.FillPath(&base, &body);
-    Gdiplus::Color fg = ToGdiColor(fgRgb);
-    float speakerX = 0.0f, speakerY = 0.0f;
-    MainVolumeIconCenter(speakerX, speakerY);
-    DrawUniformStatusIcon(gfx, fg, speakerX, speakerY, PopupKind::NativeVolume,
-                          g_nativePercent, g_nativeMuted);
-    const float trackW = logicalW - (g_showMixerArrow.load() ? 191.0f : 169.0f);
-    Gdiplus::GraphicsPath track;
-    AddRoundedRect(track, 76.0f, centerY - 4.0f, trackW, 8.0f, 4.0f);
-    Gdiplus::SolidBrush tb(ToGdiColor(trackRgb));
-    gfx.FillPath(&tb, &track);
-    int percent = std::clamp(g_nativePercent, 0, 100);
-    if (g_nativePercentKnown && percent > 0) {
-        float fill = trackW * percent / 100.0f;
-        auto state = gfx.Save();
-        gfx.SetClip(Gdiplus::RectF(76.0f, centerY - 4.0f, fill, 8.0f));
-        Gdiplus::SolidBrush sb(ToGdiColor(accentRgb));
-        gfx.FillPath(&sb, &track);
-        gfx.Restore(state);
-    }
-    if (g_nativePercentKnown)
-        DrawTrackThumb(gfx, 76.0f + trackW * percent / 100.0f,
-                       centerY, ToGdiColor(accentRgb), light);
-    if (g_showValue.load()) {
-        // Without the chevron, move the number right along with the track;
-        // the 167px default track must not overlap the value label.
-        const float valueX = logicalW -
-            (g_showMixerArrow.load() ? 108.0f : 84.0f);
-        DrawText(gfx, std::to_wstring(percent) + L"%",
-                 valueX, centerY - 16.0f, 54.0f, 32.0f,
-                 15, fg, true);
-    }
-    if (g_showMixerArrow.load())
-        DrawExpandChevron(gfx, HorizontalChevronX(), HorizontalChevronY(), fg);
-}
-
-
-// Lock-key notices use the same 296x92 status surface as native, device and
-// network notices. Keep a compact state underline as an extra visual cue.
-void DrawLockStatus(Gdiplus::Graphics& gfx) {
-    const bool light = IsLightTheme();
-    DrawStatusNoticeChrome(gfx, light);
-    const Gdiplus::Color fg = ToGdiColor(OsdTextRgb(light));
-    const Gdiplus::Color quiet(195, fg.GetR(), fg.GetG(), fg.GetB());
-    const int key = std::clamp(g_lastLock, 0, 3);
-    const Gdiplus::Color active = ToGdiColor(OsdAccentRgb());
-    const Gdiplus::Color inactive(145, active.GetR(), active.GetG(), active.GetB());
-    DrawText(gfx, kLockGlyphs[key], kStatusIconX + 2.0f,
-             kStatusIconY + 3.0f, kStatusIconSize - 4.0f,
-             kStatusIconSize - 6.0f, key == 3 ? 16.0f : 23.0f,
-             g_lastLockValue ? active : quiet, true);
-    DrawStatusNoticeLabels(gfx, kLockDisplayNames[key],
-                           g_lastLockValue ? Tr(OsdText::On) : Tr(OsdText::Off),
-                           fg);
-    Gdiplus::GraphicsPath line;
-    AddRoundedRect(line, kStatusTextX, 74.0f, 188.0f, 3.0f, 1.5f);
-    Gdiplus::SolidBrush lineBrush(g_lastLockValue ? active : inactive);
-    gfx.FillPath(&lineBrush, &line);
-}
-
-// Low-level keyboard hook: event-driven and no keyboard polling. Toggle state
-// is tracked on first key down (not repeated autorepeat key-down messages).
-// ============================================================
-// Input hit surfaces, UI event dispatch and thread
 // ============================================================
 LRESULT CALLBACK LockKeyProc(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && lp) {
@@ -9944,91 +7280,13 @@ LRESULT CALLBACK LockKeyProc(int code, WPARAM wp, LPARAM lp) {
 // The main layered OSD remains mouse-transparent. A dedicated, nearly
 // invisible hit window covers only the visible mixer button, keeping the
 // rest of the popup click-through and free of focus changes.
-void SetPopupInteractive(bool interactive) {
-    if (!g_popupWnd) return;
-    LONG_PTR flags = GetWindowLongPtrW(g_popupWnd, GWL_EXSTYLE);
-    if ((!interactive && !(flags & WS_EX_TRANSPARENT)) ||
-        (interactive && (flags & WS_EX_TRANSPARENT))) {
-        SetWindowLongPtrW(g_popupWnd, GWL_EXSTYLE,
-            interactive ? (flags & ~WS_EX_TRANSPARENT) : (flags | WS_EX_TRANSPARENT));
-        SetWindowPos(g_popupWnd, nullptr, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
-            SWP_FRAMECHANGED);
-    }
-}
-
-void UpdateArrowHitWindow() {
-    if (!g_arrowWnd) return;
-    if (g_popupKind != PopupKind::NativeVolume || !g_showMixerArrow.load() ||
-        !g_popupWnd || !IsWindowVisible(g_popupWnd)) {
-        g_arrowHovered = false;
-        g_arrowPressed = false;
-        if (GetCapture() == g_arrowWnd) ReleaseCapture();
-        ShowWindow(g_arrowWnd, SW_HIDE);
-        return;
-    }
-    RECT main{};
-    GetWindowRect(g_popupWnd, &main);
-    const bool vertical = g_verticalVolumeBrightness.load();
-    const float arrowX = vertical ? VerticalChevronX() : HorizontalChevronX();
-    const float arrowY = vertical ? VerticalChevronY() : HorizontalChevronY();
-    const float targetLogicalSize = kArrowHitDiameter;
-    const int targetW = std::max(16, static_cast<int>(
-        std::lround(targetLogicalSize * g_scale)));
-    const int targetH = targetW;
-    const int x = main.left + static_cast<int>(std::lround(arrowX * g_scale)) - targetW / 2;
-    const int y = main.top + static_cast<int>(std::lround(arrowY * g_scale)) - targetH / 2;
-    SetWindowPos(g_arrowWnd, HWND_TOPMOST, x, y, targetW, targetH,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-}
-
-// An almost invisible, non-activating mouse surface. The remaining main OSD
-// stays click-through, preserving track dragging and mixer-arrow hit targets.
-void UpdateSpeakerHitWindow() {
-    if (!g_speakerHitWnd) return;
-    if (g_popupKind != PopupKind::NativeVolume || !g_popupWnd ||
-        !IsWindowVisible(g_popupWnd) || g_closing.load()) {
-        g_speakerPressed = false;
-        if (GetCapture() == g_speakerHitWnd) ReleaseCapture();
-        ShowWindow(g_speakerHitWnd, SW_HIDE);
-        return;
-    }
-    RECT popup{};
-    if (!GetWindowRect(g_popupWnd, &popup) || g_scale <= 0.0f) {
-        ShowWindow(g_speakerHitWnd, SW_HIDE);
-        return;
-    }
-    float cx = 0.0f, cy = 0.0f;
-    MainVolumeIconCenter(cx, cy);
-    const float hitSize = std::max(26.0f,
-        static_cast<float>(g_iconSize.load()) + 8.0f);
-    const int size = std::max(16, static_cast<int>(std::lround(hitSize * g_scale)));
-    const int x = popup.left + static_cast<int>(std::lround(cx * g_scale)) - size / 2;
-    const int y = popup.top + static_cast<int>(std::lround(cy * g_scale)) - size / 2;
-    SetWindowPos(g_speakerHitWnd, HWND_TOPMOST, x, y, size, size,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-}
-
-void ResetHideTimer(UINT ms) {
-    if (g_popupWnd)
-        SetTimer(g_popupWnd, kHideTimer, ms, nullptr);
-}
-
-void ResetHideTimerFor(DurationKind kind) {
-    g_activeDurationKind = kind;
-    ResetHideTimer(OsdDuration(kind));
-}
-
-// Shared routing for every category completed in the experimental XAML
-// renderer. The original GDI+ event handler remains ONLY behind an explicit
-// XAML-off setting; failure/initialization never silently paints the old UI.
 void ShowMigratedXamlLevel(PopupKind kind) {
     const bool brightness = kind == PopupKind::NativeBrightness;
     if(!brightness&&g_showSmtcOnVolume.load()&&
        g_mediaCurrent.available&&!g_xamlMixerOpen&&
        ShowXamlMediaPanel()) return;
     if(g_xamlMediaOpen) ResetXamlMediaController();
-    HideGdiLevelForXaml();
+    PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         Wh_Log(L"Fluent OSD v1.0.28: XAML %s missing anchor",
@@ -10063,7 +7321,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
 // Lock-key OSD is the first compact, noninteractive XAML status category.
 // Retain the keyboard hook, localization, placement and duration engine.
 void ShowMigratedXamlLockStatus() {
-    HideGdiLevelForXaml();
+    PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         Wh_Log(L"XAML v1.0.28: lock status missing placement anchor");
@@ -10085,7 +7343,7 @@ void ShowMigratedXamlLockStatus() {
 // Event identity and debounce stay in the existing event engine; the
 // XAML snapshot owns the names and uses installed Segoe Fluent Icons.
 void ShowMigratedXamlDeviceNotice(DurationKind duration) {
-    HideGdiLevelForXaml();
+    PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         Wh_Log(L"XAML v1.0.28: device notice missing placement anchor");
@@ -10113,7 +7371,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
 // the existing XAML status card, not another GDI+ painter or Win32 hit HWND.
 // Glyph identifiers are Microsoft Segoe Fluent Icons (Windows 11).
 void ShowMigratedXamlNativeEvent() {
-    HideGdiLevelForXaml();
+    PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         Wh_Log(L"XAML v1.0.28: native event missing placement anchor");
@@ -10218,7 +7476,7 @@ bool CopyClipboardThumbnailPixels(HBITMAP bitmap,
 // Text/file notices use the same compact XAML card. If the original capture
 // produced a bounded thumbnail, use the native XAML image-first layout.
 void ShowMigratedXamlClipboardNotice() {
-    HideGdiLevelForXaml();
+    PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         ClearClipboardThumbnail();
@@ -10431,7 +7689,7 @@ bool ShowXamlMediaPanel(bool passiveRefresh) {
        !g_mediaCurrent.available) return false;
     RECT main{},panel{};
     if(!BuildMediaPanelAnchors(main,panel,g_scale)) return false;
-    HideGdiLevelForXaml();
+    PrepareXamlCategory();
     auto volume=MakeXamlSnapshot(PopupKind::NativeVolume,main,g_scale);
     volume.durationMs=OsdDuration(DurationKind::Media);
     volume.passiveRefresh=passiveRefresh;
@@ -10466,7 +7724,7 @@ void ShowXamlMixerPanel() {
         ResetXamlMixerController();
         return;
     }
-    HideGdiLevelForXaml();
+    PrepareXamlCategory();
     auto volume = MakeXamlSnapshot(
         PopupKind::NativeVolume, main, g_scale);
     volume.mixerChevron = g_showMixerArrow.load();
@@ -10538,7 +7796,7 @@ ControlEffects ApplyOsdCommands(
                 } else if (g_showMixerArrow.load() &&
                            g_popupKind == PopupKind::NativeVolume) {
                     ResetXamlMediaController();
-                    ClosePanel();
+                    
                     g_xamlMixerOutputExpanded = false;
                     RefreshMixer();
                     StartMixerOutputNotifications();
@@ -10759,7 +8017,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_nativeEventPosted = false;
         ReleaseSRWLockExclusive(&g_nativeEventLock);
         if (!ShowCustomNative(received.kind)) return 0;
-        ClosePanel();
+        
         g_nativeEventCurrent = std::move(received);
         g_popupKind = PopupKind::NativeEvent;
         BrightnessEvent ev{};
@@ -10827,7 +8085,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == kLockToggleMessage && hwnd == g_receiveWnd) {
         int index = static_cast<int>(wp);
         if (index < 0 || index >= 4 || !g_showLockKeys[index].load()) return 0;
-        ClosePanel();
+        
         g_lastLock = index;
         g_lastLockValue = lp != 0;
         g_popupKind = PopupKind::LockStatus;
