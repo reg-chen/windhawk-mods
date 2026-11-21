@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.28
+// @version         1.0.29
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -641,14 +641,12 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 // ==/WindhawkModSettings==
 
 #include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
 #include <dbt.h>
 #include <setupapi.h>
 #include <iphlpapi.h>
 #include <shellapi.h>
 #include <windhawk_utils.h>
-#include <highlevelmonitorconfigurationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
 #include <physicalmonitorenumerationapi.h>
 #include <atomic>
@@ -665,7 +663,6 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #include <cstddef>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
-#include <windowsx.h>
 #include <wbemidl.h>
 #include <audiopolicy.h>
 #include <propidl.h>
@@ -696,11 +693,9 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #include <winrt/Windows.Foundation.Collections.h>
 #include <array>
 #include <mutex>
-#include <winrt/Windows.Storage.Streams.h>
 #include <vector>
 #include <memory>
 #include <limits>
-#include <cstdlib>
 #include <utility>
 #include <type_traits>
 #include <string>
@@ -1064,38 +1059,62 @@ MixerButton MixerButtonGeometry(const osd_model::Snapshot& value,
     return {true, size, std::max(0.0, (bodyW - size) / 2.0),
         std::max(0.0, bodyH - size - bottom), size + bottom + gap};
 }
-// Reserve exactly the measured text/icon rows and the chevron button row.
-// The previous layout spent up to a full Thumb diameter on EACH vertical
-// gap; a short customizable card consequently had almost no Slider travel.
+// Use measured rows with rounded-corner clearance, not hard-coded edge gaps.
+// A centered label or icon must clear the actual corner arc at its own width.
+// On a short user-configured card, spacing yields first to Slider travel.
 struct VerticalLevelFlow {
-    double pad = 0, gap = 0;
+    double topPad = 0, bottomPad = 0, gap = 0;
     double sliderTop = 0, sliderBottom = 0, iconTop = 0;
 };
 VerticalLevelFlow VerticalLevelBounds(
-        const osd_model::Snapshot& value, double bodyHeight,
-        double chevronReserve, double iconHeight, double labelHeight) {
+        const osd_model::Snapshot& value, double bodyWidth,
+        double bodyHeight, double chevronReserve,
+        double iconWidth, double iconHeight,
+        double labelWidth, double labelHeight) {
     const double contentHeight = std::max(0.0,
         bodyHeight - chevronReserve);
     const double freeHeight = std::max(0.0,
         contentHeight - iconHeight - labelHeight);
+    const double radius = std::clamp(
+        static_cast<double>(value.cornerRadius), 0.0,
+        std::min(bodyWidth, bodyHeight) / 2.0);
+    const auto cornerInset = [&](double glyphWidth) {
+        if (radius <= 0.0 || glyphWidth <= 0.0) return 0.0;
+        // Keep 3 logical pixels between the glyph and the rounded edge.
+        const double sideRoom = std::max(0.0,
+            (bodyWidth - glyphWidth) / 2.0 - 3.0);
+        if (sideRoom >= radius) return 0.0;
+        const double arcX = radius - sideRoom;
+        return radius - std::sqrt(std::max(0.0,
+            radius * radius - arcX * arcX));
+    };
     const double desiredPad = std::clamp(
-        double(value.innerPadding) * .28, 2.0, 5.0);
+        double(value.innerPadding) * .48, 8.0, 12.0);
+    const double desiredTop = std::max(desiredPad,
+        value.showValue ? cornerInset(labelWidth) + 2.0 : desiredPad);
+    const double desiredBottom = std::max(desiredPad,
+        value.showIcon ? cornerInset(iconWidth) + 2.0 : desiredPad);
     const double desiredGap = std::clamp(
-        double(value.innerPadding) * .24, 2.0, 5.0);
+        double(value.innerPadding) * .50, 7.0, 10.0);
     const int gapCount = int(value.showIcon) + int(value.showValue);
+    const double wantedSpacing =
+        desiredTop + desiredBottom + gapCount * desiredGap;
+    // Preserve a meaningful Slider travel range when a panel is short.
+    const double minTrack = std::min(36.0, freeHeight);
+    const double spacingScale = wantedSpacing > 0.0
+        ? std::clamp((freeHeight - minTrack) / wantedSpacing, 0.0, 1.0)
+        : 1.0;
     VerticalLevelFlow out;
-    out.pad = std::min(desiredPad,
-        freeHeight / (gapCount == 2 ? 6.0 : 4.0));
-    out.gap = gapCount ? std::min(desiredGap,
-        std::max(0.0, (freeHeight - 2.0 * out.pad) /
-                           (gapCount + 1.0))) : 0.0;
+    out.topPad = desiredTop * spacingScale;
+    out.bottomPad = desiredBottom * spacingScale;
+    out.gap = desiredGap * spacingScale;
     out.iconTop = bodyHeight - chevronReserve -
-        out.pad - iconHeight;
-    out.sliderTop = out.pad +
+        out.bottomPad - iconHeight;
+    out.sliderTop = out.topPad +
         (value.showValue ? labelHeight + out.gap : 0.0);
     out.sliderBottom = std::max(out.sliderTop,
         value.showIcon ? out.iconTop - out.gap :
-            bodyHeight - chevronReserve - out.pad);
+            bodyHeight - chevronReserve - out.bottomPad);
     return out;
 }
 // Computed card layout, shared by future XAML painting and hit geometry.
@@ -3004,7 +3023,8 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         // Controls and text have distinct measured rows. Layout budgets
         // modest gaps first and assigns the entire remainder to the Slider.
         const auto flow = osd_layout::VerticalLevelBounds(value,
-            bodyH, mixerButton.verticalReserve, iconH, labelH);
+            bodyW, bodyH, mixerButton.verticalReserve,
+            iconW, iconH, labelW, labelH);
         const double iconTop = flow.iconTop;
         const double trackTop = flow.sliderTop;
         const double trackBottom = flow.sliderBottom;
@@ -3035,7 +3055,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         state.value.Width(bodyW);
         state.value.TextAlignment(wx::TextAlignment::Center);
         controls::Canvas::SetLeft(state.value, 0.0);
-        controls::Canvas::SetTop(state.value, flow.pad);
+        controls::Canvas::SetTop(state.value, flow.topPad);
         state.levelSlider.Width(std::max(30.0,
             std::max(trackThickness, wantedThumb) + 12.0));
         state.levelSlider.Height(std::max(1.0, length));
