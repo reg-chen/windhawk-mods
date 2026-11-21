@@ -887,6 +887,9 @@ void HideSurface(State& state) {
     if (state.barInput) ShowWindow(state.barInput, SW_HIDE);
     if (state.iconInput) ShowWindow(state.iconInput, SW_HIDE);
     if (state.host) ShowWindow(state.host, SW_HIDE);
+    if ((state.barInput && GetCapture() == state.barInput) ||
+        (state.iconInput && GetCapture() == state.iconInput))
+        ReleaseCapture();
     state.dragging = false;
     state.iconPressed = false;
 }
@@ -957,6 +960,48 @@ void DragTrack(State& state, HWND hwnd, LPARAM lp) {
     if (state.host) KillTimer(state.host, kHideTimer);
 }
 
+// Shared Win32 gesture lifecycle for migrated XAML controls. Only the
+// action callback varies: a slider sets its value, an icon invokes a click.
+void ArmInteractionTimer(State& state, bool active) {
+    if (!state.host) return;
+    KillTimer(state.host, kHideTimer);
+    if (!active)
+        SetTimer(state.host, kHideTimer,
+            std::clamp(state.current.durationMs, DWORD(500), DWORD(20000)),
+            nullptr);
+}
+
+bool PointerInsideClient(HWND hwnd, LPARAM lp) {
+    RECT bounds{};
+    if (!GetClientRect(hwnd, &bounds)) return false;
+    const POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+    return PtInRect(&bounds, point) != FALSE;
+}
+
+void BeginInputGesture(State& state, HWND hwnd, bool slider, LPARAM lp) {
+    state.dragging = slider;
+    state.iconPressed = !slider;
+    SetCapture(hwnd);
+    ArmInteractionTimer(state, true);
+    if (slider) DragTrack(state, hwnd, lp);
+}
+
+void EndInputGesture(State& state, HWND hwnd, bool slider, LPARAM lp) {
+    const bool clicked = !slider && state.iconPressed &&
+        PointerInsideClient(hwnd, lp);
+    if (slider && state.dragging) DragTrack(state, hwnd, lp);
+    state.dragging = state.iconPressed = false;
+    if (GetCapture() == hwnd) ReleaseCapture();
+    if (clicked) SendInput(state, InputAction::ToggleMute, 0);
+    ArmInteractionTimer(state, false);
+}
+
+void CancelInputGesture(State& state, HWND hwnd, bool releaseCapture) {
+    state.dragging = state.iconPressed = false;
+    if (releaseCapture && GetCapture() == hwnd) ReleaseCapture();
+    ArmInteractionTimer(state, false);
+}
+
 bool HandleInputWindow(State& state, HWND hwnd, UINT message,
                        WPARAM wp, LPARAM lp, LRESULT& result) {
     const bool bar = hwnd == state.barInput;
@@ -970,53 +1015,28 @@ bool HandleInputWindow(State& state, HWND hwnd, UINT message,
             result = TRUE;
             return true;
         case WM_LBUTTONDOWN:
-            if (bar) {
-                state.dragging = true;
-                SetCapture(hwnd);
-                if (state.host) KillTimer(state.host, kHideTimer);
-                DragTrack(state, hwnd, lp);
-            } else {
-                state.iconPressed = true;
-                SetCapture(hwnd);
-                if (state.host) KillTimer(state.host, kHideTimer);
-            }
+            BeginInputGesture(state, hwnd, bar, lp);
             result = 0; return true;
         case WM_MOUSEMOVE:
             if (bar && state.dragging) DragTrack(state, hwnd, lp);
             result = 0; return true;
-        case WM_LBUTTONUP: {
-            if (bar && state.dragging) DragTrack(state, hwnd, lp);
-            if (icon && state.iconPressed) {
-                RECT bounds{};
-                GetClientRect(hwnd, &bounds);
-                POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-                if (PtInRect(&bounds, point))
-                    SendInput(state, InputAction::ToggleMute, 0);
-            }
-            state.dragging = false;
-            state.iconPressed = false;
-            if (GetCapture() == hwnd) ReleaseCapture();
-            if (state.host) SetTimer(state.host, kHideTimer,
-                state.current.durationMs, nullptr);
+        case WM_LBUTTONUP:
+            EndInputGesture(state, hwnd, bar, lp);
             result = 0; return true;
-        }
         case WM_MOUSEWHEEL:
             if (bar) {
                 const int steps = osd_input::ConsumeWheelSteps(
                     GET_WHEEL_DELTA_WPARAM(wp), state.wheelRemainder);
                 if (steps)
                     SendInput(state, InputAction::Wheel, steps * WHEEL_DELTA);
-                if (state.host) {
-                    KillTimer(state.host, kHideTimer);
-                    SetTimer(state.host, kHideTimer,
-                             state.current.durationMs, nullptr);
-                }
+                ArmInteractionTimer(state, false);
             }
             result = 0; return true;
         case WM_CAPTURECHANGED:
+            CancelInputGesture(state, hwnd, false);
+            result = 0; return true;
         case WM_CANCELMODE:
-            state.dragging = false;
-            state.iconPressed = false;
+            CancelInputGesture(state, hwnd, true);
             result = 0; return true;
         case WM_ERASEBKGND: result = TRUE; return true;
         case WM_PAINT: {
