@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.16
+// @version         1.0.17
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.16)
+## XAML migration experiment (v1.0.17)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -29,14 +29,13 @@ simultaneously because their Windows OSD hooks still target the same
 Explorer functions. Restore the official `@id fluent-osd` only when
 merging the renderer back into the production branch.
 
-Branch-only, opt-in native XAML Island renderer for **migrated OSD
-categories**: system volume and Windows native brightness. One existing
-toggle directly chooses XAML for both; if XAML is unavailable, those
-categories are not silently painted by GDI+. The individual Show switches
-still decide which OSD events appear. DDC/CI brightness is **not migrated
-yet**, because its per-display simultaneous value routing requires
-independent XAML hosts; all other unported categories remain on GDI+.
-XAML is currently noninteractive and lacks full animation/opacity parity.
+Branch-only native XAML Island renderer for migrated categories:
+**system volume, native brightness and per-target DDC/CI brightness**.
+The existing XAML toggle selects the migrated renderer (no GDI+ fallback).
+Opacity inherits the original background-opacity setting; Win32 input
+surfaces relay clicks/drags/wheels to the existing audio and brightness
+workers. DDC targets have independent XAML hosts and their original
+monitor identity. Media/mixer/notifications remain GDI+ until migrated.
 
 ## Features
 
@@ -138,8 +137,8 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
         - experimentalXamlVolume: false
           $name: Experimental XAML renderer for migrated OSDs (no fallback)
           $name:zh-TW: XAML 已遷移提示渲染開關（不回退）
-          $description: Control XAML rendering for migrated categories: volume and native brightness. No GDI+ fallback if XAML fails. DDC/CI, media, mixer and other unported categories keep their existing renderer. Individual Show switches remain independent.
-          $description:zh-TW: 直接控制已遷移的音量與 Windows 原生亮度提示，XAML 失敗不回退 GDI+；DDC/CI、媒體、混音器與其他未遷移類別仍用舊渲染器。各項 Show 開關繼續獨立。
+          $description: Controls migrated volume, native brightness and per-display DDC/CI brightness XAML OSDs. No GDI+ fallback. Media, mixer, notifications and other unported categories remain on GDI+; Show toggles stay independent.
+          $description:zh-TW: 直接控制音量、Windows 原生亮度、每螢幕 DDC/CI 亮度的 XAML 渲染；不回退 GDI+。媒體、混音器、提示等尚未遷移類別維持 GDI+，各 Show 開關獨立。
         - showCustomBrightness: false
           $name: Show custom Windows brightness OSD
           $name:zh-TW: 顯示自訂 Windows 亮度 OSD
@@ -727,6 +726,14 @@ struct IDesktopWindowXamlSourceNative : IUnknown {
 constexpr GUID kInteropIID = {
     0x3cbcf1bf, 0x2f76, 0x4e9c,
     {0x96, 0xab, 0xe8, 0x4b, 0x37, 0x97, 0x25, 0x54}};
+// Microsoft IXamlSourceTransparency: Windows.UI.Xaml.Window.Current QI.
+struct IXamlSourceTransparency : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE get_IsBackgroundTransparent(BYTE*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_IsBackgroundTransparent(BYTE) = 0;
+};
+constexpr GUID kTransparencyIID = {
+    0x06636c29, 0x5a17, 0x458d,
+    {0x8e, 0xa2, 0x24, 0x22, 0xd9, 0x97, 0xa9, 0x22}};
 constexpr wchar_t kClass[] = L"Windhawk.FluentOSD.XamlMigration.Host";
 constexpr UINT kShowMessage = WM_APP + 680;
 constexpr UINT kHideMessage = WM_APP + 681;
@@ -741,16 +748,23 @@ std::mutex g_startLock;
 SRWLOCK g_snapshotLock = SRWLOCK_INIT;
 HANDLE g_thread = nullptr;
 
+enum class LevelKind { Volume, NativeBrightness, DdcBrightness };
 struct Snapshot {
+    LevelKind kind = LevelKind::Volume;
+    std::wstring key;       // Nonempty for a physical DDC display/window.
+    HWND receiver = nullptr;
+    WCHAR device[CCHDEVICENAME]{};
+    DWORD physicalIndex = 0, minimum = 0, maximum = 0;
     int percent = 0;
     int rawValue = 0;
     bool valueKnown = true;
     bool muted = false;
     bool brightness = false;
     bool showIcon = true;
+    BYTE backgroundAlpha = 255;
     DWORD durationMs = 3000;
-    RECT anchor{};          // GDI-era positioning canvas in physical pixels.
-    float scale = 1.0f;     // Original DPI * user-defined scale.
+    RECT anchor{};          // Existing placement canvas in physical pixels.
+    float scale = 1.0f;     // Monitor DPI * user-defined size.
     bool vertical = false;
     bool showValue = true;
     int innerPadding = 14;
@@ -758,10 +772,17 @@ struct Snapshot {
     DWORD background = 0x232327, text = 0xf8f8fc;
     DWORD accent = 0x67acff, track = 0x56565c;
 };
-Snapshot g_pending{};
+std::vector<Snapshot> g_pending; // Batched, atomic DDC update across monitors.
 
 struct State {
     HWND host = nullptr, island = nullptr;
+    HWND barInput = nullptr, iconInput = nullptr;
+    bool dragging = false, iconPressed = false;
+    double trackX = 0, trackY = 0, trackW = 0, trackH = 0;
+    double iconX = 0, iconY = 0, iconW = 0, iconH = 0;
+    double scale = 1.0;
+    Snapshot current;
+    std::unordered_map<std::wstring, std::unique_ptr<State>> peers;
     hosting::WindowsXamlManager manager{nullptr};
     hosting::DesktopWindowXamlSource source{nullptr};
     controls::Border card{nullptr};
@@ -783,9 +804,9 @@ struct State {
     double valueSlotWidth = 0.0, valueSlotHeight = 0.0;
     double rawSlotWidth = 0.0, rawSlotHeight = 0.0;
 };
-media::SolidColorBrush Brush(DWORD rgb) {
+media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
     return media::SolidColorBrush(winrt::Windows::UI::Color{
-        255, static_cast<BYTE>(rgb >> 16), static_cast<BYTE>(rgb >> 8),
+        alpha, static_cast<BYTE>(rgb >> 16), static_cast<BYTE>(rgb >> 8),
         static_cast<BYTE>(rgb)});
 }
 
@@ -849,14 +870,12 @@ void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
         state.measuredValueFontSize = valueFontSize;
     }
 }
-void DrawSnapshot(State& state) {
+void DrawSnapshot(State& state, const Snapshot& value) {
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
         !state.fillClip || !state.thumb) return;
-    Snapshot value;
-    AcquireSRWLockShared(&g_snapshotLock);
-    value = g_pending;
-    ReleaseSRWLockShared(&g_snapshotLock);
+    state.current = value;
+    state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
 
     const float scale = std::clamp(value.scale, 0.5f, 6.0f);
     const double logicalW = static_cast<double>(
@@ -877,7 +896,7 @@ void DrawSnapshot(State& state) {
 
     state.canvas.Width(bodyW);
     state.canvas.Height(bodyH);
-    state.card.Background(Brush(value.background));
+    state.card.Background(Brush(value.background, value.backgroundAlpha));
     state.icon.Foreground(Brush(value.text));
     state.value.Foreground(Brush(value.text));
     state.track.Fill(Brush(value.track));
@@ -984,6 +1003,14 @@ void DrawSnapshot(State& state) {
         state.value.TextAlignment(wx::TextAlignment::Center);
         controls::Canvas::SetLeft(state.value, 0.0);
         controls::Canvas::SetTop(state.value, pad);
+        state.trackX = centerX - trackThickness / 2.0;
+        state.trackY = trackTop;
+        state.trackW = trackThickness;
+        state.trackH = length;
+        state.iconX = (bodyW - iconW) / 2.0;
+        state.iconY = iconTop;
+        state.iconW = iconW;
+        state.iconH = iconH;
     } else {
         // One shared axis for outer padding and one shared gap on BOTH
         // sides of the bar. This makes extra custom width flow into the
@@ -1045,6 +1072,14 @@ void DrawSnapshot(State& state) {
             std::max(0.0, valueX));
         controls::Canvas::SetTop(state.value,
             std::max(0.0, (bodyH - labelH) / 2.0));
+        state.trackX = trackX;
+        state.trackY = midY - trackThickness / 2.0;
+        state.trackW = trackW;
+        state.trackH = trackThickness;
+        state.iconX = iconX;
+        state.iconY = std::max(0.0, (bodyH - iconH) / 2.0);
+        state.iconW = iconW;
+        state.iconH = iconH;
     }
 
     if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
