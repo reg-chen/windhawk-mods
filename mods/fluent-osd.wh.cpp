@@ -17,134 +17,76 @@
 /*
 # Fluent OSD
 
-Customizable native XAML Island on-screen displays for Windows 11.
-Choose which Windows indicators to keep or hide and which custom OSDs
-to show. All supported custom OSD categories use XAML; there is no
-legacy GDI+ renderer or renderer toggle.
+Customizable XAML on-screen displays for Windows 11. Choose which native
+Windows indicators to hide and which custom OSDs to show.
 
 ## Features
 
-- **Volume and brightness:** Horizontal or vertical volume and brightness
-  cards with XAML sliders, mouse-wheel support, and optional DDC/CI
-  brightness per physical external monitor.
-- **Media (SMTC):** Album art, track information, playback controls,
-  timeline/seek, shuffle and repeat when exposed by the media session.
-- **Audio mixer:** Master and per-app volume/mute controls, scrollable
-  app rows, and a playback-device selector.
-- **System events:** Caps/Num/Scroll/Insert, keyboard backlight, airplane
-  mode, camera, microphone, virtual desktop, and system text indicators.
-- **Notifications:** Clipboard text/file/image, USB, Bluetooth Classic/LE
-  and network events. Multi-item device notifications can expand to
-  scrollable details.
-- **Appearance and layout:** System/light/dark themes, colors, background
-  brushes, button shapes, dimensions, placement, display routing,
-  fade/visibility timing and English/Traditional Chinese UI.
-
-Main OSD, attached media/mixer panels, and independently addressed DDC
-targets use native XAML Island surfaces. Mirrored OSDs on other monitors
-are view-only; physical DDC targets retain their own monitor identity.
+- **Volume and brightness:** Horizontal or vertical layouts, interactive
+  sliders, mouse-wheel control and optional per-monitor DDC/CI brightness.
+- **Media:** Album art, track details, playback controls, timeline,
+  shuffle and repeat (subject to media-session support).
+- **Audio mixer:** Master and per-app volume/mute controls and playback
+  device selection.
+- **System events:** Lock keys, keyboard backlight, airplane mode,
+  camera, microphone, virtual desktop and other Windows indicators.
+- **Notifications:** Clipboard, USB, Bluetooth and network events.
+- **Appearance:** Themes, colors, custom background brushes, window
+  corner radius, button shapes, sizing, placement, multi-monitor display
+  and visibility timing. English and Traditional Chinese are supported.
 
 ## Getting started
 
-1. Use **Windows native OSD — Hide switches** to select which Windows
-   indicators to suppress.
-2. Enable the corresponding **Custom OSD** switches. Hide and Show are
-   independent, so you can keep both indicators when supported.
-3. Configure appearance, layout, timing and monitor selection as needed.
-   Custom OSD display switches are **disabled by default**.
-
-**Upgrading from the experimental `fluent-osd-xaml` mod:** Disable that
-mod before enabling official `fluent-osd`; both hook the same Explorer
-functions and must not run together. The official Windhawk ID remains
-`fluent-osd`, preserving its existing settings identity.
+1. Configure **Windows native OSD — Hide switches** for indicators you
+   want to suppress.
+2. Enable the corresponding **Custom OSD** switches to display Fluent OSD.
+   Hide and Show are independent; custom displays are off by default.
+3. Adjust appearance, layout and timing to your preference.
 
 ## Custom background brushes
 
-Under **Fluent appearance > Background effect**:
-
-- **Transparency** (default): Existing solid background color with its
-  0–100% opacity setting.
-- **Custom brush**: Enter a *single-line* brush definition, applied
-  directly to the OSD card background (do not include `Fill:=`).
-
-Supported brush examples:
+Under **Fluent appearance > Background effect**, choose **Transparency**
+for a solid color with adjustable opacity, or **Custom brush** to enter
+a single-line brush definition.
 
 | Brush | Example |
 | --- | --- |
 | `SolidColorBrush` | `<SolidColorBrush Color="$mainColor" Opacity="0.8" />` |
 | `AcrylicBrush` | `<AcrylicBrush BackgroundSource="HostBackdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />` |
 | `LinearGradientBrush` | `<LinearGradientBrush StartPoint="0,0" EndPoint="1,1"><GradientStop Color="$mainColor" Offset="0" /><GradientStop Color="#80000000" Offset="1" /></LinearGradientBrush>` |
-| `ImageBrush` | `<ImageBrush ImageSource="C:\Pictures\osd.png" Stretch="UniformToFill" Opacity="0.8" />` |
+| `ImageBrush` | `<ImageBrush ImageSource="C:\\Pictures\\osd.png" Stretch="UniformToFill" Opacity="0.8" />` |
 | `WindhawkBlur` | `<WindhawkBlur BlurAmount="18" TintColor="$mainColor" TintOpacity="0.3" NoiseOpacity="0.02" />` |
 
-Colors accept `#RRGGBB`, `#AARRGGBB`, `$mainColor`,
-`$accentColor`, `$textColor` or `$trackColor`. The variables
-resolve to the current OSD appearance colors.
+Supported color values include `#RRGGBB`, `#AARRGGBB`,
+`$mainColor`, `$accentColor`, `$textColor` and `$trackColor`.
 
-- **LinearGradientBrush:** 2–12 `GradientStop` elements with color and
-  offset; optional start/end points, spread mode and opacity.
-- **ImageBrush:** Absolute local drive paths only (not web URLs);
-  maximum source file 16 MiB, decoded output at most 1024 pixels per side.
-  Background images are cached per OSD surface.
-- **WindhawkBlur:** A module-defined Windows Composition effect, not
-  a standard XAML brush element. Supports `BlurAmount`, `TintColor`,
-  `TintOpacity`, `TintLuminosityOpacity`, `TintSaturation`,
-  `NoiseOpacity`, `NoiseDensity`, `FallbackColor` and `Opacity`.
-  If `FallbackColor` is provided, battery saver or disabled Windows
-  transparency may use a solid fallback. Resources are released
-  with their XAML Island.
-
-Only these brush types and explicitly supported attributes are accepted.
-The parser does not load arbitrary XAML, named colors, theme resources,
-bindings or styling rules. Invalid definitions fall back to the solid
-background. Acrylic rendering depends on Windows transparency policy.
+- **ImageBrush:** Local absolute paths only, files up to 16 MiB;
+  images are decoded to at most 1024 pixels per side.
+- **LinearGradientBrush:** 2–12 gradient stops.
+- **WindhawkBlur:** Supports tint, opacity, blur and noise options.
+- Arbitrary XAML, bindings and unsupported brush attributes are not
+  accepted. Invalid definitions fall back to a solid background.
+  Acrylic effects depend on Windows transparency settings.
 
 ## Compatibility and limitations
 
-- Windows 11 x64. Hooks run in Explorer; DDC brightness also integrates
-  with supported **Taskbar Scroll Actions** and **Twinkle Tray** input.
-  DDC/CI requires a capable monitor and brightness write path.
-- The mixer playback-device selector changes Windows default **Console**
-  and **Multimedia** endpoints, not the separate **Communications**
-  endpoint. It uses the undocumented `IPolicyConfig` interface.
-- Media/device events depend on Windows, its drivers and active sessions.
-  Bluetooth disconnect events are not guaranteed; no continuous GATT
-  polling is performed.
-- Previous GDI-specific bar thickness, thumb diameter and icon stroke
-  options are not used by the new native XAML controls.
-- If XAML initialization fails, there is no GDI+ visual fallback.
-  Windows updates may change Shell hook symbols or undocumented APIs.
-
-## Shell-safe XAML startup
-
-Native hooks start immediately; the XAML renderer initializes only after
-the taskbar's InputSite is available beneath its XAML content bridge.
-Following the event-discovery pattern used by Taskbar Volume Control
-and Taskbar Scroll Actions, this mod observes `CreateWindowInBand` and
-notifies its controller asynchronously. A one-time check also covers
-reloading the mod after the taskbar already exists. No readiness polling
-or fixed delay is used. This relies on undocumented Shell window classes;
-Windows-version compatibility is not guaranteed.
-
-## OSD window corners
-
-Use **Custom OSD > Fluent appearance > OSD window corner radius** to
-choose a radius from 0 to 34 logical pixels (default 17). The setting
-affects the visible XAML card of all custom OSD categories, including
-volume, brightness, SMTC, mixer, DDC and system notifications.
-Windows DWM host-window corner rounding is deliberately disabled to
-prevent a second, conflicting clip; the visible XAML border owns the
-user-configured corner radius.
+- Windows 11 x64. DDC/CI brightness requires a compatible monitor and
+  works with supported Taskbar Scroll Actions and Twinkle Tray input.
+- Audio output selection changes the default **Console** and
+  **Multimedia** devices, not the **Communications** device.
+- Media and device notifications depend on the information provided by
+  Windows and connected hardware; Bluetooth disconnect notifications
+  may not always be available.
+- Windows updates may affect compatibility with Shell integrations.
 
 ## Credits and license
 
 Copyright (c) Reg Chen. Licensed under **GPL-3.0**.
 
-The `WindhawkBlur` Composition effect is adapted from
+The `WindhawkBlur` effect is adapted from
 [diogonevesofc/taskbar-styler](https://github.com/diogonevesofc/taskbar-styler)
 (GPL-3.0-or-later), which credits Windhawk Styler and TranslucentTB.
-No third-party UI asset files are bundled. External project and
-product names/trademarks belong to their owners.
+External project and product names/trademarks belong to their owners.
 */
 // ==/WindhawkModReadme==
 
