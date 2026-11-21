@@ -730,6 +730,7 @@ namespace {
 // Presentation-independent input arithmetic. Both the legacy GDI+
 // controls and migrated XAML controls use these same normalized units.
 namespace osd_input {
+constexpr int kWheelStepPercent = 5; // Unified notch size for level and Mixer.
 int TrackPercent(double pointer, double origin, double span, bool reverse) {
     if (!std::isfinite(pointer) || !std::isfinite(origin) ||
         !std::isfinite(span) || span <= 0.0) return 0;
@@ -1239,6 +1240,7 @@ struct State {
     controls::ScrollViewer mixerRowsScroll{nullptr},
                            mixerOutputsScroll{nullptr};
     bool mixerPopulating = false, mixerPeerOpen = false;
+    int mixerWheelRow = -1, mixerWheelRemainder = 0;
     State* pairedMixer = nullptr;  // STA-only, owned by root.peers.
     State* pairedVolume = nullptr; // STA-only, root owns this State.
     bool noticeExpanded = false;
@@ -1964,6 +1966,11 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         !state.mixerRows || !state.mixerRowsScroll ||
         !state.mixerOutputs || !state.mixerOutputsScroll) return;
     state.mixerPopulating = true;
+    if (state.current.kind != LevelKind::Mixer ||
+        state.current.mixer.generation != data.mixer.generation) {
+        state.mixerWheelRow = -1;
+        state.mixerWheelRemainder = 0;
+    }
     state.current = data;
     const auto frame = osd_layout::LevelFrame(data);
     const double w = frame.width, h = frame.height;
@@ -2167,6 +2174,41 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
                                index, percent);
                 ArmInteractionTimer(state, true);
             });
+        // Slider/ScrollViewer can mark PointerWheelChanged as handled.
+        // Observe handled events on the hovered Slider specifically,
+        // without stealing wheel scrolling from the remaining Mixer list.
+        slider.AddHandler(
+            wx::UIElement::PointerWheelChangedEvent(),
+            winrt::box_value(xinput::PointerEventHandler(
+                [&state, index, slider](
+                        auto const&, xinput::PointerRoutedEventArgs const& args) {
+                    if (state.mixerPopulating ||
+                        state.current.kind != LevelKind::Mixer ||
+                        index >= static_cast<int>(state.current.mixer.rows.size()) ||
+                        !slider.IsEnabled()) return;
+                    const int delta = args.GetCurrentPoint(slider)
+                        .Properties().MouseWheelDelta();
+                    if (!delta) return;
+                    if (state.mixerWheelRow != index) {
+                        state.mixerWheelRow = index;
+                        state.mixerWheelRemainder = 0;
+                    }
+                    const int steps = osd_input::ConsumeWheelSteps(
+                        delta, state.mixerWheelRemainder);
+                    if (steps) {
+                        const int current = static_cast<int>(std::lround(
+                            std::clamp(slider.Value(), 0.0, 100.0)));
+                        const int next = std::clamp(
+                            current + steps * osd_input::kWheelStepPercent,
+                            0, 100);
+                        if (next != current) slider.Value(next);
+                        // ValueChanged owns immediate % feedback and the
+                        // existing typed command to Core Audio.
+                    }
+                    ArmInteractionTimer(state, true);
+                    args.Handled(true);
+                })),
+            true);
         row.Children().Append(slider);
         row.Children().Append(label);
         state.mixerRows.Children().Append(row);
@@ -3041,7 +3083,7 @@ constexpr float kOutputPickerHeight = 28.0f;
 constexpr float kOutputPickerMenuTop = 42.0f;
 constexpr float kOutputPickerRowHeight = 30.0f;
 constexpr int kOutputPickerMaxRows = 4;
-constexpr int kWheelStepPercent = 5;  // One standard notch; leave high-res deltas accumulated.
+constexpr int kWheelStepPercent = osd_input::kWheelStepPercent; // Shared with XAML.
 constexpr UINT kNativeOsdMessage = WM_APP + 320;
 constexpr UINT kMediaUpdateMessage = WM_APP + 321;
 constexpr UINT kLockToggleMessage = WM_APP + 322;
