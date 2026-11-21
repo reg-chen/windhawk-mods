@@ -954,10 +954,14 @@ void HideSurface(State& state) {
     }
     state.statusLineAnimating = false;
     state.noticeExpanded = false;
-    // Clipboard image bytes must not persist after the flyout disappears.
-    if (state.clipboardImage) state.clipboardImage.Source(nullptr);
-    state.current.clipboardPixels.clear();
-    state.current.clipboardPixels.shrink_to_fit();
+    // Drop the STA image source on dismissal without letting an optional
+    // COM failure unwind through Explorer's HWND/teardown callback.
+    if (state.clipboardImage) {
+        try { state.clipboardImage.Source(nullptr); }
+        catch (...) { /* The Island may already be closing. */ }
+    }
+    // Reclaim the bounded clipboard payload without shrink_to_fit allocation.
+    std::vector<uint8_t>{}.swap(state.current.clipboardPixels);
     if (state.canvas) state.canvas.ReleasePointerCaptures();
     // CaptureLost may invoke the shared interaction callback and restart
     // the inactivity timer. Cancel once more before hiding the HWND.
