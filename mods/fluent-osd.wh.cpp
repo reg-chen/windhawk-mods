@@ -798,6 +798,7 @@ struct State {
     HWND host = nullptr, island = nullptr;
     HWND barInput = nullptr, iconInput = nullptr;
     bool dragging = false, iconPressed = false;
+    int wheelRemainder = 0;
     double trackX = 0, trackY = 0, trackW = 0, trackH = 0;
     double iconX = 0, iconY = 0, iconW = 0, iconH = 0;
     double scale = 1.0;
@@ -973,8 +974,11 @@ bool HandleInputWindow(State& state, HWND hwnd, UINT message,
         }
         case WM_MOUSEWHEEL:
             if (bar) {
-                SendInput(state, InputAction::Wheel,
-                    GET_WHEEL_DELTA_WPARAM(wp));
+                state.wheelRemainder += GET_WHEEL_DELTA_WPARAM(wp);
+                const int steps = state.wheelRemainder / WHEEL_DELTA;
+                state.wheelRemainder %= WHEEL_DELTA;
+                if (steps)
+                    SendInput(state, InputAction::Wheel, steps * WHEEL_DELTA);
                 if (state.host) {
                     KillTimer(state.host, kHideTimer);
                     SetTimer(state.host, kHideTimer,
@@ -1068,6 +1072,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
         !state.fillClip || !state.thumb) return;
+    if (state.current.kind != value.kind) state.wheelRemainder = 0;
     state.current = value;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
 
@@ -5342,7 +5347,8 @@ void DisplayDdcBatch() {
         IsWindowVisible(g_popupWnd) && g_visible.device[0]) {
         auto current = std::find_if(events.begin(), events.end(),
             [&](const BrightnessEvent& event) {
-                return _wcsicmp(event.device, g_visible.device) == 0;
+                return event.physicalIndex == g_visible.physicalIndex &&
+                       _wcsicmp(event.device, g_visible.device) == 0;
             });
         if (current != events.end()) {
             master = *current;
@@ -5388,7 +5394,8 @@ void DisplayDdcBatch() {
             }
             g_ddcLastUnresolved[0] = L'\0';
             const auto sameDevice = [&](const DdcTargetState& state) {
-                return _wcsicmp(state.event.device, ev.device) == 0;
+                return state.event.physicalIndex == ev.physicalIndex &&
+                       _wcsicmp(state.event.device, ev.device) == 0;
             };
             auto it = std::find_if(g_ddcTargets.begin(),
                                    g_ddcTargets.end(), sameDevice);
@@ -7997,13 +8004,17 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (success) g_lastConfirmedNativeBrightness = g_nativePercent;
             else if (g_lastConfirmedNativeBrightness >= 0) {
                 g_nativePercent = g_lastConfirmedNativeBrightness;
-                RenderPopup();
+                if (g_xamlForMigrated.load() &&
+                    g_popupKind == PopupKind::NativeBrightness)
+                    ShowMigratedXamlLevel(PopupKind::NativeBrightness);
+                else RenderPopup();
                 Wh_Log(L"Native brightness wheel write failed; restored value");
             }
         } else if (g_xamlForMigrated.load() &&
-                   g_popupKind == PopupKind::DdcBrightness &&
-                   g_xamlPendingDdcGeneration == static_cast<DWORD>(wp)) {
-            // Roll back only the target whose write failed. Never replace
+                   g_popupKind == PopupKind::DdcBrightness) {
+            // Roll back only the target whose write failed.
+            if (g_xamlPendingDdcGeneration != static_cast<DWORD>(wp))
+                return 0; Never replace
             // another monitor's value with a global DDC confirmation.
             const auto target = std::find_if(
                 g_ddcTargets.begin(), g_ddcTargets.end(),
