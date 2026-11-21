@@ -47,14 +47,14 @@ Windows indicators to hide and which custom OSDs to show.
 
 Under **Fluent appearance > Background effect**, choose **Transparency**
 for a solid color with adjustable opacity, or **Custom brush** to enter
-a single-line brush definition.
+a single-line brush definition (without `Fill:=`).
 
 | Brush | Example |
 | --- | --- |
 | `SolidColorBrush` | `<SolidColorBrush Color="$mainColor" Opacity="0.8" />` |
 | `AcrylicBrush` | `<AcrylicBrush BackgroundSource="HostBackdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />` |
 | `LinearGradientBrush` | `<LinearGradientBrush StartPoint="0,0" EndPoint="1,1"><GradientStop Color="$mainColor" Offset="0" /><GradientStop Color="#80000000" Offset="1" /></LinearGradientBrush>` |
-| `ImageBrush` | `<ImageBrush ImageSource="C:\\Pictures\\osd.png" Stretch="UniformToFill" Opacity="0.8" />` |
+| `ImageBrush` | `<ImageBrush ImageSource="C:\Pictures\osd.png" Stretch="UniformToFill" Opacity="0.8" />` |
 | `WindhawkBlur` | `<WindhawkBlur BlurAmount="18" TintColor="$mainColor" TintOpacity="0.3" NoiseOpacity="0.02" />` |
 
 Supported color values include `#RRGGBB`, `#AARRGGBB`,
