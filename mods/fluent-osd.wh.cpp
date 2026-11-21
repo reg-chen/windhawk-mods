@@ -727,7 +727,7 @@ constexpr GUID kInteropIID = {
     0x3cbcf1bf, 0x2f76, 0x4e9c,
     {0x96, 0xab, 0xe8, 0x4b, 0x37, 0x97, 0x25, 0x54}};
 // Microsoft IXamlSourceTransparency: Windows.UI.Xaml.Window.Current QI.
-struct IXamlSourceTransparency : IUnknown {
+struct IXamlSourceTransparency : IInspectable {
     virtual HRESULT STDMETHODCALLTYPE get_IsBackgroundTransparent(BYTE*) = 0;
     virtual HRESULT STDMETHODCALLTYPE put_IsBackgroundTransparent(BYTE) = 0;
 };
@@ -988,6 +988,18 @@ bool HandleInputWindow(State& state, HWND hwnd, UINT message,
             state.iconPressed = false;
             result = 0; return true;
         case WM_ERASEBKGND: result = TRUE; return true;
+        case WM_PAINT: {
+            // Layered input HWND needs opaque source pixels so Windows
+            // hit-tests it; LWA_ALPHA=1 leaves it visually imperceptible.
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(hwnd, &ps);
+            if (dc) {
+                FillRect(dc, &ps.rcPaint,
+                    reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+                EndPaint(hwnd, &ps);
+            }
+            result = 0; return true;
+        }
     }
     return false;
 }
@@ -1294,13 +1306,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.16: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.17: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.16: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.17: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     ShowWindow(hwnd, SW_HIDE);
@@ -1602,7 +1614,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.16: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.17: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -7983,6 +7995,35 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RenderPopup();
                 Wh_Log(L"Native brightness wheel write failed; restored value");
             }
+        } else if (g_xamlForMigrated.load() &&
+                   g_popupKind == PopupKind::DdcBrightness &&
+                   g_xamlPendingDdcGeneration == static_cast<DWORD>(wp)) {
+            // Roll back only the target whose write failed. Never replace
+            // another monitor's value with a global DDC confirmation.
+            const auto target = std::find_if(
+                g_ddcTargets.begin(), g_ddcTargets.end(),
+                [&](const DdcTargetState& item) {
+                    return item.event.physicalIndex ==
+                            g_xamlPendingDdcWrite.physicalIndex &&
+                        _wcsicmp(item.event.device,
+                                g_xamlPendingDdcWrite.device) == 0;
+                });
+            if (!success) {
+                if (target != g_ddcTargets.end())
+                    target->event.value = g_xamlPendingDdcPrevious;
+                if (g_visible.physicalIndex ==
+                        g_xamlPendingDdcWrite.physicalIndex &&
+                    _wcsicmp(g_visible.device,
+                              g_xamlPendingDdcWrite.device) == 0)
+                    g_visible.value = g_xamlPendingDdcPrevious;
+                Wh_Log(L"XAML v1.0.17: DDC write failed for '%s' index %lu",
+                    g_xamlPendingDdcWrite.device,
+                    g_xamlPendingDdcWrite.physicalIndex);
+                (void)ShowXamlDdcTargets(g_visible);
+            } else if (target != g_ddcTargets.end()) {
+                g_lastConfirmedDdcBrightness = target->event.value;
+            }
+            g_xamlPendingDdcGeneration = 0;
         } else {
             if (success) g_lastConfirmedDdcBrightness = g_visible.value;
             else {
@@ -8729,7 +8770,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.16 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.17 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
