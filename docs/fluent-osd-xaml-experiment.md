@@ -549,6 +549,13 @@ each OSD type.
   `experimentalXamlVolume`. USB, Bluetooth, network, clipboard, native
   non-level events, Mixer and SMTC are **not** migrated in this increment.
   A status card does **not** imply those other notification categories use XAML.
+- **Lock status indicator motion:** ON expands from 35% to 100% of the
+  live text-column width; OFF contracts back to 35%, centered throughout.
+  Width and alpha use the same 220 ms cubic easing on the existing XAML
+  STA. A new toggle samples the interpolated ratio before reversing, so
+  rapid events do not jump to the prior endpoint. Hide, surface switch
+  and unload cancel the status animation timer. The corner-safe bottom
+  clearance remains calculated from card padding and radius.
 - **Validation pending:** compile v1.0.20 in Windhawk and toggle each of
   Caps/Num/Scroll/Insert ON then OFF. Check all four symbols, even spacing,
   opacity 20/60/96%, theme and font changes, fade and position at multiple
