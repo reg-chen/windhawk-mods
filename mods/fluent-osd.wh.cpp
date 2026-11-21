@@ -1231,16 +1231,17 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     controls::Canvas::SetTop(state.statusTitle, top);
     controls::Canvas::SetLeft(state.statusDetail, textX);
     controls::Canvas::SetTop(state.statusDetail, top + titleFont * 1.43 + lineGap);
-    // The state line is intentionally asymmetric: ON spans the available
-    // text column, OFF is a short dash. Both share the same left anchor.
-    // Width remains proportional to the live card size, not fixed pixels.
-    state.statusUnderline.Width(value.statusActive ? textW : textW * .35);
+    // ON spans the text column; OFF is shorter. Center both under the
+    // title/detail column using the actual computed underline width.
+    const double underlineW = value.statusActive ? textW : textW * .35;
+    state.statusUnderline.Width(underlineW);
     state.statusUnderline.Height(lineHeight);
     state.statusUnderline.RadiusX(lineHeight / 2.0);
     state.statusUnderline.RadiusY(lineHeight / 2.0);
     state.statusUnderline.Fill(Brush(value.accent,
         value.statusActive ? 255 : 145));
-    controls::Canvas::SetLeft(state.statusUnderline, textX);
+    controls::Canvas::SetLeft(state.statusUnderline,
+        textX + (textW - underlineW) / 2.0);
     controls::Canvas::SetTop(state.statusUnderline, underlineTop);
     ShowPositionedSurface(state, value, insetX, insetY, bodyW, bodyH);
 }
