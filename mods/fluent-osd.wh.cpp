@@ -1378,7 +1378,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // The input overlays share this WndProc but must NEVER resize
             // the actual XAML island when their hit rectangles change.
             if (state && hwnd == state->host &&
-                state->island && wp != SIZE_MINIMIZED
+                state->island && wp != SIZE_MINIMIZED)
                 SetWindowPos(state->island, nullptr, 0, 0,
                     LOWORD(lp), HIWORD(lp),
                     SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1390,8 +1390,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_CLOSE:
             // A hit surface or DDC peer must not terminate the STA.
-            if (state && (hwnd != state->host ||
-                          !state->current.key.empty())) {
+            if (state && hwnd != state->host) {
+                ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            }
+            if (state && !state->current.key.empty()) {
                 HideSurface(*state);
                 return 0;
             }
