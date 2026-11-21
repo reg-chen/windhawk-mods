@@ -3,13 +3,13 @@
 // @name            Fluent OSD (XAML)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.31
+// @version         1.0.32
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
 // @include         Twinkle Tray.exe
 // @architecture    x86-64
-// @compilerOptions -lgdi32 -luser32 -lshcore -ladvapi32 -lole32 -luuid -lshell32 -lsetupapi -liphlpapi -loleaut32 -lruntimeobject -lwindowsapp -ldwmapi
+// @compilerOptions -lgdi32 -luser32 -lshcore -ladvapi32 -lole32 -luuid -lshell32 -lsetupapi -liphlpapi -loleaut32 -lruntimeobject -lwindowsapp -ldwmapi -DWIN32_LEAN_AND_MEAN
 // @license         GPL-3.0
 // ==/WindhawkMod==
 
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML-only renderer (v1.0.31)
+## XAML-only renderer (v1.0.32)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -334,10 +334,48 @@ belong to their owners.
           - light: 淺色
           - dark: 深色
         - ddcBorderless: true
-          $name: Borderless DDC/CI OSD (no outline or shadow)
-          $name:zh-TW: 無邊框 DDC/CI OSD（無外框或陰影）
-          $description: Matches the border/shadow behavior of Notification Center Styler's Borderless theme. Only this custom OSD is affected; no automatic cross-mod theme sync.
-          $description:zh-TW: 外框／陰影行為參考 Notification Center Styler 的 Borderless 主題。只影響此自訂 OSD，不會自動與其他 Mod 同步主題。
+          $name: Borderless custom OSD cards
+          $name:zh-TW: 自訂 OSD 卡片無邊框
+          $description: Removes the XAML card outline for all custom OSD categories. Does not control other mods.
+          $description:zh-TW: 移除所有自訂 OSD 類別的 XAML 卡片外框，不影響其他 Mod。
+        - ddcBackgroundMode: system
+          $name: Background color source
+          $name:zh-TW: 背景顏色來源
+          $options:
+          - system: Follow light/dark theme
+          - custom: Custom color
+          $options:zh-TW:
+          - system: 跟隨淺色／深色主題
+          - custom: 自訂顏色
+        - ddcCustomBackground: "#28282C"
+          $name: Custom background color (#RRGGBB)
+          $name:zh-TW: 自訂背景顏色（#RRGGBB）
+          #! $showIf: {ddcBackgroundMode: custom}
+          #! $format: colorRgb
+        - ddcBackgroundEffect: opacity
+          $name: Background effect
+          $name:zh-TW: 背景效果
+          $description: Preserve the existing solid opacity, or use one restricted custom brush definition.
+          $description:zh-TW: 保留原有純色不透明度，或改用單一受限制的自訂筆刷定義。
+          $options:
+          - opacity: Transparency
+          - custom: Custom brush
+          $options:zh-TW:
+          - opacity: 透明度
+          - custom: 自訂筆刷
+        - ddcBackgroundOpacity: 96
+          $name: Background opacity (%)
+          $name:zh-TW: 背景不透明度（%）
+          #! $showIf: {ddcBackgroundEffect: opacity}
+          #! $min: 0
+          #! $max: 100
+          #! $format: slider
+        - ddcCustomBrush: '<AcrylicBrush BackgroundSource="HostBackdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />'
+          $name: Custom background brush (single-line)
+          $name:zh-TW: 自訂背景筆刷（單行）
+          $description: Supports AcrylicBrush, SolidColorBrush, LinearGradientBrush, local ImageBrush and WindhawkBlur. Invalid definitions fall back to solid.
+          $description:zh-TW: 支援 AcrylicBrush、SolidColorBrush、LinearGradientBrush、ImageBrush（本機圖片）和 WindhawkBlur；無效時回退純色。
+          #! $showIf: {ddcBackgroundEffect: custom}
         - ddcAccentMode: system
           $name: Progress bar color source
           $name:zh-TW: 進度條顏色來源
@@ -354,19 +392,19 @@ belong to their owners.
           $description:zh-TW: 只有進度條顏色來源設為自訂時才使用。無效的十六進位色碼會回退至系統強調色。
           #! $showIf: {ddcAccentMode: custom}
           #! $format: colorRgb
-        - ddcBackgroundMode: system
-          $name: Background color source
-          $name:zh-TW: 背景顏色來源
+        - ddcTrackMode: system
+          $name: Progress track color
+          $name:zh-TW: 進度軌道顏色
           $options:
           - system: Follow light/dark theme
           - custom: Custom color
           $options:zh-TW:
           - system: 跟隨淺色／深色主題
           - custom: 自訂顏色
-        - ddcCustomBackground: "#28282C"
-          $name: Custom background color (#RRGGBB)
-          $name:zh-TW: 自訂背景顏色（#RRGGBB）
-          #! $showIf: {ddcBackgroundMode: custom}
+        - ddcCustomTrack: "#5A5A60"
+          $name: Custom track color (#RRGGBB)
+          $name:zh-TW: 自訂軌道顏色（#RRGGBB）
+          #! $showIf: {ddcTrackMode: custom}
           #! $format: colorRgb
         - ddcTextMode: system
           $name: Text and icon color (Light theme defaults to dark text)
@@ -382,44 +420,6 @@ belong to their owners.
           $name:zh-TW: 自訂文字及圖示顏色（#RRGGBB）
           #! $showIf: {ddcTextMode: custom}
           #! $format: colorRgb
-        - ddcTrackMode: system
-          $name: Progress track color
-          $name:zh-TW: 進度軌道顏色
-          $options:
-          - system: Follow light/dark theme
-          - custom: Custom color
-          $options:zh-TW:
-          - system: 跟隨淺色／深色主題
-          - custom: 自訂顏色
-        - ddcCustomTrack: "#5A5A60"
-          $name: Custom track color (#RRGGBB)
-          $name:zh-TW: 自訂軌道顏色（#RRGGBB）
-          #! $showIf: {ddcTrackMode: custom}
-          #! $format: colorRgb
-        - ddcBackgroundEffect: opacity
-          $name: Background effect
-          $name:zh-TW: 背景效果
-          $description: Preserve the existing solid opacity, or use one restricted custom brush definition.
-          $description:zh-TW: 保留原有純色不透明度，或改用單一受限制的自訂筆刷定義。
-          $options:
-          - opacity: Transparency
-          - custom: Custom brush
-          $options:zh-TW:
-          - opacity: 透明度
-          - custom: 自訂筆刷
-        - ddcCustomBrush: '<AcrylicBrush BackgroundSource="HostBackdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />'
-          $name: Custom background brush (single-line)
-          $name:zh-TW: 自訂背景筆刷（單行）
-          $description: Supports AcrylicBrush, SolidColorBrush, LinearGradientBrush, local ImageBrush and WindhawkBlur. Invalid definitions fall back to solid.
-          $description:zh-TW: 支援 AcrylicBrush、SolidColorBrush、LinearGradientBrush、ImageBrush（本機圖片）和 WindhawkBlur；無效時回退純色。
-          #! $showIf: {ddcBackgroundEffect: custom}
-        - ddcBackgroundOpacity: 96
-          $name: Background opacity (%)
-          $name:zh-TW: 背景不透明度（%）
-          #! $showIf: {ddcBackgroundEffect: opacity}
-          #! $min: 0
-          #! $max: 100
-          #! $format: slider
         - ddcCornerRadius: 17
           $name: Card corner radius (logical px)
           $name:zh-TW: 卡片圓角半徑（邏輯像素）
@@ -464,8 +464,8 @@ belong to their owners.
           $name: Show sun icon
           $name:zh-TW: 顯示太陽圖示
         - ddcShowValue: true
-          $name: Show brightness value
-          $name:zh-TW: 顯示亮度數值
+          $name: Show volume / brightness value
+          $name:zh-TW: 顯示音量／亮度數值
         - ddcInnerPadding: 14
           $name: Vertical OSD interior padding (logical px)
           $name:zh-TW: 垂直 OSD 內容內距（邏輯像素）
@@ -619,14 +619,20 @@ belong to their owners.
           $name:zh-TW: 使用垂直音量與亮度版面
           $description: Layout only; it does not enable Windows custom volume or brightness OSDs. Other native-event replacements retain compact icon-and-state cards.
           $description:zh-TW: 此選項只改變版面，不會啟用自訂 Windows 音量或亮度 OSD。其他原生事件的自訂提示仍維持精簡圖示及狀態卡片。
-        - fadeOsd: true
-          $name: Enable custom OSD fade animation
-          $name:zh-TW: 啟用自訂 OSD 淡入淡出動畫
         - ddcSizePercent: 75
           $name: Custom OSD size (%)
           $name:zh-TW: 自訂 OSD 大小（%）
           $description: Overall uniform scale applied after the configurable logical width/height and monitor DPI. Does not change the aspect ratio of either layout.
           $description:zh-TW: 在可設定的邏輯寬高及螢幕 DPI 之後套用整體等比縮放，不會改變任何版面的長寬比例。
+        - fadeOsd: true
+          $name: Enable custom OSD fade animation
+          $name:zh-TW: 啟用自訂 OSD 淡入淡出動畫
+        - fadeDurationMs: 160
+          $name: Fade duration (ms)
+          $name:zh-TW: 淡入淡出時間（毫秒）
+          #! $showIf: {fadeOsd: true}
+          #! $min: 60
+          #! $max: 450
         - displayOutputMode: source
           $name: OSD display output
           $name:zh-TW: OSD 顯示螢幕
@@ -683,13 +689,8 @@ belong to their owners.
           $name:zh-TW: 垂直位移（邏輯像素；向下為正）
           #! $min: -500
           #! $max: 500
-        - fadeDurationMs: 160
-          $name: Fade duration (ms)
-          $name:zh-TW: 淡入淡出時間（毫秒）
-          #! $min: 60
-          #! $max: 450
-      $name: Position and size
-      $name:zh-TW: 位置與大小
+      $name: Layout, display and animation
+      $name:zh-TW: 版面、顯示螢幕與動畫
   $name: 2. Custom OSD
   $name:zh-TW: 2. 自訂 OSD
   $description: A Show switch controls only its own custom flyout. Native visibility is controlled exclusively by the native Hide switches above; when Hide is off and Show is on, both native and custom OSDs will appear.
@@ -1679,6 +1680,11 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
 // diogonevesofc/taskbar-styler, based on upstream Windhawk / TranslucentTB.
 // No general style engine, theme-resource parser or XamlReader.
 namespace osd_blur {
+// Rec. 709 luminance coefficients used by the saturation and luminosity
+// matrices. Keep them together with the effect graph when porting.
+constexpr float kLumaR = 0.2126f;
+constexpr float kLumaG = 0.7152f;
+constexpr float kLumaB = 0.0722f;
 namespace wf = winrt::Windows::Foundation;
 namespace wge = winrt::Windows::Graphics::Effects;
 namespace awge = ABI::Windows::Graphics::Effects;
@@ -1691,8 +1697,8 @@ struct GaussianBlurEffect
                         awge::IGraphicsEffectD2D1Interop> {
     wge::IGraphicsEffectSource Source{nullptr};
     float BlurAmount = 0.0f;
-    D2D1_GAUSSIANBLUR_OPTIMIZATION Optimization =
-        D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED;
+    MY_D2D1_GAUSSIANBLUR_OPTIMIZATION Optimization =
+        MY_D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED;
     D2D1_BORDER_MODE BorderMode = D2D1_BORDER_MODE_SOFT;
 
     winrt::hstring Name() const noexcept { return m_name; }
@@ -3298,7 +3304,7 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
     if (!SetWindowPos(state.host, HWND_TOPMOST,
                        placed.x, placed.y, placed.width, placed.height,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.31: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.32: show failed (%lu)", GetLastError());
         return;
     }
     if (!wasVisible) {
@@ -4625,13 +4631,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.31: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.32: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.31: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.32: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
@@ -4953,7 +4959,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     // Island; the XAML Border provides the only visible card background.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
-    Wh_Log(L"XAML v1.0.31: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+    Wh_Log(L"XAML v1.0.32: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
         static_cast<unsigned long>(rounded),
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
@@ -5020,7 +5026,7 @@ void CloseSurface(State& state) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.31: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.32: island close failed"); }
         state.source = nullptr;
     }
     state.island = nullptr;
@@ -5068,7 +5074,7 @@ void DeliverPending(State& root) {
             peer->viewOnly = readOnly;
             try { CreateSurface(*peer, GetModuleHandleW(nullptr)); }
             catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.31: peer create failed 0x%08lX",
+                Wh_Log(L"XAML v1.0.32: peer create failed 0x%08lX",
                     static_cast<unsigned long>(ex.code()));
                 CloseSurface(*peer);
                 return nullptr;
@@ -5115,7 +5121,7 @@ void TryEnableIslandTransparency() {
     try {
         auto currentWindow = wx::Window::Current();
         if (!currentWindow) {
-            Wh_Log(L"XAML v1.0.31: Window.Current unavailable for transparency");
+            Wh_Log(L"XAML v1.0.32: Window.Current unavailable for transparency");
             return;
         }
         ComPtr<IXamlSourceTransparency> transparency;
@@ -5124,10 +5130,10 @@ void TryEnableIslandTransparency() {
             reinterpret_cast<void**>(transparency.GetAddressOf()));
         if (SUCCEEDED(hr) && transparency)
             hr = transparency->put_IsBackgroundTransparent(1);
-        Wh_Log(L"XAML v1.0.31: Island transparency HRESULT=0x%08lX",
+        Wh_Log(L"XAML v1.0.32: Island transparency HRESULT=0x%08lX",
             static_cast<unsigned long>(hr));
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.31: transparency initialization exception 0x%08lX",
+        Wh_Log(L"XAML v1.0.32: transparency initialization exception 0x%08lX",
             static_cast<unsigned long>(ex.code()));
     }
 }
@@ -5160,7 +5166,7 @@ DWORD WINAPI ThreadProc(void*) {
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.31: renderer ready (per-display DDC)");
+                Wh_Log(L"XAML v1.0.32: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -5169,11 +5175,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.31: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.32: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.31: unexpected startup exception");
+        Wh_Log(L"XAML v1.0.32: unexpected startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -5189,7 +5195,7 @@ DWORD WINAPI ThreadProc(void*) {
     CloseSurface(root);
     if (root.manager) {
         try { root.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.31: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.32: manager close failed"); }
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
@@ -5203,7 +5209,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.31: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.32: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -7718,7 +7724,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
                 FindMonitorByDeviceName(target.event.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
-                Wh_Log(L"XAML v1.0.31: unresolved DDC display '%s'",
+                Wh_Log(L"XAML v1.0.32: unresolved DDC display '%s'",
                        target.event.device);
                 continue;
             }
@@ -7731,13 +7737,13 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
             push(master, anchor, g_scale);
     }
     if (batch.empty()) {
-        Wh_Log(L"XAML v1.0.31: no resolvable DDC snapshots");
+        Wh_Log(L"XAML v1.0.32: no resolvable DDC snapshots");
         xaml_osd::Hide();
         return false;
     }
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.31: DDC batch not delivered");
+        Wh_Log(L"XAML v1.0.32: DDC batch not delivered");
     return ok;
 }
 
@@ -8778,7 +8784,7 @@ void ShowMigratedXamlLockStatus() {
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.31: lock status missing placement anchor");
+        Wh_Log(L"XAML v1.0.32: lock status missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -8789,7 +8795,7 @@ void ShowMigratedXamlLockStatus() {
         ? Tr(OsdText::On) : Tr(OsdText::Off);
     snapshot.statusActive = g_lastLockValue;
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.31: lock status unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.32: lock status unavailable; NO GDI+ fallback");
 }
 
 // Entire USB/Bluetooth/network category: single-item notifications and
@@ -8800,7 +8806,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.31: device notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.32: device notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -8818,7 +8824,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
         default: return;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.31: device notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.32: device notice unavailable; NO GDI+ fallback");
 }
 
 // A native system event already has one immutable display payload; use
@@ -8828,7 +8834,7 @@ void ShowMigratedXamlNativeEvent() {
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.31: native event missing placement anchor");
+        Wh_Log(L"XAML v1.0.32: native event missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -8886,7 +8892,7 @@ void ShowMigratedXamlNativeEvent() {
             return;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.31: native event unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.32: native event unavailable; NO GDI+ fallback");
 }
 
 // Convert the already-downscaled clipboard HBITMAP into a private, bounded
@@ -8934,7 +8940,7 @@ void ShowMigratedXamlClipboardNotice() {
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         ClearClipboardThumbnail();
-        Wh_Log(L"XAML v1.0.31: clipboard notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.32: clipboard notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -8959,7 +8965,7 @@ void ShowMigratedXamlClipboardNotice() {
         snapshot.scale = g_scale;
     }
     if (!ShowXamlMirrored(snapshot))
-        Wh_Log(L"XAML v1.0.31: clipboard notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.32: clipboard notice unavailable; NO GDI+ fallback");
 }
 
 
@@ -9572,7 +9578,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (target != g_ddcTargets.end())
                     target->event.value = write.previousValue;
                 if (master) g_visible.value = write.previousValue;
-                Wh_Log(L"XAML v1.0.31: DDC write failed for '%s' index %lu",
+                Wh_Log(L"XAML v1.0.32: DDC write failed for '%s' index %lu",
                     write.event.device, write.event.physicalIndex);
                 if (g_popupKind == PopupKind::DdcBrightness)
                     (void)ShowXamlDdcTargets(g_visible);
