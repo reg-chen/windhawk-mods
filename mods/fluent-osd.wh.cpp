@@ -1229,6 +1229,10 @@ void HideSurface(State& state) {
     state.dragging = state.iconPressed = state.pointerActive = false;
     state.fading = state.fadeOut = false;
     if (state.host) ShowWindow(state.host, SW_HIDE);
+    // Mirror the native panel's lifetime in its UI-thread controller.
+    // The action is idempotent and generation-checked at the receiver.
+    if (state.current.kind == LevelKind::Mixer && !g_stopping.load())
+        SendMixerInput(state, InputAction::CloseMixer, -1);
 }
 
 void HideAll(State& root) {
@@ -2006,17 +2010,6 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         slider.StepFrequency(1.0);
         slider.IsEnabled(item.enabled);
         slider.Value(std::clamp(item.percent, 0, 100));
-        slider.ValueChanged(
-            [&state, index](auto const&, auto const& args) {
-                if (state.mixerPopulating ||
-                    state.current.kind != LevelKind::Mixer) return;
-                const int percent = static_cast<int>(std::lround(
-                    std::clamp(args.NewValue(), 0.0, 100.0)));
-                SendMixerInput(state, InputAction::MixerSetPercent,
-                               index, percent);
-                ArmInteractionTimer(state, true);
-            });
-        row.Children().Append(slider);
         controls::TextBlock label;
         label.Width(percentW);
         label.FontSize(std::clamp(data.fontSize - 2, 10, 17));
@@ -2025,6 +2018,19 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         label.TextAlignment(wx::TextAlignment::Right);
         label.VerticalAlignment(wx::VerticalAlignment::Center);
         label.Foreground(Brush(data.text));
+        // Update feedback without rebuilding the panel during pointer drag.
+        slider.ValueChanged(
+            [&state, index, label](auto const&, auto const& args) {
+                if (state.mixerPopulating ||
+                    state.current.kind != LevelKind::Mixer) return;
+                const int percent = static_cast<int>(std::lround(
+                    std::clamp(args.NewValue(), 0.0, 100.0)));
+                label.Text(winrt::hstring(std::to_wstring(percent) + L"%"));
+                SendMixerInput(state, InputAction::MixerSetPercent,
+                               index, percent);
+                ArmInteractionTimer(state, true);
+            });
+        row.Children().Append(slider);
         row.Children().Append(label);
         state.mixerRows.Children().Append(row);
     }
@@ -9388,7 +9394,8 @@ ControlEffects ApplyOsdCommands(
                 continue;
             }
             if (cmd.action == osd_control::Action::CloseMixer) {
-                if (g_xamlMixerOpen) {
+                if (g_xamlMixerOpen &&
+                    cmd.generation == g_xamlMixerGeneration) {
                     g_xamlMixerOpen = false;
                     g_xamlMixerOutputExpanded = false;
                     StopMixerOutputNotifications();
