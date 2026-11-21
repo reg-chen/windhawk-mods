@@ -771,7 +771,7 @@ struct MixerOutput {
     bool selected = false;
 };
 struct MixerModel {
-    std::wstring title, outputHeading, selectedOutput;
+    std::wstring title, outputHeading, selectedOutput, outputError;
     std::vector<MixerRow> rows;
     std::vector<MixerOutput> outputs;
     uint32_t generation = 0;
@@ -1944,7 +1944,8 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     const auto& model = data.mixer;
     auto output = makeButton(
         model.outputHeading + L": " + model.selectedOutput +
-        (model.outputFailed ? L" !" : L"  \uE70D"),
+        (model.outputFailed ? L" (" + model.outputError + L")"
+                            : L"  \uE70D"),
         contentW, 32.0);
     output.HorizontalAlignment(wx::HorizontalAlignment::Left);
     output.Click([&state](auto const&, auto const&) {
@@ -1952,8 +1953,13 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     });
     state.mixerColumn.Children().Append(output);
 
+    const double availableMenuH = std::max(32.0,
+        h - 2.0 * pad - 36.0 - 32.0);
     const double outputRowsH = model.outputExpanded
-        ? std::min<size_t>(model.outputs.size(), 4) * 32.0 : 0.0;
+        ? std::min(
+            static_cast<double>(std::min<size_t>(
+                model.outputs.size(), 4)) * 32.0, availableMenuH)
+        : 0.0;
     state.mixerOutputsScroll.Visibility(model.outputExpanded
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
     if (model.outputExpanded) {
@@ -2055,7 +2061,12 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         row.Children().Append(label);
         state.mixerRows.Children().Append(row);
     }
-    state.mixerColumn.Children().Append(state.mixerRowsScroll);
+    state.mixerRowsScroll.Visibility(model.outputExpanded
+        ? wx::Visibility::Collapsed : wx::Visibility::Visible);
+    // Output selection occupies the available panel viewport. Do not
+    // allow its list to overlap active sliders or escape the card.
+    if (!model.outputExpanded)
+        state.mixerColumn.Children().Append(state.mixerRowsScroll);
     state.mixerPopulating = false;
     ShowPositionedSurface(state, data, frame.insetX, frame.insetY, w, h);
 }
@@ -9300,6 +9311,7 @@ osd_model::MixerModel BuildMixerModel() {
     osd_model::MixerModel model;
     model.title = Tr(OsdText::VolumeMixer);
     model.outputHeading = Tr(OsdText::AudioOutput);
+    model.outputError = Tr(OsdText::AudioSwitchFailed);
     model.generation = g_xamlMixerGeneration;
     model.outputExpanded = g_xamlMixerOutputExpanded;
     model.outputFailed = g_mixerOutputSwitchFailed;
@@ -9379,6 +9391,7 @@ void ShowXamlMixerPanel() {
     RECT main{}, panel{};
     if (!BuildMixerPanelAnchors(main, panel, g_scale)) {
         Wh_Log(L"XAML Mixer: missing calculated placement");
+        ResetXamlMixerController();
         return;
     }
     HideGdiLevelForXaml();
@@ -9393,8 +9406,10 @@ void ShowXamlMixerPanel() {
     mixer.durationMs = OsdDuration(DurationKind::Interactive);
     mixer.mixerChevron = false;
     mixer.mixer = BuildMixerModel();
-    if (!xaml_osd::ShowBatch({volume, mixer}))
+    if (!xaml_osd::ShowBatch({volume, mixer})) {
         Wh_Log(L"XAML Mixer: panel unavailable; no GDI+ fallback");
+        ResetXamlMixerController();
+    }
 }
 
 void ShowNativeVolumePopup() {
@@ -9418,6 +9433,16 @@ void ShowNativeVolumePopup() {
 }
 
 void ActivateMixer() {
+    if (g_xamlForMigrated.load()) {
+        // A legacy arrow callback may still arrive while switching modes.
+        // Route it through the same renderer-neutral control command.
+        osd_model::Snapshot source;
+        source.kind = osd_model::Kind::Volume;
+        osd_control::Submit(
+            osd_control::Build(source, osd_control::Action::OpenMixer, 0),
+            g_receiveWnd);
+        return;
+    }
     if (g_panelMode == PanelMode::Mixer) {
         ClosePanel();
         ShowVolumePanelIfReady();
