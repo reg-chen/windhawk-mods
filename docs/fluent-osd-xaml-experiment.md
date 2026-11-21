@@ -2,7 +2,7 @@
 
 **Branch:** `fluent-osd-xaml`  
 **Baseline:** `fluent-osd` v1.0.1 (`8ff2d4352d8c081e78208266ff1561b5e5bfe31b`)  
-**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.20** adds native XAML Caps/Num/Scroll/Insert status cards to volume, native brightness and per-target DDC/CI. The earlier v1.0.19 build received compiler feedback for `Windows.UI.Input` projection and the missing include was added; **v1.0.20 still requires a fresh Windhawk compilation and runtime test.**
+**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.21** adds passive single-item USB/Bluetooth/network notices to native XAML volume, native brightness, per-target DDC/CI and Caps/Num/Scroll/Insert. The earlier v1.0.19 build received compiler feedback for `Windows.UI.Input` projection and the missing include was added; **v1.0.21 still requires a fresh Windhawk compilation and runtime test.**
 
 ## Goal / non-goals
 
@@ -561,6 +561,35 @@ each OSD type.
   opacity 20/60/96%, theme and font changes, fade and position at multiple
   DPI values, and transitions to/from volume and DDC. Also verify no leftover
   HWND or Explorer shutdown blocker on mod disable/reload.
+
+## v1.0.21 — Passive USB, Bluetooth and network notifications
+
+- The existing 320 ms event-batching and identity-deduplication engine is
+  unchanged; single-item USB/Bluetooth/network notifications now render
+  through the native XAML status card when `experimentalXamlVolume` is on.
+  Names, actions and device state are copied to a snapshot on the existing
+  UI thread, then drawn on the XAML STA.
+- The built-in **Segoe Fluent Icons** font supplies Bluetooth
+  `U+E702`, USB `U+E88E`, Network `U+E968` (per Microsoft's
+  [official glyph reference](https://learn.microsoft.com/en-us/windows/apps/design/iconography/segoe-fluent-icons-font)).
+  No additional icon files or runtime dependencies are introduced.
+- The status-card geometry, theme, background alpha, corner radius,
+  position, font size and fade behavior are reused. Device notifications
+  do **not** display the lock-key ON/OFF underline. Switching out of a
+  lock-card cancels the underline animation safely.
+- **Scope limit:** aggregated notifications with more than one item still
+  use the original GDI+ hit-tested, expandable list. Image/text clipboard
+  notices, SMTC/Mixer and native non-level status events remain GDI+.
+  This is deliberate functional preservation, not a renderer fallback
+  following an XAML initialization failure.
+- **Manual verification:** USB connect/disconnect, Bluetooth paired-device
+  connect/disconnect when Windows emits these events, network state
+  changes, a batch with two or more items (the details view must still
+  open), and rapid transitions from lock-key status to a device notice.
+  Check glyph presence, truncation for long device names, light/dark
+  modes, theme opacity, display placement, teardown and Explorer reload.
+  Compilation and runtime behavior remain unverified in this editing
+  environment.
 
 ## Migration gates
 
