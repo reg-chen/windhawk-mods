@@ -8306,9 +8306,10 @@ void ShowMigratedXamlLockStatus() {
         Wh_Log(L"XAML v1.0.22: lock status unavailable; NO GDI+ fallback");
 }
 
-// Single-item USB/Bluetooth/network notices are noninteractive; their event
-// identity and debounce still belong to the existing notice engine. Native
-// XAML uses installed Segoe Fluent Icons instead of bundling icon assets.
+// Entire USB/Bluetooth/network category: single-item notifications and
+// aggregated, clickable device lists share the same XAML Island renderer.
+// Event identity and debounce stay in the existing event engine; the
+// XAML snapshot owns the names and uses installed Segoe Fluent Icons.
 void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     HideGdiLevelForXaml();
     RECT target{};
