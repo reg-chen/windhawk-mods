@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.26
+// @version         1.0.27
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML migration experiment (v1.0.26)
+## XAML migration experiment (v1.0.27)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -1470,6 +1470,8 @@ struct State {
     controls::Viewbox viewbox{nullptr};
     controls::TextBlock icon{nullptr};
     controls::TextBlock value{nullptr};
+    controls::Slider levelSlider{nullptr};
+    bool levelPopulating = false;
     shapes::Rectangle track{nullptr};
     shapes::Rectangle fill{nullptr};
     media::RectangleGeometry fillClip{nullptr};
@@ -1717,7 +1719,9 @@ void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
         state.current.showIcon &&
         InHitRegion(pos.X, pos.Y, state.iconX, state.iconY,
                     state.iconW, state.iconH, halo);
-    const bool bar = state.current.valueKnown &&
+    const bool native = state.levelSlider &&
+        state.levelSlider.Visibility() == wx::Visibility::Visible;
+    const bool bar = state.current.valueKnown && !native &&
         InHitRegion(pos.X, pos.Y, state.trackX, state.trackY,
                     state.trackW, state.trackH, halo);
     if (!icon && !bar) return;
@@ -1784,8 +1788,16 @@ void PointerWheel(State& state, const xinput::PointerRoutedEventArgs& args) {
         state.current.kind == LevelKind::NativeEvent ||
         state.current.kind == LevelKind::Mixer ||
         state.current.kind == LevelKind::Media) return;
-    const int delta = args.GetCurrentPoint(state.canvas)
-        .Properties().MouseWheelDelta();
+    const auto point = args.GetCurrentPoint(state.canvas);
+    const auto pos = point.Position();
+    if (state.levelSlider &&
+        state.levelSlider.Visibility() == wx::Visibility::Visible &&
+        InHitRegion(pos.X, pos.Y, state.trackX, state.trackY,
+                    state.trackW, state.trackH, 12.0)) {
+        ArmInteractionTimer(state, false);
+        return; // Native Slider owns wheel over its track.
+    }
+    const int delta = point.Properties().MouseWheelDelta();
     const int steps = osd_input::ConsumeWheelSteps(delta, state.wheelRemainder);
     if (steps) SendInput(state, InputAction::Wheel, steps * WHEEL_DELTA);
     ArmInteractionTimer(state, false);
@@ -1878,7 +1890,7 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
     if (!SetWindowPos(state.host, HWND_TOPMOST,
                        placed.x, placed.y, placed.width, placed.height,
                       SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.26: show failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.27: show failed (%lu)", GetLastError());
         return;
     }
     if (!wasVisible) {
@@ -2852,6 +2864,8 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
 }
 void DrawSnapshot(State& state, const Snapshot& value) {
     const auto view = osd_model::SelectView(value.kind);
+    if (view != osd_model::View::Level && state.levelSlider)
+        state.levelSlider.Visibility(wx::Visibility::Collapsed);
     if (view == osd_model::View::Mixer) {
         DrawMixerSnapshot(state, value);
         return;
@@ -2882,7 +2896,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
         !state.fillClip || !state.thumb || !state.thumbCore ||
-        !state.statusTile) return;
+        !state.levelSlider || !state.statusTile) return;
     if (state.current.kind != value.kind) state.wheelRemainder = 0;
     state.current = value;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
@@ -2931,6 +2945,37 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     state.thumbCore.Fill(Brush(thumbVisual.center));
 
     const int percent = std::clamp(value.percent, 0, 100);
+    // Native Slider owns normalized drag and Thumb. Unknown raw brightness
+    // and explicitly hidden-thumb variants retain their old track.
+    const bool nativeLevel = value.valueKnown && value.thumbDiameter > 0;
+    state.levelSlider.Visibility(nativeLevel
+        ? wx::Visibility::Visible : wx::Visibility::Collapsed);
+    state.levelSlider.IsEnabled(nativeLevel);
+    state.levelSlider.Orientation(value.vertical
+        ? controls::Orientation::Vertical : controls::Orientation::Horizontal);
+    state.levelSlider.IsDirectionReversed(false);
+    state.levelSlider.Background(Brush(value.track));
+    state.levelSlider.Foreground(Brush(value.accent));
+    auto resources = state.levelSlider.Resources();
+    const auto themeBrush = [&](const wchar_t* key, DWORD color) {
+        resources.Insert(winrt::box_value(winrt::hstring(key)), Brush(color));
+    };
+    themeBrush(L"SliderTrackValueFill", value.accent);
+    themeBrush(L"SliderTrackValueFillPointerOver", value.accent);
+    themeBrush(L"SliderTrackValueFillPressed", value.accent);
+    themeBrush(L"SliderTrackFill", value.track);
+    themeBrush(L"SliderTrackFillPointerOver", value.track);
+    themeBrush(L"SliderTrackFillPressed", value.track);
+    resources.Insert(winrt::box_value(winrt::hstring(
+        L"SliderTrackThemeHeight")),
+        winrt::box_value(double(std::clamp(value.barThickness, 2, 18))));
+    state.levelPopulating = true;
+    state.levelSlider.Value(percent);
+    state.levelPopulating = false;
+    state.track.Visibility(nativeLevel
+        ? wx::Visibility::Collapsed : wx::Visibility::Visible);
+    state.fill.Visibility(nativeLevel
+        ? wx::Visibility::Collapsed : wx::Visibility::Visible);
     // Segoe Fluent Icons is provided by Windows; no external font assets.
     state.icon.Text(value.brightness ? L"\uE706" :
         (value.muted || percent == 0 ? L"\uE74F" : L"\uE767"));
@@ -3016,7 +3061,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
 
         state.thumb.Width(thumbSize);
         state.thumb.Height(thumbSize);
-        state.thumb.Visibility(thumbSize > 0.0 && value.valueKnown
+        state.thumb.Visibility(!nativeLevel && thumbSize > 0.0 && value.valueKnown
             ? wx::Visibility::Visible : wx::Visibility::Collapsed);
         const double thumbHalf = thumbSize / 2.0;
         const double thumbY = std::clamp(trackBottom - filled,
@@ -3027,7 +3072,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         const double core = thumbSize * thumbVisual.coreRatio;
         state.thumbCore.Width(core);
         state.thumbCore.Height(core);
-        state.thumbCore.Visibility(thumbSize > 0.0 && value.valueKnown
+        state.thumbCore.Visibility(!nativeLevel && thumbSize > 0.0 && value.valueKnown
             ? wx::Visibility::Visible : wx::Visibility::Collapsed);
         controls::Canvas::SetLeft(state.thumbCore, centerX - core / 2.0);
         controls::Canvas::SetTop(state.thumbCore, thumbY - core / 2.0);
@@ -3038,6 +3083,12 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         state.value.TextAlignment(wx::TextAlignment::Center);
         controls::Canvas::SetLeft(state.value, 0.0);
         controls::Canvas::SetTop(state.value, pad);
+        state.levelSlider.Width(std::max(30.0,
+            std::max(trackThickness, wantedThumb) + 12.0));
+        state.levelSlider.Height(std::max(1.0, length));
+        controls::Canvas::SetLeft(state.levelSlider,
+            centerX - state.levelSlider.Width() / 2.0);
+        controls::Canvas::SetTop(state.levelSlider, trackTop);
         state.trackX = centerX - trackThickness / 2.0;
         state.trackY = trackTop;
         state.trackW = trackThickness;
@@ -3095,7 +3146,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
 
         state.thumb.Width(thumbSize);
         state.thumb.Height(thumbSize);
-        state.thumb.Visibility(thumbSize > 0.0 && value.valueKnown
+        state.thumb.Visibility(!nativeLevel && thumbSize > 0.0 && value.valueKnown
             ? wx::Visibility::Visible : wx::Visibility::Collapsed);
         const double thumbHalf = thumbSize / 2.0;
         const double thumbX = std::clamp(filled, thumbHalf,
@@ -3105,7 +3156,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         const double core = thumbSize * thumbVisual.coreRatio;
         state.thumbCore.Width(core);
         state.thumbCore.Height(core);
-        state.thumbCore.Visibility(thumbSize > 0.0 && value.valueKnown
+        state.thumbCore.Visibility(!nativeLevel && thumbSize > 0.0 && value.valueKnown
             ? wx::Visibility::Visible : wx::Visibility::Collapsed);
         controls::Canvas::SetLeft(state.thumbCore,
             trackX + thumbX - core / 2.0);
@@ -3119,6 +3170,12 @@ void DrawSnapshot(State& state, const Snapshot& value) {
             std::max(0.0, valueX));
         controls::Canvas::SetTop(state.value,
             std::max(0.0, (bodyH - labelH) / 2.0));
+        state.levelSlider.Width(std::max(1.0, trackW));
+        state.levelSlider.Height(std::max(30.0,
+            std::max(trackThickness, wantedThumb) + 12.0));
+        controls::Canvas::SetLeft(state.levelSlider, trackX);
+        controls::Canvas::SetTop(state.levelSlider,
+            midY - state.levelSlider.Height() / 2.0);
         state.trackX = trackX;
         state.trackY = midY - trackThickness / 2.0;
         state.trackW = trackW;
@@ -3155,13 +3212,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (state) {
                 try { DeliverPending(*state); }
                 catch (const winrt::hresult_error& ex) {
-                    Wh_Log(L"XAML v1.0.26: draw exception 0x%08lX; disabling renderer",
+                    Wh_Log(L"XAML v1.0.27: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
                 } catch (...) {
-                    Wh_Log(L"XAML v1.0.26: unexpected draw exception; disabling renderer");
+                    Wh_Log(L"XAML v1.0.27: unexpected draw exception; disabling renderer");
                     g_failed.store(true);
                     g_ready.store(nullptr, std::memory_order_release);
                     HideAll(*state);
@@ -3274,6 +3331,30 @@ void CreateContent(State& state) {
     thumbCore.Height(7.0);
     thumbCore.Fill(Brush(0xa6a6a6));
     canvas.Children().Append(thumbCore);
+
+    controls::Slider levelSlider;
+    levelSlider.Visibility(wx::Visibility::Collapsed);
+    levelSlider.Minimum(0.0);
+    levelSlider.Maximum(100.0);
+    levelSlider.SmallChange(5.0);
+    levelSlider.StepFrequency(1.0);
+    levelSlider.MinWidth(0.0);
+    levelSlider.MinHeight(0.0);
+    levelSlider.IsThumbToolTipEnabled(false);
+    levelSlider.ValueChanged([&state](auto const&, auto const& args) {
+        if (state.levelPopulating || !state.current.valueKnown ||
+            (state.current.kind != LevelKind::Volume &&
+             state.current.kind != LevelKind::NativeBrightness &&
+             state.current.kind != LevelKind::DdcBrightness)) return;
+        const int percent = static_cast<int>(std::lround(
+            std::clamp(args.NewValue(), 0.0, 100.0)));
+        if (percent == state.current.percent) return;
+        state.current = osd_model::WithPercent(state.current, percent);
+        state.value.Text(winrt::hstring(std::to_wstring(percent) + L"%"));
+        SendInput(state, InputAction::SetPercent, percent);
+        ArmInteractionTimer(state, true);
+    });
+    canvas.Children().Append(levelSlider);
 
     controls::TextBlock value;
     value.Text(L"0%");
@@ -3390,6 +3471,7 @@ void CreateContent(State& state) {
     state.fillClip = fillClip;
     state.thumb = thumb;
     state.thumbCore = thumbCore;
+    state.levelSlider = levelSlider;
     state.value = value;
     state.statusTile = statusTile;
     state.statusGlyph = statusGlyph;
@@ -3456,7 +3538,7 @@ void CreateSurface(State& state, HINSTANCE instance) {
     // Island; the XAML Border provides the only visible card background.
     const MARGINS glass{-1, -1, -1, -1};
     const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
-    Wh_Log(L"XAML v1.0.26: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+    Wh_Log(L"XAML v1.0.27: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
         static_cast<unsigned long>(rounded),
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
@@ -3502,6 +3584,7 @@ void CloseSurface(State& state) {
     state.statusTitle = nullptr;
     state.statusGlyph = nullptr;
     state.statusTile = nullptr;
+    state.levelSlider = nullptr;
     state.thumbCore = nullptr;
     state.thumb = nullptr;
     state.fillClip = nullptr;
@@ -3514,7 +3597,7 @@ void CloseSurface(State& state) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.26: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.27: island close failed"); }
         state.source = nullptr;
     }
     state.island = nullptr;
@@ -3597,7 +3680,7 @@ void DeliverPending(State& root) {
             try {
                 CreateSurface(*fresh, GetModuleHandleW(nullptr));
             } catch (const winrt::hresult_error& ex) {
-                Wh_Log(L"XAML v1.0.26: DDC target create failed 0x%08lX",
+                Wh_Log(L"XAML v1.0.27: DDC target create failed 0x%08lX",
                     static_cast<unsigned long>(ex.code()));
                 CloseSurface(*fresh);
                 continue;
@@ -3622,7 +3705,7 @@ void TryEnableIslandTransparency() {
     try {
         auto currentWindow = wx::Window::Current();
         if (!currentWindow) {
-            Wh_Log(L"XAML v1.0.26: Window.Current unavailable for transparency");
+            Wh_Log(L"XAML v1.0.27: Window.Current unavailable for transparency");
             return;
         }
         ComPtr<IXamlSourceTransparency> transparency;
@@ -3631,10 +3714,10 @@ void TryEnableIslandTransparency() {
             reinterpret_cast<void**>(transparency.GetAddressOf()));
         if (SUCCEEDED(hr) && transparency)
             hr = transparency->put_IsBackgroundTransparent(1);
-        Wh_Log(L"XAML v1.0.26: Island transparency HRESULT=0x%08lX",
+        Wh_Log(L"XAML v1.0.27: Island transparency HRESULT=0x%08lX",
             static_cast<unsigned long>(hr));
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.26: transparency initialization exception 0x%08lX",
+        Wh_Log(L"XAML v1.0.27: transparency initialization exception 0x%08lX",
             static_cast<unsigned long>(ex.code()));
     }
 }
@@ -3667,7 +3750,7 @@ DWORD WINAPI ThreadProc(void*) {
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
                 g_ready.store(root.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.26: renderer ready (per-display DDC)");
+                Wh_Log(L"XAML v1.0.27: renderer ready (per-display DDC)");
                 while (!g_stopping.load() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
@@ -3676,11 +3759,11 @@ DWORD WINAPI ThreadProc(void*) {
             }
         }
     } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.26: startup failed 0x%08lX (%s)",
+        Wh_Log(L"XAML v1.0.27: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
         g_failed.store(true);
     } catch (...) {
-        Wh_Log(L"XAML v1.0.26: unexpected startup exception");
+        Wh_Log(L"XAML v1.0.27: unexpected startup exception");
         g_failed.store(true);
     }
     g_ready.store(nullptr, std::memory_order_release);
@@ -3696,7 +3779,7 @@ DWORD WINAPI ThreadProc(void*) {
     CloseSurface(root);
     if (root.manager) {
         try { root.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.26: manager close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.27: manager close failed"); }
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
@@ -3710,7 +3793,7 @@ void Start() {
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (!g_thread) {
         g_failed.store(true);
-        Wh_Log(L"XAML v1.0.26: STA creation failed (%lu)", GetLastError());
+        Wh_Log(L"XAML v1.0.27: STA creation failed (%lu)", GetLastError());
     }
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
@@ -7479,7 +7562,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
                 FindMonitorByDeviceName(target.event.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
-                Wh_Log(L"XAML v1.0.26: unresolved DDC display '%s'",
+                Wh_Log(L"XAML v1.0.27: unresolved DDC display '%s'",
                        target.event.device);
                 continue;
             }
@@ -7492,13 +7575,13 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
             push(master, anchor, g_scale);
     }
     if (batch.empty()) {
-        Wh_Log(L"XAML v1.0.26: no resolvable DDC snapshots");
+        Wh_Log(L"XAML v1.0.27: no resolvable DDC snapshots");
         xaml_osd::Hide();
         return false;
     }
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
-        Wh_Log(L"XAML v1.0.26: DDC batch not delivered; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.27: DDC batch not delivered; NO GDI+ fallback");
     return ok;
 }
 
@@ -9930,7 +10013,7 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"Fluent OSD v1.0.26: XAML %s missing anchor",
+        Wh_Log(L"Fluent OSD v1.0.27: XAML %s missing anchor",
                brightness ? L"brightness" : L"volume");
         return;
     }
@@ -9946,13 +10029,13 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     const int index = brightness ? 1 : 0;
     if (xaml_osd::Show(snapshot)) {
         if (!routeLogged[index]) {
-            Wh_Log(L"Fluent OSD v1.0.26: native %s -> XAML only",
+            Wh_Log(L"Fluent OSD v1.0.27: native %s -> XAML only",
                    brightness ? L"brightness" : L"volume");
             routeLogged[index] = true;
         }
         unavailableLogged[index] = false;
     } else if (!unavailableLogged[index]) {
-        Wh_Log(L"Fluent OSD v1.0.26: XAML %s unavailable; NO GDI+ fallback",
+        Wh_Log(L"Fluent OSD v1.0.27: XAML %s unavailable; NO GDI+ fallback",
                brightness ? L"brightness" : L"volume");
         unavailableLogged[index] = true;
     }
@@ -9965,7 +10048,7 @@ void ShowMigratedXamlLockStatus() {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.26: lock status missing placement anchor");
+        Wh_Log(L"XAML v1.0.27: lock status missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -9976,7 +10059,7 @@ void ShowMigratedXamlLockStatus() {
         ? Tr(OsdText::On) : Tr(OsdText::Off);
     snapshot.statusActive = g_lastLockValue;
     if (!xaml_osd::Show(snapshot))
-        Wh_Log(L"XAML v1.0.26: lock status unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.27: lock status unavailable; NO GDI+ fallback");
 }
 
 // Entire USB/Bluetooth/network category: single-item notifications and
@@ -9987,7 +10070,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.26: device notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.27: device notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -10005,7 +10088,7 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
         default: return;
     }
     if (!xaml_osd::Show(snapshot))
-        Wh_Log(L"XAML v1.0.26: device notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.27: device notice unavailable; NO GDI+ fallback");
 }
 
 // A native system event already has one immutable display payload; use
@@ -10015,7 +10098,7 @@ void ShowMigratedXamlNativeEvent() {
     HideGdiLevelForXaml();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
-        Wh_Log(L"XAML v1.0.26: native event missing placement anchor");
+        Wh_Log(L"XAML v1.0.27: native event missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -10073,7 +10156,7 @@ void ShowMigratedXamlNativeEvent() {
             return;
     }
     if (!xaml_osd::Show(snapshot))
-        Wh_Log(L"XAML v1.0.26: native event unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.27: native event unavailable; NO GDI+ fallback");
 }
 
 // Convert the already-downscaled clipboard HBITMAP into a private, bounded
@@ -10121,7 +10204,7 @@ void ShowMigratedXamlClipboardNotice() {
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
         ClearClipboardThumbnail();
-        Wh_Log(L"XAML v1.0.26: clipboard notice missing placement anchor");
+        Wh_Log(L"XAML v1.0.27: clipboard notice missing placement anchor");
         return;
     }
     auto snapshot = MakeXamlStatusSnapshot(
@@ -10146,7 +10229,7 @@ void ShowMigratedXamlClipboardNotice() {
         snapshot.scale = g_scale;
     }
     if (!xaml_osd::Show(snapshot))
-        Wh_Log(L"XAML v1.0.26: clipboard notice unavailable; NO GDI+ fallback");
+        Wh_Log(L"XAML v1.0.27: clipboard notice unavailable; NO GDI+ fallback");
 }
 
 
@@ -10845,7 +10928,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (target != g_ddcTargets.end())
                     target->event.value = write.previousValue;
                 if (master) g_visible.value = write.previousValue;
-                Wh_Log(L"XAML v1.0.26: DDC write failed for '%s' index %lu",
+                Wh_Log(L"XAML v1.0.27: DDC write failed for '%s' index %lu",
                     write.event.device, write.event.physicalIndex);
                 if (g_popupKind == PopupKind::DdcBrightness)
                     (void)ShowXamlDdcTargets(g_visible);
@@ -11623,7 +11706,7 @@ BOOL Wh_ModInit() {
     LoadSettings();
     if (g_isExplorer) HookNativeOsd();
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.0.26 (XAML experimental, no fallback) initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v1.0.27 (XAML experimental, no fallback) initialized (%s)", name);
     return TRUE;
 }
 
