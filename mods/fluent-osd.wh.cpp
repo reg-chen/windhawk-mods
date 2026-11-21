@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML Experimental)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.18
+// @version         1.0.19
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -2344,12 +2344,10 @@ WCHAR g_ddcLastUnresolved[CCHDEVICENAME]{}; // UI thread, log only changed failu
 WCHAR g_ddcLastTarget[CCHDEVICENAME]{}; // UI thread, log target transitions
 
 SRWLOCK g_wheelWriteLock = SRWLOCK_INIT;
-BrightnessWheelTask g_wheelWritePending;
-bool g_wheelWriteHasPending = false;
+std::vector<BrightnessWheelTask> g_wheelWritePending; // At most one latest write per physical display.
 HANDLE g_wheelWriteWake = nullptr;
 HANDLE g_wheelWriteThread = nullptr;
 std::atomic<bool> g_wheelWriteStop{false};
-std::atomic<DWORD> g_wheelWriteLatest{0};
 
 HMODULE g_combase = nullptr;               // UI thread only
 RoUninitialize_t g_roUninitialize = nullptr;
@@ -3067,13 +3065,26 @@ BOOL WINAPI GetVcpHook(HANDLE handle, BYTE code, LPMC_VCP_CODE_TYPE type,
 void QueueBrightnessWheelTask(const BrightnessWheelTask& task) {
     if (!g_wheelWriteWake || g_wheelWriteStop.load()) return;
     AcquireSRWLockExclusive(&g_wheelWriteLock);
-    g_wheelWritePending = task;
-    g_wheelWriteHasPending = true; // Replace older pending writes on rapid wheel turns.
-    g_wheelWriteLatest.store(task.generation, std::memory_order_relaxed);
+    auto sameTarget = [&](const BrightnessWheelTask& pending) {
+        return pending.native == task.native &&
+            (task.native ||
+             (pending.monitor.physicalIndex == task.monitor.physicalIndex &&
+              _wcsicmp(pending.monitor.device, task.monitor.device) == 0));
+    };
+    const auto found = std::find_if(g_wheelWritePending.begin(),
+                                   g_wheelWritePending.end(), sameTarget);
+    if (found != g_wheelWritePending.end()) {
+        *found = task; // Coalesce only within the same physical target.
+    } else if (g_wheelWritePending.size() < kMaxDdcTargets + 1) {
+        g_wheelWritePending.push_back(task);
+    } else {
+        // Hard bound against malformed/rapid producer floods.
+        g_wheelWritePending.erase(g_wheelWritePending.begin());
+        g_wheelWritePending.push_back(task);
+    }
     ReleaseSRWLockExclusive(&g_wheelWriteLock);
     SetEvent(g_wheelWriteWake);
 }
-
 
 void Publish(HANDLE handle, DWORD value) {
     if (!DdcAllowed()) return;
@@ -5643,26 +5654,38 @@ DWORD WINAPI BrightnessWheelThreadProc(void*) {
     const bool comReady = SUCCEEDED(init);
     while (WaitForSingleObject(g_wheelWriteWake, INFINITE) == WAIT_OBJECT_0) {
         if (g_wheelWriteStop.load()) break;
-        BrightnessWheelTask task{};
-        bool pending = false;
+        std::vector<BrightnessWheelTask> tasks;
         AcquireSRWLockExclusive(&g_wheelWriteLock);
-        if (g_wheelWriteHasPending) {
-            task = g_wheelWritePending;
-            g_wheelWriteHasPending = false;
-            pending = true;
-        }
+        tasks.swap(g_wheelWritePending);
         ReleaseSRWLockExclusive(&g_wheelWriteLock);
-        if (!pending || task.generation != g_wheelWriteLatest.load()) continue;
-        const bool success = task.native ?
-            (comReady && WriteNativeBrightnessWmi(
-                static_cast<BYTE>(std::clamp(task.value, 0, 100))))
-            : WriteExternalBrightnessDdc(task);
-        HWND receiver = g_receiveWnd;
-        if (receiver && !g_closing.load())
-            PostMessageW(receiver, kBrightnessWheelResultMessage,
-                static_cast<WPARAM>(task.generation),
-                static_cast<LPARAM>((success ? 1 : 0) |
-                                    (task.native ? 2 : 0)));
+        for (const auto& task : tasks) {
+            if (g_wheelWriteStop.load()) break;
+            // Skip a snapshot superseded while another DDC command ran.
+            AcquireSRWLockShared(&g_wheelWriteLock);
+            const bool superseded = std::any_of(
+                g_wheelWritePending.begin(), g_wheelWritePending.end(),
+                [&](const BrightnessWheelTask& newer) {
+                    return newer.generation > task.generation &&
+                        newer.native == task.native &&
+                        (task.native ||
+                         (newer.monitor.physicalIndex ==
+                              task.monitor.physicalIndex &&
+                          _wcsicmp(newer.monitor.device,
+                                  task.monitor.device) == 0));
+                });
+            ReleaseSRWLockShared(&g_wheelWriteLock);
+            if (superseded) continue;
+            const bool success = task.native ?
+                (comReady && WriteNativeBrightnessWmi(
+                    static_cast<BYTE>(std::clamp(task.value, 0, 100))))
+                : WriteExternalBrightnessDdc(task);
+            const HWND receiver = g_receiveWnd;
+            if (receiver && !g_closing.load())
+                PostMessageW(receiver, kBrightnessWheelResultMessage,
+                    static_cast<WPARAM>(task.generation),
+                    static_cast<LPARAM>((success ? 1 : 0) |
+                                        (task.native ? 2 : 0)));
+        }
     }
     if (comReady) CoUninitialize();
     return 0;
@@ -7816,9 +7839,11 @@ void HandleMixerDrag(LPARAM lp) {
 // XAML interaction commands reach this original UI thread without
 // cross-apartment WinRT calls. Physical DDC identity is carried on each
 // command, not inferred from whichever monitor happened to be last active.
-BrightnessEvent g_xamlPendingDdcWrite{};
-DWORD g_xamlPendingDdcGeneration = 0;
-DWORD g_xamlPendingDdcPrevious = 0;
+struct XamlPendingDdcWrite {
+    BrightnessEvent event{};
+    DWORD previousValue = 0, generation = 0;
+};
+std::vector<XamlPendingDdcWrite> g_xamlPendingDdcWrites; // UI thread only.
 
 void ProcessXamlInputs() {
     auto inputs = xaml_osd::TakeInputs();
@@ -7890,9 +7915,18 @@ void ProcessXamlInputs() {
         task.monitor = event;  // Exact display + physical index.
         task.value = static_cast<int>(raw);
         task.generation = ++g_wheelWriteGeneration;
-        g_xamlPendingDdcWrite = event;
-        g_xamlPendingDdcPrevious = event.value;
-        g_xamlPendingDdcGeneration = task.generation;
+        auto pending = std::find_if(
+            g_xamlPendingDdcWrites.begin(), g_xamlPendingDdcWrites.end(),
+            [&](const XamlPendingDdcWrite& item) {
+                return item.event.physicalIndex == event.physicalIndex &&
+                    _wcsicmp(item.event.device, event.device) == 0;
+            });
+        if (pending == g_xamlPendingDdcWrites.end()) {
+            if (g_xamlPendingDdcWrites.size() >= kMaxDdcTargets)
+                g_xamlPendingDdcWrites.erase(g_xamlPendingDdcWrites.begin());
+            g_xamlPendingDdcWrites.push_back(
+                {event, event.value, task.generation});
+        } else pending->generation = task.generation;
         event.value = raw;
         if (g_visible.physicalIndex == event.physicalIndex &&
             _wcsicmp(g_visible.device, event.device) == 0)
@@ -8056,9 +8090,45 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == kBrightnessWheelResultMessage && hwnd == g_receiveWnd) {
-        if (static_cast<DWORD>(wp) != g_wheelWriteGeneration) return 0;
+        const DWORD generation = static_cast<DWORD>(wp);
         const bool success = (lp & 1) != 0;
         const bool native = (lp & 2) != 0;
+        if (!native && g_xamlForMigrated.load()) {
+            const auto pending = std::find_if(
+                g_xamlPendingDdcWrites.begin(),
+                g_xamlPendingDdcWrites.end(),
+                [generation](const XamlPendingDdcWrite& item) {
+                    return item.generation == generation;
+                });
+            if (pending == g_xamlPendingDdcWrites.end())
+                return 0; // Superseded DDC write: never roll back its target.
+            const XamlPendingDdcWrite write = *pending;
+            g_xamlPendingDdcWrites.erase(pending);
+            const auto target = std::find_if(
+                g_ddcTargets.begin(), g_ddcTargets.end(),
+                [&](const DdcTargetState& item) {
+                    return item.event.physicalIndex ==
+                            write.event.physicalIndex &&
+                        _wcsicmp(item.event.device,
+                                write.event.device) == 0;
+                });
+            const bool master = g_visible.physicalIndex ==
+                    write.event.physicalIndex &&
+                _wcsicmp(g_visible.device, write.event.device) == 0;
+            if (!success) {
+                if (target != g_ddcTargets.end())
+                    target->event.value = write.previousValue;
+                if (master) g_visible.value = write.previousValue;
+                Wh_Log(L"XAML v1.0.19: DDC write failed for '%s' index %lu",
+                    write.event.device, write.event.physicalIndex);
+                if (g_popupKind == PopupKind::DdcBrightness)
+                    (void)ShowXamlDdcTargets(g_visible);
+            } else if (master && target != g_ddcTargets.end()) {
+                g_lastConfirmedDdcBrightness = target->event.value;
+            }
+            return 0;
+        }
+        if (generation != g_wheelWriteGeneration) return 0;
         if (native) {
             if (success) g_lastConfirmedNativeBrightness = g_nativePercent;
             else if (g_lastConfirmedNativeBrightness >= 0) {
@@ -8069,39 +8139,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else RenderPopup();
                 Wh_Log(L"Native brightness wheel write failed; restored value");
             }
-        } else if (g_xamlForMigrated.load() &&
-                   g_xamlPendingDdcGeneration == static_cast<DWORD>(wp)) {
-            // A DDC failure rolls back only its recorded physical target,
-            // even if a volume or native brightness event has since opened.
-            const auto target = std::find_if(
-                g_ddcTargets.begin(), g_ddcTargets.end(),
-                [&](const DdcTargetState& item) {
-                    return item.event.physicalIndex ==
-                            g_xamlPendingDdcWrite.physicalIndex &&
-                        _wcsicmp(item.event.device,
-                                g_xamlPendingDdcWrite.device) == 0;
-                });
-            if (!success) {
-                if (target != g_ddcTargets.end())
-                    target->event.value = g_xamlPendingDdcPrevious;
-                if (g_visible.physicalIndex ==
-                        g_xamlPendingDdcWrite.physicalIndex &&
-                    _wcsicmp(g_visible.device,
-                              g_xamlPendingDdcWrite.device) == 0)
-                    g_visible.value = g_xamlPendingDdcPrevious;
-                Wh_Log(L"XAML v1.0.19: DDC write failed for '%s' index %lu",
-                    g_xamlPendingDdcWrite.device,
-                    g_xamlPendingDdcWrite.physicalIndex);
-                if (g_popupKind == PopupKind::DdcBrightness)
-                    (void)ShowXamlDdcTargets(g_visible);
-            } else if (target != g_ddcTargets.end()) {
-                g_lastConfirmedDdcBrightness = target->event.value;
-            }
-            g_xamlPendingDdcGeneration = 0;
-        } else if (g_xamlForMigrated.load()) {
-            // No matching XAML target: never apply GDI+'s global DDC
-            // rollback to a different display.
-        } else {
+        } else if (!g_xamlForMigrated.load()) {
             if (success) g_lastConfirmedDdcBrightness = g_visible.value;
             else {
                 g_visible.value = g_lastConfirmedDdcBrightness;
