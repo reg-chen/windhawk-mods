@@ -5825,6 +5825,23 @@ xaml_osd::Snapshot MakeXamlSnapshot(
     return data;
 }
 
+// All compact XAML categories share one rendering snapshot contract.
+// Device/native notices and lock keys differ only in content and behavior;
+// the background/theme/placement lifecycle is inherited from MakeXamlSnapshot.
+xaml_osd::Snapshot MakeXamlStatusSnapshot(
+        xaml_osd::LevelKind category, const RECT& anchor,
+        DurationKind duration, bool fluentIcon = false) {
+    auto data = MakeXamlSnapshot(
+        PopupKind::NativeBrightness, anchor, g_scale);
+    data.kind = category;
+    data.brightness = false;
+    data.valueKnown = false;
+    data.showValue = false;
+    data.statusFontIcon = fluentIcon;
+    data.durationMs = OsdDuration(duration);
+    return data;
+}
+
 void HideGdiLevelForXaml() {
     if (g_popupWnd) {
         KillTimer(g_popupWnd, kHideTimer);
@@ -8307,16 +8324,13 @@ void ShowMigratedXamlLockStatus() {
         Wh_Log(L"XAML v1.0.23: lock status missing placement anchor");
         return;
     }
-    auto snapshot = MakeXamlSnapshot(
-        PopupKind::NativeBrightness, target, g_scale);
-    snapshot.kind = xaml_osd::LevelKind::LockStatus;
-    snapshot.brightness = false;
+    auto snapshot = MakeXamlStatusSnapshot(
+        xaml_osd::LevelKind::LockStatus, target, DurationKind::LockKeys);
     snapshot.statusTitle = kLockDisplayNames[std::clamp(g_lastLock, 0, 3)];
     snapshot.statusGlyph = kLockGlyphs[std::clamp(g_lastLock, 0, 3)];
     snapshot.statusDetail = g_lastLockValue
         ? Tr(OsdText::On) : Tr(OsdText::Off);
     snapshot.statusActive = g_lastLockValue;
-    snapshot.durationMs = OsdDuration(DurationKind::LockKeys);
     if (!xaml_osd::Show(snapshot))
         Wh_Log(L"XAML v1.0.23: lock status unavailable; NO GDI+ fallback");
 }
@@ -8332,20 +8346,14 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
         Wh_Log(L"XAML v1.0.23: device notice missing placement anchor");
         return;
     }
-    auto snapshot = MakeXamlSnapshot(
-        PopupKind::NativeBrightness, target, g_scale);
-    snapshot.kind = xaml_osd::LevelKind::NoticeStatus;
-    snapshot.brightness = false;
-    snapshot.valueKnown = false;
-    snapshot.showValue = false;
-    snapshot.statusFontIcon = true;
+    auto snapshot = MakeXamlStatusSnapshot(
+        xaml_osd::LevelKind::NoticeStatus, target, duration, true);
     snapshot.statusTitle = g_noticeTitle;
     snapshot.statusDetail = g_noticeBody;
     snapshot.noticeDetails = g_noticeDetails;
     snapshot.noticeDetailsHeading = Tr(OsdText::EventDetails);
     snapshot.noticeInteractiveDurationMs =
         OsdDuration(DurationKind::Interactive);
-    snapshot.durationMs = OsdDuration(duration);
     switch (g_noticeIcon) {
         case NoticeIcon::Bluetooth: snapshot.statusGlyph = L"\uE702"; break;
         case NoticeIcon::Usb:       snapshot.statusGlyph = L"\uE88E"; break;
@@ -8366,14 +8374,9 @@ void ShowMigratedXamlNativeEvent() {
         Wh_Log(L"XAML v1.0.23: native event missing placement anchor");
         return;
     }
-    auto snapshot = MakeXamlSnapshot(
-        PopupKind::NativeBrightness, target, g_scale);
-    snapshot.kind = xaml_osd::LevelKind::NativeEvent;
-    snapshot.brightness = false;
-    snapshot.valueKnown = false;
-    snapshot.showValue = false;
-    snapshot.statusFontIcon = true;
-    snapshot.durationMs = OsdDuration(DurationKind::NativeEvents);
+    auto snapshot = MakeXamlStatusSnapshot(
+        xaml_osd::LevelKind::NativeEvent, target,
+        DurationKind::NativeEvents, true);
 
     const NativeEventInfo& event = g_nativeEventCurrent;
     switch (event.kind) {
