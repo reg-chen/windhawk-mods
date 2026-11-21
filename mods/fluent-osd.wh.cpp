@@ -4960,6 +4960,13 @@ HWND CreateMirrorSurface() {
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
 }
 void RefreshMirrorOutputs(HMONITOR master) {
+    // XAML creates its own per-monitor DDC hosts. Never start the legacy
+    // GDI+ replicas while the migrated DDC renderer is selected.
+    if (g_xamlForMigrated.load() &&
+        g_popupKind == PopupKind::DdcBrightness) {
+        DestroyMirroredWindows();
+        return;
+    }
     const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
     const bool targetDisplayMode = mode == 0 &&
         g_popupKind == PopupKind::DdcBrightness && !g_ddcTargets.empty();
@@ -5185,6 +5192,111 @@ void RenderMirroredFrame(HDC screen, void* pixels, int sourceWidth,
     }
 }
 
+// Shared properties of all migrated XAML level indicators; the source
+// value, event identity and monitor placement remain category-specific.
+xaml_volume::Snapshot MakeXamlSnapshot(
+        PopupKind kind, const RECT& anchor, float scale) {
+    xaml_volume::Snapshot data;
+    data.kind = kind == PopupKind::NativeVolume
+        ? xaml_volume::LevelKind::Volume
+        : kind == PopupKind::DdcBrightness
+        ? xaml_volume::LevelKind::DdcBrightness
+        : xaml_volume::LevelKind::NativeBrightness;
+    data.brightness = kind != PopupKind::NativeVolume;
+    data.receiver = g_receiveWnd;
+    data.showIcon = !data.brightness || g_showSun.load();
+    data.percent = g_nativePercent;
+    data.rawValue = g_nativePercent;
+    data.valueKnown = g_nativePercentKnown;
+    data.muted = !data.brightness && g_nativeMuted;
+    data.durationMs = OsdDuration(kind == PopupKind::DdcBrightness
+        ? DurationKind::DdcBrightness
+        : kind == PopupKind::NativeBrightness
+        ? DurationKind::NativeBrightness : DurationKind::Volume);
+    data.anchor = anchor;
+    data.scale = scale;
+    data.vertical = g_verticalVolumeBrightness.load();
+    data.showValue = g_showValue.load();
+    data.innerPadding = g_innerPadding.load();
+    data.iconSize = g_iconSize.load();
+    data.fontSize = g_fontSize.load();
+    data.barThickness = g_barThickness.load();
+    data.thumbDiameter = g_thumbDiameter.load();
+    const bool light = IsLightTheme();
+    data.background = OsdBackgroundRgb(light);
+    data.backgroundAlpha = OsdBackgroundAlpha();
+    data.text = OsdTextRgb(light);
+    data.accent = OsdAccentRgb();
+    data.track = OsdTrackRgb(light);
+    return data;
+}
+
+void HideGdiLevelForXaml() {
+    if (g_popupWnd) {
+        KillTimer(g_popupWnd, kHideTimer);
+        KillTimer(g_popupWnd, kFadeTimer);
+        KillTimer(g_popupWnd, kMediaAnimationTimer);
+        g_fadeActive = false;
+        ShowWindow(g_popupWnd, SW_HIDE);
+    }
+    HideMirroredWindows(false);
+    ClosePanel();
+    if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
+    UpdateArrowHitWindow();
+    UpdateSpeakerHitWindow();
+}
+
+// All valid DDC targets can render simultaneously on their actual displays.
+// Fixed-output modes preserve the previous single-output behavior instead.
+bool ShowXamlDdcTargets(const BrightnessEvent& master) {
+    const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
+    std::vector<xaml_volume::Snapshot> batch;
+    const ULONGLONG now = GetTickCount64();
+    auto push = [&](const BrightnessEvent& ev,
+                    const RECT& anchor, float scale) {
+        auto snapshot = MakeXamlSnapshot(
+            PopupKind::DdcBrightness, anchor, scale);
+        snapshot.key = std::wstring(L"ddc:") + ev.device + L":" +
+            std::to_wstring(ev.physicalIndex);
+        wcscpy_s(snapshot.device, ev.device);
+        snapshot.physicalIndex = ev.physicalIndex;
+        snapshot.minimum = ev.minimum;
+        snapshot.maximum = ev.maximum;
+        snapshot.rawValue = static_cast<int>(ev.value);
+        snapshot.percent = BrightnessPercent(ev, &snapshot.valueKnown);
+        batch.push_back(std::move(snapshot));
+    };
+
+    if (mode == 0 || mode == 3) {
+        for (const auto& target : g_ddcTargets) {
+            if (target.expiresAt <= now) continue;
+            HMONITOR monitor =
+                FindMonitorByDeviceName(target.event.device);
+            PopupPlacement placement{};
+            if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
+                Wh_Log(L"XAML v1.0.17: unresolved DDC display '%s'",
+                       target.event.device);
+                continue;
+            }
+            push(target.event, placement.bounds, placement.scale);
+        }
+    } else {
+        // Primary/selected output remains one card with the chosen event.
+        RECT anchor{};
+        if (g_popupWnd && GetWindowRect(g_popupWnd, &anchor))
+            push(master, anchor, g_scale);
+    }
+    if (batch.empty()) {
+        Wh_Log(L"XAML v1.0.17: no resolvable DDC snapshots");
+        xaml_volume::Hide();
+        return false;
+    }
+    const bool ok = xaml_volume::ShowBatch(batch);
+    if (!ok)
+        Wh_Log(L"XAML v1.0.17: DDC batch not delivered; NO GDI+ fallback");
+    return ok;
+}
+
 // Coalesce writes per physical display, not across all displays. Each
 // target's raw value and range survive the burst for independent painting.
 void DisplayDdcBatch() {
@@ -5290,6 +5402,11 @@ void DisplayDdcBatch() {
     g_lastConfirmedDdcBrightness = master.value;
     g_popupKind = PopupKind::DdcBrightness;
     MovePopupToDisplay(master);
+    if (g_xamlForMigrated.load()) {
+        HideGdiLevelForXaml();
+        (void)ShowXamlDdcTargets(master);
+        return;
+    }
     SetPopupInteractive(false);
     ShowPopupAnimated();
     UpdateArrowHitWindow();
@@ -7547,67 +7664,28 @@ void ResetHideTimerFor(DurationKind kind) {
 // XAML-off setting; failure/initialization never silently paints the old UI.
 void ShowMigratedXamlLevel(PopupKind kind) {
     const bool brightness = kind == PopupKind::NativeBrightness;
-
-    // Hide the old layered GDI+ surface before closing a panel, which may
-    // otherwise recenter and briefly repaint it. This stays on the UI thread.
-    if (g_popupWnd) {
-        KillTimer(g_popupWnd, kHideTimer);
-        KillTimer(g_popupWnd, kFadeTimer);
-        KillTimer(g_popupWnd, kMediaAnimationTimer);
-        g_fadeActive = false;
-        ShowWindow(g_popupWnd, SW_HIDE);
-    }
-    ClosePanel();
-    if (g_barWheelWnd) ShowWindow(g_barWheelWnd, SW_HIDE);
-    UpdateArrowHitWindow();
-    UpdateSpeakerHitWindow();
-
+    HideGdiLevelForXaml();
     RECT target{};
     if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
-        Wh_Log(L"Fluent OSD v1.0.16: XAML %s unavailable (no anchor HWND)",
+        Wh_Log(L"Fluent OSD v1.0.17: XAML %s missing anchor",
                brightness ? L"brightness" : L"volume");
         return;
     }
-
-    const bool light = IsLightTheme();
-    xaml_volume::Snapshot data;
-    data.percent = g_nativePercent;
-    data.rawValue = g_nativePercent;
-    data.valueKnown = g_nativePercentKnown;
-    data.muted = !brightness && g_nativeMuted;
-    data.brightness = brightness;
-    data.showIcon = !brightness || g_showSun.load();
-    data.durationMs = OsdDuration(brightness ?
-        DurationKind::NativeBrightness : DurationKind::Volume);
-    data.anchor = target;
-    data.scale = g_scale;
-    data.vertical = g_verticalVolumeBrightness.load();
-    data.showValue = g_showValue.load();
-    data.innerPadding = g_innerPadding.load();
-    data.iconSize = g_iconSize.load();
-    data.fontSize = g_fontSize.load();
-    data.barThickness = g_barThickness.load();
-    data.thumbDiameter = g_thumbDiameter.load();
-    data.background = OsdBackgroundRgb(light);
-    data.text = OsdTextRgb(light);
-    data.accent = OsdAccentRgb();
-    data.track = OsdTrackRgb(light);
-
-    // Post failure is observable; never try GDI+ when XAML is selected.
-    static bool loggedRoute[2]{};
-    static bool loggedUnavailable[2]{};
-    const int category = brightness ? 1 : 0;
-    if (xaml_volume::Show(data)) {
-        if (!loggedRoute[category]) {
-            Wh_Log(L"Fluent OSD v1.0.16: native %s -> XAML only",
+    const auto snapshot = MakeXamlSnapshot(kind, target, g_scale);
+    static bool routeLogged[2]{};
+    static bool unavailableLogged[2]{};
+    const int index = brightness ? 1 : 0;
+    if (xaml_volume::Show(snapshot)) {
+        if (!routeLogged[index]) {
+            Wh_Log(L"Fluent OSD v1.0.17: native %s -> XAML only",
                    brightness ? L"brightness" : L"volume");
-            loggedRoute[category] = true;
+            routeLogged[index] = true;
         }
-        loggedUnavailable[category] = false;
-    } else if (!loggedUnavailable[category]) {
-        Wh_Log(L"Fluent OSD v1.0.16: XAML %s unavailable; NO GDI+ fallback",
+        unavailableLogged[index] = false;
+    } else if (!unavailableLogged[index]) {
+        Wh_Log(L"Fluent OSD v1.0.17: XAML %s unavailable; NO GDI+ fallback",
                brightness ? L"brightness" : L"volume");
-        loggedUnavailable[category] = true;
+        unavailableLogged[index] = true;
     }
 }
 
