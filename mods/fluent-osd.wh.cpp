@@ -30,12 +30,13 @@ Explorer functions. Restore the official `@id fluent-osd` only when
 merging the renderer back into the production branch.
 
 Branch-only native XAML Island renderer for migrated categories:
-**system volume, native brightness and per-target DDC/CI brightness**.
+**system volume, native brightness, per-target DDC/CI brightness and lock-key status**.
 The existing XAML toggle selects the migrated renderer (no GDI+ fallback).
 Opacity inherits the original background-opacity setting; Native XAML pointer gestures
 relay clicks/drags/wheels to the existing audio and brightness
 workers. DDC targets have independent XAML hosts and their original
-monitor identity. Media/mixer/notifications remain GDI+ until migrated.
+monitor identity. Caps/Num/Scroll/Insert now use a shared XAML status card.
+Media/mixer/USB/Bluetooth/network/clipboard notices remain GDI+ until migrated.
 
 ## Features
 
@@ -783,7 +784,7 @@ std::mutex g_startLock;
 SRWLOCK g_snapshotLock = SRWLOCK_INIT;
 HANDLE g_thread = nullptr;
 
-enum class LevelKind { Volume, NativeBrightness, DdcBrightness };
+enum class LevelKind { Volume, NativeBrightness, DdcBrightness, LockStatus };
 struct Snapshot {
     LevelKind kind = LevelKind::Volume;
     std::wstring key;       // Nonempty for a physical DDC display/window.
@@ -794,6 +795,8 @@ struct Snapshot {
     int rawValue = 0;
     bool valueKnown = true;
     bool muted = false;
+    bool statusActive = false;
+    std::wstring statusTitle, statusDetail, statusGlyph;
     bool brightness = false;
     bool showIcon = true;
     BYTE backgroundAlpha = 255;
@@ -854,6 +857,11 @@ struct State {
     shapes::Rectangle fill{nullptr};
     media::RectangleGeometry fillClip{nullptr};
     shapes::Ellipse thumb{nullptr};
+    // Shared status-card visual tree for Caps/Num/Scroll/Insert.
+    controls::Border statusTile{nullptr};
+    controls::TextBlock statusGlyph{nullptr}, statusTitle{nullptr},
+                        statusDetail{nullptr};
+    shapes::Rectangle statusUnderline{nullptr};
 
     // Intrinsic size of *all possible* speaker and volume-value states.
     // These change only with the corresponding font size; neither text
@@ -871,6 +879,7 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
 }
 
 void DrawSnapshot(State&, const Snapshot&);
+void DrawStatusSnapshot(State&, const Snapshot&);
 
 // All audio/WMI/DDC writes stay on the original Explorer OSD UI thread.
 // The STA handles pointer geometry and sends only bounded POD commands.
@@ -955,7 +964,8 @@ void DragTrack(State& state, double x, double y) {
 }
 
 void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
-    if (!state.canvas || !state.host) return;
+    if (!state.canvas || !state.host ||
+        state.current.kind == LevelKind::LockStatus) return;
     const auto point = args.GetCurrentPoint(state.canvas);
     if (!point.Properties().IsLeftButtonPressed()) return;
     const auto pos = point.Position();
@@ -1008,7 +1018,8 @@ void PointerCancelled(State& state) {
 }
 
 void PointerWheel(State& state, const xinput::PointerRoutedEventArgs& args) {
-    if (!state.current.valueKnown) return;
+    if (!state.current.valueKnown ||
+        state.current.kind == LevelKind::LockStatus) return;
     const int delta = args.GetCurrentPoint(state.canvas)
         .Properties().MouseWheelDelta();
     const int steps = osd_input::ConsumeWheelSteps(delta, state.wheelRemainder);
@@ -1077,14 +1088,159 @@ void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
         state.measuredValueFontSize = valueFontSize;
     }
 }
+
+// XAML host placement and fade lifecycle is shared by levels and status cards.
+// The input geometry remains in logical DIPs on the same Canvas.
+void ShowPositionedSurface(State& state, const Snapshot& value,
+                           double insetX, double insetY,
+                           double bodyW, double bodyH) {
+    const float scale = std::clamp(value.scale, 0.5f, 6.0f);
+    const int hostW = std::max(28, static_cast<int>(std::lround(bodyW * scale)));
+    const int hostH = std::max(28, static_cast<int>(std::lround(bodyH * scale)));
+    const int x = value.anchor.left +
+        static_cast<int>(std::lround(insetX * scale));
+    const int y = value.anchor.top +
+        static_cast<int>(std::lround(insetY * scale));
+    const bool wasVisible = IsWindowVisible(state.host) != FALSE;
+    if (!wasVisible)
+        state.card.Opacity(value.fadeEnabled ? 0.0 : 1.0);
+    else if (state.fadeOut) {
+        KillTimer(state.host, kFadeTimer);
+        state.fading = state.fadeOut = false;
+        state.card.Opacity(1.0);
+    }
+    if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
+                      SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+        Wh_Log(L"XAML v1.0.19: show failed (%lu)", GetLastError());
+        return;
+    }
+    if (!wasVisible) {
+        state.fading = value.fadeEnabled;
+        state.fadeOut = false;
+        state.fadeStart = GetTickCount64();
+        if (state.fading) SetTimer(state.host, kFadeTimer, 16, nullptr);
+    } else if (!value.fadeEnabled && state.fading) {
+        state.fading = false;
+        KillTimer(state.host, kFadeTimer);
+        state.card.Opacity(1.0);
+    }
+    ArmInteractionTimer(state, state.dragging || state.iconPressed);
+}
+
+void DrawStatusSnapshot(State& state, const Snapshot& value) {
+    if (!state.host || !state.card || !state.canvas ||
+        !state.statusTile || !state.statusTitle || !state.statusGlyph ||
+        !state.statusDetail || !state.statusUnderline) return;
+    state.current = value;
+    state.wheelRemainder = 0;
+    state.dragging = state.iconPressed = state.pointerActive = false;
+    state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
+
+    // Same host canvas as other status notices: 296x92 by default. The
+    // card inset is proportional to the source status canvas, while actual
+    // card size and content columns are derived from the active bounds.
+    const double logicalW = std::max(32.0,
+        static_cast<double>(value.anchor.right - value.anchor.left) / state.scale);
+    const double logicalH = std::max(32.0,
+        static_cast<double>(value.anchor.bottom - value.anchor.top) / state.scale);
+    const double insetX = std::min(logicalW * (8.0 / 296.0), logicalW / 8.0);
+    const double insetY = std::min(logicalH * (7.0 / 92.0), logicalH / 8.0);
+    const double bodyW = std::max(28.0, logicalW - 2.0 * insetX);
+    const double bodyH = std::max(28.0, logicalH - 2.0 * insetY);
+    const double pad = std::clamp(
+        static_cast<double>(value.innerPadding), 6.0, 22.0) * .68;
+    const double tileSize = std::max(18.0,
+        std::min(bodyH - 2.0 * pad, bodyH * .69));
+    const double tileX = pad, tileY = (bodyH - tileSize) / 2.0;
+    const double textX = tileX + tileSize + pad;
+    const double textW = std::max(1.0, bodyW - textX - pad);
+
+    state.canvas.IsHitTestVisible(false);
+    state.canvas.Width(bodyW);
+    state.canvas.Height(bodyH);
+    state.card.Background(Brush(value.background, value.backgroundAlpha));
+    const double radius = static_cast<double>(
+        std::clamp(value.cornerRadius, 0, 34));
+    state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
+    state.card.BorderBrush(Brush(value.track));
+    const double border = value.borderless ? 0.0 : 1.0;
+    state.card.BorderThickness(wx::Thickness{border, border, border, border});
+    state.icon.Visibility(wx::Visibility::Collapsed);
+    state.value.Visibility(wx::Visibility::Collapsed);
+    state.track.Visibility(wx::Visibility::Collapsed);
+    state.fill.Visibility(wx::Visibility::Collapsed);
+    state.thumb.Visibility(wx::Visibility::Collapsed);
+
+    state.statusTile.Visibility(wx::Visibility::Visible);
+    state.statusGlyph.Visibility(wx::Visibility::Visible);
+    state.statusTitle.Visibility(wx::Visibility::Visible);
+    state.statusDetail.Visibility(wx::Visibility::Visible);
+    state.statusUnderline.Visibility(wx::Visibility::Visible);
+
+    state.statusTile.Width(tileSize);
+    state.statusTile.Height(tileSize);
+    const double tileRadius = std::min(tileSize * .19, radius);
+    state.statusTile.CornerRadius(wx::CornerRadius{
+        tileRadius, tileRadius, tileRadius, tileRadius});
+    state.statusTile.Background(Brush(value.track, 120));
+    controls::Canvas::SetLeft(state.statusTile, tileX);
+    controls::Canvas::SetTop(state.statusTile, tileY);
+
+    state.statusGlyph.Text(winrt::hstring(value.statusGlyph));
+    state.statusGlyph.FontSize(value.statusGlyph.size() > 1
+        ? std::clamp(value.fontSize, 12, 24)
+        : std::clamp(value.iconSize + 7, 16, 32));
+    state.statusGlyph.Foreground(Brush(value.statusActive
+        ? value.accent : value.text,
+        value.statusActive ? 255 : 195));
+    state.statusTitle.Text(winrt::hstring(value.statusTitle));
+    state.statusDetail.Text(winrt::hstring(value.statusDetail));
+    const int titleFont = std::clamp(value.fontSize, 10, 24);
+    const int detailFont = std::max(10, titleFont - 3);
+    state.statusTitle.FontSize(titleFont);
+    state.statusDetail.FontSize(detailFont);
+    state.statusTitle.Foreground(Brush(value.text));
+    state.statusDetail.Foreground(Brush(value.text, 195));
+    state.statusTitle.Width(textW);
+    state.statusDetail.Width(textW);
+    const double lineGap = std::clamp(bodyH * .045, 2.0, 6.0);
+    const double textBlockH = titleFont * 1.43 + detailFont * 1.43 + lineGap;
+    const double top = std::max(0.0, (bodyH - textBlockH) / 2.0 - 2.0);
+    controls::Canvas::SetLeft(state.statusTitle, textX);
+    controls::Canvas::SetTop(state.statusTitle, top);
+    controls::Canvas::SetLeft(state.statusDetail, textX);
+    controls::Canvas::SetTop(state.statusDetail, top + titleFont * 1.43 + lineGap);
+    const double lineHeight = std::max(2.0, bodyH * .04);
+    state.statusUnderline.Width(textW);
+    state.statusUnderline.Height(lineHeight);
+    state.statusUnderline.RadiusX(lineHeight / 2.0);
+    state.statusUnderline.RadiusY(lineHeight / 2.0);
+    state.statusUnderline.Fill(Brush(value.accent,
+        value.statusActive ? 255 : 145));
+    controls::Canvas::SetLeft(state.statusUnderline, textX);
+    controls::Canvas::SetTop(state.statusUnderline,
+        std::max(0.0, bodyH - pad * .55 - lineHeight));
+    ShowPositionedSurface(state, value, insetX, insetY, bodyW, bodyH);
+}
+
 void DrawSnapshot(State& state, const Snapshot& value) {
-    const bool wasVisible = state.host && IsWindowVisible(state.host);
+    if (value.kind == LevelKind::LockStatus) {
+        DrawStatusSnapshot(state, value);
+        return;
+    }
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
-        !state.fillClip || !state.thumb) return;
+        !state.fillClip || !state.thumb || !state.statusTile) return;
     if (state.current.kind != value.kind) state.wheelRemainder = 0;
     state.current = value;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
+    state.canvas.IsHitTestVisible(true);
+    state.statusTile.Visibility(wx::Visibility::Collapsed);
+    state.statusTitle.Visibility(wx::Visibility::Collapsed);
+    state.statusDetail.Visibility(wx::Visibility::Collapsed);
+    state.statusUnderline.Visibility(wx::Visibility::Collapsed);
+    state.track.Visibility(wx::Visibility::Visible);
+    state.fill.Visibility(wx::Visibility::Visible);
 
     const float scale = std::clamp(value.scale, 0.5f, 6.0f);
     const double logicalW = static_cast<double>(
@@ -1096,13 +1252,6 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     const double bodyW = std::max(28.0, logicalW - insetX * 2.0);
     const double bodyH = std::max(28.0, logicalH -
         (value.vertical ? 12.0 : 23.0));
-    const int hostW = std::max(28, static_cast<int>(std::lround(bodyW * scale)));
-    const int hostH = std::max(28, static_cast<int>(std::lround(bodyH * scale)));
-    const int x = value.anchor.left +
-        static_cast<int>(std::lround(insetX * scale));
-    const int y = value.anchor.top +
-        static_cast<int>(std::lround(insetY * scale));
-
     state.canvas.Width(bodyW);
     state.canvas.Height(bodyH);
     state.card.Background(Brush(value.background, value.backgroundAlpha));
@@ -1299,29 +1448,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         state.iconH = iconH;
     }
 
-    if (!wasVisible)
-        state.card.Opacity(value.fadeEnabled ? 0.0 : 1.0);
-    else if (state.fadeOut) {
-        KillTimer(state.host, kFadeTimer);
-        state.fading = state.fadeOut = false;
-        state.card.Opacity(1.0); // A fresh event cancels pending fade-out.
-    }
-    if (!SetWindowPos(state.host, HWND_TOPMOST, x, y, hostW, hostH,
-                      SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"XAML v1.0.19: show failed (%lu)", GetLastError());
-        return;
-    }
-    if (!wasVisible) {
-        state.fading = value.fadeEnabled;
-        state.fadeOut = false;
-        state.fadeStart = GetTickCount64();
-        if (state.fading) SetTimer(state.host, kFadeTimer, 16, nullptr);
-    } else if (!value.fadeEnabled && state.fading) {
-        state.fading = false;
-        KillTimer(state.host, kFadeTimer);
-        state.card.Opacity(1.0);
-    }
-    ArmInteractionTimer(state, state.dragging || state.iconPressed);
+    ShowPositionedSurface(state, value, insetX, insetY, bodyW, bodyH);
 }
 void DeliverPending(State& root); // Defined after native/XAML host creation.
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1454,6 +1581,27 @@ void CreateContent(State& state) {
     value.Foreground(Brush(0xf8f8fc));
     canvas.Children().Append(value);
 
+    // Noninteractive lock-key cards share this Canvas and stay hidden in
+    // level-indicator mode. The status renderer derives its layout from bounds.
+    controls::Border statusTile;
+    statusTile.Visibility(wx::Visibility::Collapsed);
+    controls::TextBlock statusGlyph;
+    statusGlyph.FontFamily(media::FontFamily{L"Segoe UI"});
+    statusGlyph.TextAlignment(wx::TextAlignment::Center);
+    statusGlyph.VerticalAlignment(wx::VerticalAlignment::Center);
+    statusTile.Child(statusGlyph);
+    canvas.Children().Append(statusTile);
+
+    controls::TextBlock statusTitle;
+    statusTitle.Visibility(wx::Visibility::Collapsed);
+    canvas.Children().Append(statusTitle);
+    controls::TextBlock statusDetail;
+    statusDetail.Visibility(wx::Visibility::Collapsed);
+    canvas.Children().Append(statusDetail);
+    shapes::Rectangle statusUnderline;
+    statusUnderline.Visibility(wx::Visibility::Collapsed);
+    canvas.Children().Append(statusUnderline);
+
     controls::Viewbox viewbox;
     viewbox.Stretch(media::Stretch::Fill);
     viewbox.Child(canvas);
@@ -1468,6 +1616,11 @@ void CreateContent(State& state) {
     state.fillClip = fillClip;
     state.thumb = thumb;
     state.value = value;
+    state.statusTile = statusTile;
+    state.statusGlyph = statusGlyph;
+    state.statusTitle = statusTitle;
+    state.statusDetail = statusDetail;
+    state.statusUnderline = statusUnderline;
     canvas.PointerPressed([&state](auto const&, const xinput::PointerRoutedEventArgs& e) {
         PointerPressed(state, e);
     });
@@ -1534,6 +1687,11 @@ void CreateSurface(State& state, HINSTANCE instance) {
 
 void CloseSurface(State& state) {
     HideSurface(state);
+    state.statusUnderline = nullptr;
+    state.statusDetail = nullptr;
+    state.statusTitle = nullptr;
+    state.statusGlyph = nullptr;
+    state.statusTile = nullptr;
     state.thumb = nullptr;
     state.fillClip = nullptr;
     state.fill = nullptr;
@@ -7802,6 +7960,30 @@ void ShowMigratedXamlLevel(PopupKind kind) {
     }
 }
 
+
+// Lock-key OSD is the first compact, noninteractive XAML status category.
+// Retain the keyboard hook, localization, placement and duration engine.
+void ShowMigratedXamlLockStatus() {
+    HideGdiLevelForXaml();
+    RECT target{};
+    if (!g_popupWnd || !GetWindowRect(g_popupWnd, &target)) {
+        Wh_Log(L"XAML v1.0.19: lock status missing placement anchor");
+        return;
+    }
+    auto snapshot = MakeXamlSnapshot(
+        PopupKind::NativeBrightness, target, g_scale);
+    snapshot.kind = xaml_osd::LevelKind::LockStatus;
+    snapshot.brightness = false;
+    snapshot.statusTitle = kLockDisplayNames[std::clamp(g_lastLock, 0, 3)];
+    snapshot.statusGlyph = kLockGlyphs[std::clamp(g_lastLock, 0, 3)];
+    snapshot.statusDetail = g_lastLockValue
+        ? Tr(OsdText::On) : Tr(OsdText::Off);
+    snapshot.statusActive = g_lastLockValue;
+    snapshot.durationMs = OsdDuration(DurationKind::LockKeys);
+    if (!xaml_osd::Show(snapshot))
+        Wh_Log(L"XAML v1.0.19: lock status unavailable; NO GDI+ fallback");
+}
+
 void ShowNativeVolumePopup() {
     BrightnessEvent ev{};
     MovePopupToDisplay(ev);
@@ -8093,10 +8275,14 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_popupKind = PopupKind::LockStatus;
         BrightnessEvent ev{};
         MovePopupToDisplay(ev);
-        SetPopupInteractive(false);
-        ShowPopupAnimated();
-        UpdateArrowHitWindow();
-        ResetHideTimerFor(DurationKind::LockKeys);
+        if (g_xamlForMigrated.load()) {
+            ShowMigratedXamlLockStatus();
+        } else {
+            SetPopupInteractive(false);
+            ShowPopupAnimated();
+            UpdateArrowHitWindow();
+            ResetHideTimerFor(DurationKind::LockKeys);
+        }
         return 0;
     }
     if (msg == kBrightnessWheelResultMessage && hwnd == g_receiveWnd) {
