@@ -3,7 +3,7 @@
 // @name            Fluent OSD (XAML)
 // @description     Customizable Windows 11 OSDs for volume, brightness, media, and system events.
 // @description:zh-TW 自訂 Windows 11 音量、亮度、媒體及系統事件提示介面。
-// @version         1.0.29
+// @version         1.0.30
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -20,7 +20,7 @@
 Customizable Fluent-style on-screen displays for Windows 11. Keep the
 Windows indicators you want, replace individual ones, or show both.
 
-## XAML-only renderer (v1.0.28)
+## XAML-only renderer (v1.0.30)
 
 The test build uses its own Windhawk ID (`fluent-osd-xaml`) and its
 own receiver-window class / WM_COPYDATA tag. It can be installed
@@ -32,7 +32,10 @@ merging the renderer back into the production branch.
 Branch-only native XAML Island renderer for migrated categories:
 **system volume, native brightness, per-target DDC/CI brightness, lock-key status, USB/Bluetooth/network details, native system status, clipboard text/file/image notices, and interactive Mixer (per-app sliders, mute and output selection)**.
 Every supported OSD category renders through XAML; there is no renderer toggle.
-Opacity inherits the original background-opacity setting; Native XAML pointer gestures
+The default background preserves the existing background opacity. An optional
+custom brush supports SolidColorBrush, AcrylicBrush and LinearGradientBrush
+with a bounded allowlist of properties and GradientStop values.
+Native XAML pointer gestures
 relay clicks/drags/wheels to the existing audio and brightness
 workers. DDC targets have independent XAML hosts and their original
 monitor identity. Caps/Num/Scroll/Insert now use a shared XAML status card.
@@ -61,8 +64,31 @@ The message-only event receiver and media/brightness workers are independent of 
   and shuffle/repeat when available through Windows SMTC.
 - **System events:** Optional keyboard lock, clipboard, USB, paired Bluetooth
   Classic/LE, and network indicators.
-- **Customization:** Light/dark/system themes, colors, dimensions, spacing,
-  placement, duration, per-monitor routing and Traditional Chinese/English UI.
+- **Customization:** Light/dark/system themes, background brushes, colors,
+  dimensions, spacing, placement, duration, per-monitor routing and
+  Traditional Chinese/English UI.
+
+## Background effects
+
+**Transparency** (default) keeps the original solid color and 0–100% opacity
+setting. **Custom brush** accepts a single restricted XAML-like Brush element.
+
+Acrylic example (single line in Windhawk settings):
+`<AcrylicBrush BackgroundSource="HostBackdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />`
+
+Linear gradient example (also entered as one line):
+`<LinearGradientBrush StartPoint="0,0" EndPoint="1,1"><GradientStop Color="$mainColor" Offset="0" /><GradientStop Color="#80000000" Offset="1" /></LinearGradientBrush>`
+
+Also supported: `<SolidColorBrush Color="$mainColor" Opacity="0.7" />`.
+Colors accept `#RRGGBB`, `#AARRGGBB`, `$mainColor`, `$accentColor`,
+`$textColor` and `$trackColor`. Gradient brushes accept 2–12 stop elements,
+StartPoint, EndPoint, SpreadMethod (Pad/Reflect/Repeat) and Opacity. Numeric
+opacity/offset coordinates must be in 0–1. Only supported elements and
+properties are parsed; no XamlReader, event handlers, resources, other
+elements or executable markup. On invalid input or unavailable acrylic,
+the original solid color is the fallback (Acrylic also has its OS fallback
+color). Brush properties are only resolved on the XAML STA and cached until
+their inputs change.
 
 ## Setup
 
@@ -357,9 +383,27 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
           $name:zh-TW: 自訂軌道顏色（#RRGGBB）
           #! $showIf: {ddcTrackMode: custom}
           #! $format: colorRgb
+        - ddcBackgroundEffect: opacity
+          $name: Background effect
+          $name:zh-TW: 背景效果
+          $description: Preserve the existing solid opacity, or use one restricted custom brush definition.
+          $description:zh-TW: 保留原有純色不透明度，或改用單一受限制的自訂筆刷定義。
+          $options:
+          - opacity: Transparency
+          - custom: Custom brush
+          $options:zh-TW:
+          - opacity: 透明度
+          - custom: 自訂筆刷
+        - ddcCustomBrush: '<AcrylicBrush BackgroundSource="HostBackdrop" TintColor="$mainColor" TintOpacity="0.3" TintLuminosityOpacity="0.6" />'
+          $name: Custom background brush (single-line)
+          $name:zh-TW: 自訂背景筆刷（單行）
+          $description: Supports AcrylicBrush, SolidColorBrush and LinearGradientBrush (with GradientStop children). Invalid definitions fall back to solid.
+          $description:zh-TW: 支援 AcrylicBrush、SolidColorBrush 及含 GradientStop 的 LinearGradientBrush。設定無效時回退純色。
+          #! $showIf: {ddcBackgroundEffect: custom}
         - ddcBackgroundOpacity: 96
           $name: Background opacity (%)
           $name:zh-TW: 背景不透明度（%）
+          #! $showIf: {ddcBackgroundEffect: opacity}
           #! $min: 0
           #! $max: 100
           #! $format: slider
@@ -820,6 +864,8 @@ struct Snapshot {
     bool brightness = false;
     bool showIcon = true;
     BYTE backgroundAlpha = 255;
+    bool customBackground = false;
+    std::wstring backgroundMarkup;
     bool borderless = true, fadeEnabled = false;
     int cornerRadius = 17;
     DWORD fadeDurationMs = 160;
@@ -1524,11 +1570,324 @@ struct State {
     double iconSlotWidth = 0.0, iconSlotHeight = 0.0;
     double valueSlotWidth = 0.0, valueSlotHeight = 0.0;
     double rawSlotWidth = 0.0, rawSlotHeight = 0.0;
+    bool backgroundCached = false, cachedCustomBackground = false;
+    DWORD cachedBackground = 0, cachedAccent = 0,
+          cachedText = 0, cachedTrack = 0;
+    BYTE cachedBackgroundAlpha = 0;
+    std::wstring cachedBackgroundMarkup;
 };
 media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
     return media::SolidColorBrush(winrt::Windows::UI::Color{
         alpha, static_cast<BYTE>(rgb >> 16), static_cast<BYTE>(rgb >> 8),
         static_cast<BYTE>(rgb)});
+}
+
+// Only a tiny, bounded, non-executable subset of Brush markup is accepted.
+// No XML entities, namespaces, attached properties, markup extensions or
+// arbitrary XAML objects may enter Explorer's XAML STA.
+struct BrushTag {
+    std::wstring name;
+    std::vector<std::pair<std::wstring, std::wstring>> attrs;
+    bool closing = false, selfClosing = false;
+};
+bool BrushWhiteSpace(wchar_t c) {
+    return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n';
+}
+void SkipBrushSpaces(const std::wstring& input, size_t& pos) {
+    while (pos < input.size() && BrushWhiteSpace(input[pos])) ++pos;
+}
+bool IsBrushLetter(wchar_t c) {
+    return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
+}
+bool ReadBrushTag(const std::wstring& input, size_t& pos, BrushTag& tag) {
+    SkipBrushSpaces(input, pos);
+    if (pos >= input.size() || input[pos++] != L'<') return false;
+    if (pos < input.size() && input[pos] == L'/') {
+        tag.closing = true;
+        ++pos;
+    }
+    const size_t nameStart = pos;
+    while (pos < input.size() && IsBrushLetter(input[pos])) ++pos;
+    if (pos == nameStart) return false;
+    tag.name = input.substr(nameStart, pos - nameStart);
+    if (tag.closing) {
+        SkipBrushSpaces(input, pos);
+        if (pos >= input.size() || input[pos++] != L'>') return false;
+        return true;
+    }
+    while (pos < input.size()) {
+        const size_t beforeSpace = pos;
+        SkipBrushSpaces(input, pos);
+        if (pos + 1 < input.size() &&
+            input[pos] == L'/' && input[pos + 1] == L'>') {
+            pos += 2;
+            tag.selfClosing = true;
+            return true;
+        }
+        if (pos < input.size() && input[pos] == L'>') {
+            ++pos;
+            return true;
+        }
+        if (beforeSpace == pos || tag.attrs.size() >= 8 ||
+            pos >= input.size() || !IsBrushLetter(input[pos]))
+            return false;
+        const size_t keyStart = pos;
+        while (pos < input.size() && IsBrushLetter(input[pos])) ++pos;
+        const std::wstring key = input.substr(keyStart, pos - keyStart);
+        SkipBrushSpaces(input, pos);
+        if (pos >= input.size() || input[pos++] != L'=') return false;
+        SkipBrushSpaces(input, pos);
+        if (pos >= input.size() ||
+            (input[pos] != L'"' && input[pos] != L'\'')) return false;
+        const wchar_t quote = input[pos++];
+        const size_t valueStart = pos;
+        while (pos < input.size() && input[pos] != quote) {
+            if (input[pos] == L'<' || input[pos] == L'>' ||
+                input[pos] == L'&' || input[pos] == L'{' ||
+                input[pos] == L'}') return false;
+            ++pos;
+        }
+        if (pos >= input.size()) return false;
+        std::wstring value = input.substr(valueStart, pos - valueStart);
+        ++pos;
+        for (const auto& existing : tag.attrs)
+            if (existing.first == key) return false;
+        tag.attrs.emplace_back(key, std::move(value));
+    }
+    return false;
+}
+bool ParseBrushFraction(const std::wstring& text, double& value) {
+    if (text.empty() || text.size() > 16) return false;
+    double n = 0.0, factor = 1.0;
+    bool seenDigit = false, seenDot = false;
+    for (wchar_t c : text) {
+        if (c == L'.' && !seenDot) { seenDot = true; continue; }
+        if (c < L'0' || c > L'9') return false;
+        seenDigit = true;
+        if (!seenDot) n = n * 10.0 + (c - L'0');
+        else { factor *= 0.1; n += (c - L'0') * factor; }
+    }
+    if (!seenDigit || n < 0.0 || n > 1.0) return false;
+    value = n;
+    return true;
+}
+bool ParseBrushPoint(const std::wstring& text,
+                     winrt::Windows::Foundation::Point& result) {
+    const size_t comma = text.find(L',');
+    if (comma == std::wstring::npos || comma == 0 ||
+        comma + 1 >= text.size() ||
+        text.find(L',', comma + 1) != std::wstring::npos) return false;
+    double x = 0.0, y = 0.0;
+    if (!ParseBrushFraction(text.substr(0, comma), x) ||
+        !ParseBrushFraction(text.substr(comma + 1), y)) return false;
+    result = {static_cast<float>(x), static_cast<float>(y)};
+    return true;
+}
+bool ParseBrushColor(const Snapshot& state, const std::wstring& text,
+                     winrt::Windows::UI::Color& color) {
+    DWORD rgb = 0;
+    BYTE alpha = 255;
+    if (text == L"$mainColor") rgb = state.background;
+    else if (text == L"$accentColor") rgb = state.accent;
+    else if (text == L"$textColor") rgb = state.text;
+    else if (text == L"$trackColor") rgb = state.track;
+    else {
+        if (text.empty() || text[0] != L'#' ||
+            (text.size() != 7 && text.size() != 9)) return false;
+        uint32_t packed = 0;
+        for (size_t i = 1; i < text.size(); ++i) {
+            const wchar_t c = text[i];
+            const int digit = c >= L'0' && c <= L'9' ? c - L'0' :
+                c >= L'a' && c <= L'f' ? c - L'a' + 10 :
+                c >= L'A' && c <= L'F' ? c - L'A' + 10 : -1;
+            if (digit < 0) return false;
+            packed = (packed << 4) | static_cast<uint32_t>(digit);
+        }
+        if (text.size() == 9) alpha = static_cast<BYTE>(packed >> 24);
+        rgb = packed & 0xFFFFFF;
+    }
+    color = {alpha, static_cast<BYTE>(rgb >> 16),
+             static_cast<BYTE>(rgb >> 8), static_cast<BYTE>(rgb)};
+    return true;
+}
+bool TryBuildBackgroundBrush(const Snapshot& state, media::Brush& output) {
+    const std::wstring& input = state.backgroundMarkup;
+    if (input.empty() || input.size() > 4096) return false;
+    size_t pos = 0;
+    BrushTag root;
+    if (!ReadBrushTag(input, pos, root) || root.closing) return false;
+    if (root.name == L"SolidColorBrush") {
+        if (!root.selfClosing) return false;
+        winrt::Windows::UI::Color color{};
+        bool hasColor = false;
+        double opacity = 1.0;
+        for (const auto& attr : root.attrs) {
+            if (attr.first == L"Color") {
+                if (!ParseBrushColor(state, attr.second, color)) return false;
+                hasColor = true;
+            } else if (attr.first == L"Opacity") {
+                if (!ParseBrushFraction(attr.second, opacity)) return false;
+            } else return false;
+        }
+        SkipBrushSpaces(input, pos);
+        if (!hasColor || pos != input.size()) return false;
+        auto brush = media::SolidColorBrush(color);
+        brush.Opacity(opacity);
+        output = brush;
+        return true;
+    }
+    if (root.name == L"AcrylicBrush") {
+        if (!root.selfClosing) return false;
+        SkipBrushSpaces(input, pos);
+        if (pos != input.size()) return false;
+        auto tint = winrt::Windows::UI::Color{255,
+            static_cast<BYTE>(state.background >> 16),
+            static_cast<BYTE>(state.background >> 8),
+            static_cast<BYTE>(state.background)};
+        auto fallback = tint;
+        double opacity = 1.0, tintOpacity = 0.6, luminosityOpacity = 0.0;
+        bool setLuminosity = false;
+        bool forceFallback = false;
+        auto source = media::AcrylicBackgroundSource::HostBackdrop;
+        for (const auto& attr : root.attrs) {
+            if (attr.first == L"TintColor") {
+                if (!ParseBrushColor(state, attr.second, tint)) return false;
+            } else if (attr.first == L"FallbackColor") {
+                if (!ParseBrushColor(state, attr.second, fallback))
+                    return false;
+            } else if (attr.first == L"TintOpacity") {
+                if (!ParseBrushFraction(attr.second, tintOpacity))
+                    return false;
+            } else if (attr.first == L"TintLuminosityOpacity") {
+                if (!ParseBrushFraction(attr.second, luminosityOpacity))
+                    return false;
+                setLuminosity = true;
+            } else if (attr.first == L"Opacity") {
+                if (!ParseBrushFraction(attr.second, opacity)) return false;
+            } else if (attr.first == L"BackgroundSource") {
+                if (attr.second == L"HostBackdrop")
+                    source = media::AcrylicBackgroundSource::HostBackdrop;
+                else if (attr.second == L"Backdrop")
+                    source = media::AcrylicBackgroundSource::Backdrop;
+                else return false;
+            } else if (attr.first == L"AlwaysUseFallback") {
+                if (attr.second == L"True" || attr.second == L"true")
+                    forceFallback = true;
+                else if (attr.second == L"False" || attr.second == L"false")
+                    forceFallback = false;
+                else return false;
+            } else return false;
+        }
+        auto brush = media::AcrylicBrush();
+        brush.BackgroundSource(source);
+        brush.TintColor(tint);
+        brush.FallbackColor(fallback);
+        brush.TintOpacity(tintOpacity);
+        if (setLuminosity)
+            brush.TintLuminosityOpacity(luminosityOpacity);
+        brush.AlwaysUseFallback(forceFallback);
+        brush.Opacity(opacity);
+        output = brush;
+        return true;
+    }
+    if (root.name != L"LinearGradientBrush" || root.selfClosing)
+        return false;
+    auto brush = media::LinearGradientBrush();
+    winrt::Windows::Foundation::Point start{0.0f, 0.0f};
+    winrt::Windows::Foundation::Point end{1.0f, 1.0f};
+    double opacity = 1.0;
+    auto spread = media::GradientSpreadMethod::Pad;
+    for (const auto& attr : root.attrs) {
+        if (attr.first == L"StartPoint") {
+            if (!ParseBrushPoint(attr.second, start)) return false;
+        } else if (attr.first == L"EndPoint") {
+            if (!ParseBrushPoint(attr.second, end)) return false;
+        } else if (attr.first == L"Opacity") {
+            if (!ParseBrushFraction(attr.second, opacity)) return false;
+        } else if (attr.first == L"SpreadMethod") {
+            if (attr.second == L"Pad")
+                spread = media::GradientSpreadMethod::Pad;
+            else if (attr.second == L"Reflect")
+                spread = media::GradientSpreadMethod::Reflect;
+            else if (attr.second == L"Repeat")
+                spread = media::GradientSpreadMethod::Repeat;
+            else return false;
+        } else return false;
+    }
+    int count = 0;
+    for (;;) {
+        BrushTag child;
+        if (!ReadBrushTag(input, pos, child)) return false;
+        if (child.closing) {
+            if (child.name != L"LinearGradientBrush" || count < 2)
+                return false;
+            break;
+        }
+        if (!child.selfClosing || child.name != L"GradientStop" ||
+            count >= 12) return false;
+        winrt::Windows::UI::Color color{};
+        double offset = 0.0;
+        bool hasColor = false, hasOffset = false;
+        for (const auto& attr : child.attrs) {
+            if (attr.first == L"Color") {
+                if (!ParseBrushColor(state, attr.second, color))
+                    return false;
+                hasColor = true;
+            } else if (attr.first == L"Offset") {
+                if (!ParseBrushFraction(attr.second, offset))
+                    return false;
+                hasOffset = true;
+            } else return false;
+        }
+        if (!hasColor || !hasOffset) return false;
+        auto stop = media::GradientStop();
+        stop.Color(color);
+        stop.Offset(offset);
+        brush.GradientStops().Append(stop);
+        ++count;
+    }
+    SkipBrushSpaces(input, pos);
+    if (pos != input.size()) return false;
+    brush.StartPoint(start);
+    brush.EndPoint(end);
+    brush.SpreadMethod(spread);
+    brush.Opacity(opacity);
+    output = brush;
+    return true;
+}
+void ApplyBackground(State& state, const Snapshot& snapshot) {
+    if (state.backgroundCached &&
+        state.cachedCustomBackground == snapshot.customBackground &&
+        state.cachedBackground == snapshot.background &&
+        state.cachedBackgroundAlpha == snapshot.backgroundAlpha &&
+        state.cachedAccent == snapshot.accent &&
+        state.cachedText == snapshot.text &&
+        state.cachedTrack == snapshot.track &&
+        state.cachedBackgroundMarkup == snapshot.backgroundMarkup)
+        return;
+    media::Brush brush{nullptr};
+    bool valid = false;
+    if (snapshot.customBackground) {
+        try { valid = TryBuildBackgroundBrush(snapshot, brush); }
+        catch (const winrt::hresult_error& ex) {
+            Wh_Log(L"Custom background brush unavailable: 0x%08lX",
+                   static_cast<unsigned long>(ex.code()));
+        } catch (...) {
+            Wh_Log(L"Custom background brush creation failed");
+        }
+        if (!valid)
+            Wh_Log(L"Custom background brush invalid; using solid fallback");
+    }
+    if (!valid) brush = Brush(snapshot.background, snapshot.backgroundAlpha);
+    state.card.Background(brush);
+    state.backgroundCached = true;
+    state.cachedCustomBackground = snapshot.customBackground;
+    state.cachedBackground = snapshot.background;
+    state.cachedBackgroundAlpha = snapshot.backgroundAlpha;
+    state.cachedAccent = snapshot.accent;
+    state.cachedText = snapshot.text;
+    state.cachedTrack = snapshot.track;
+    state.cachedBackgroundMarkup = snapshot.backgroundMarkup;
 }
 
 void DrawSnapshot(State&, const Snapshot&);
@@ -2104,7 +2463,7 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
 
     state.canvas.IsHitTestVisible(clickableNotice);
     state.canvas.Width(bodyW);
-    state.card.Background(Brush(value.background, value.backgroundAlpha));
+    ApplyBackground(state, value);
     const double radius = layout.radius;
     state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
     state.card.BorderBrush(Brush(value.track));
@@ -2207,7 +2566,7 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
     state.canvas.IsHitTestVisible(false);
     state.canvas.Width(bodyW);
     state.canvas.Height(bodyH);
-    state.card.Background(Brush(data.background, data.backgroundAlpha));
+    ApplyBackground(state, data);
     state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
     state.card.BorderBrush(Brush(data.track));
     const double border = data.borderless ? 0.0 : 1.0;
@@ -2401,6 +2760,8 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         state.current.vertical==snap.vertical&&
         state.current.background==snap.background&&
         state.current.backgroundAlpha==snap.backgroundAlpha&&
+        state.current.customBackground==snap.customBackground&&
+        state.current.backgroundMarkup==snap.backgroundMarkup&&
         state.current.accent==snap.accent&&
         state.current.text==snap.text&&
         state.current.track==snap.track&&
@@ -2424,7 +2785,7 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
     const double w=g.frame.width,h=g.frame.height;
     state.canvas.IsHitTestVisible(true);
     state.canvas.Width(w);state.canvas.Height(h);
-    state.card.Background(Brush(snap.background,snap.backgroundAlpha));
+    ApplyBackground(state, snap);
     const double radius=std::clamp(double(snap.cornerRadius),0.0,34.0);
     state.card.CornerRadius(wx::CornerRadius{
         radius,radius,radius,radius});
@@ -2631,7 +2992,7 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     state.canvas.IsHitTestVisible(true);
     state.canvas.Width(w);
     state.canvas.Height(h);
-    state.card.Background(Brush(data.background, data.backgroundAlpha));
+    ApplyBackground(state, data);
     state.card.CornerRadius(wx::CornerRadius{radius, radius, radius, radius});
     state.card.BorderBrush(Brush(data.track));
     const double border = data.borderless ? 0.0 : 1.0;
@@ -2935,7 +3296,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         osd_layout::MixerButtonGeometry(value, bodyW, bodyH);
     state.canvas.Width(bodyW);
     state.canvas.Height(bodyH);
-    state.card.Background(Brush(value.background, value.backgroundAlpha));
+    ApplyBackground(state, value);
     const double radius = static_cast<double>(
         std::clamp(value.cornerRadius, 0, 34));
     state.card.CornerRadius(wx::CornerRadius{
@@ -4141,6 +4502,9 @@ std::atomic<int> g_trackMode{0};
 std::atomic<DWORD> g_customTrack{0};
 std::atomic<bool> g_validCustomTrack{false};
 std::atomic<int> g_backgroundOpacity{96};
+std::atomic<bool> g_useCustomBackgroundBrush{false};
+std::mutex g_backgroundMarkupMutex;
+std::wstring g_backgroundMarkup;
 std::atomic<int> g_cornerRadius{17};
 std::atomic<int> g_fontSize{15};
 std::atomic<int> g_iconSize{16};
@@ -4649,6 +5013,21 @@ void LoadSettings() {
     LoadHexSetting(L"CustomOSD.Appearance.ddcCustomText", g_customText, g_validCustomText);
     LoadHexSetting(L"CustomOSD.Appearance.ddcCustomTrack", g_customTrack, g_validCustomTrack);
     g_backgroundOpacity.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBackgroundOpacity"), 0, 100));
+    {
+        PCWSTR effect = Wh_GetStringSetting(L"CustomOSD.Appearance.ddcBackgroundEffect");
+        const bool custom = effect && _wcsicmp(effect, L"custom") == 0;
+        Wh_FreeStringSetting(effect);
+        PCWSTR configured = Wh_GetStringSetting(L"CustomOSD.Appearance.ddcCustomBrush");
+        std::wstring markup = configured ? configured : L"";
+        Wh_FreeStringSetting(configured);
+        // Settings callbacks and OSD snapshots may run on separate threads.
+        // Publish the markup under the lock before publishing the mode flag.
+        {
+            std::lock_guard<std::mutex> lock(g_backgroundMarkupMutex);
+            g_backgroundMarkup = std::move(markup);
+            g_useCustomBackgroundBrush.store(custom, std::memory_order_release);
+        }
+    }
     g_cornerRadius.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcCornerRadius"), 0, 34));
     g_fontSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcFontSize"), 10, 24));
     g_iconSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcIconSize"), 10, 24));
@@ -6060,6 +6439,12 @@ xaml_osd::Snapshot MakeXamlSnapshot(
     const bool light = IsLightTheme();
     data.background = OsdBackgroundRgb(light);
     data.backgroundAlpha = OsdBackgroundAlpha();
+    {
+        std::lock_guard<std::mutex> lock(g_backgroundMarkupMutex);
+        data.customBackground =
+            g_useCustomBackgroundBrush.load(std::memory_order_acquire);
+        if (data.customBackground) data.backgroundMarkup = g_backgroundMarkup;
+    }
     data.borderless = g_ddcBorderless.load();
     data.cornerRadius = g_cornerRadius.load();
     data.fadeEnabled = g_fadeEnabled.load();
