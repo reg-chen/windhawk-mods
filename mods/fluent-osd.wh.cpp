@@ -1389,79 +1389,74 @@ void CreateContent(State& state) {
     state.thumb = thumb;
     state.value = value;
 }
-DWORD WINAPI ThreadProc(void*) {
-    State state;
-    MSG msg{};
-    bool apartment = false, registered = false;
-    const HINSTANCE inst = GetModuleHandleW(nullptr);
-    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
-    g_threadId.store(GetCurrentThreadId(), std::memory_order_release);
-    try {
-        winrt::init_apartment(winrt::apartment_type::single_threaded);
-        apartment = true;
-        if (!g_stopping.load()) {
-            WNDCLASSEXW wc{sizeof(wc)};
-            wc.lpfnWndProc = WndProc;
-            wc.hInstance = inst;
-            wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-            wc.lpszClassName = kClass;
-            registered = RegisterClassExW(&wc) != 0;
-            if (!registered)
-                winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
-            state.host = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                kClass, L"", WS_POPUP, 0, 0, kWidth, kHeight,
-                nullptr, nullptr, inst, &state);
-            if (!state.host)
-                winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
-            const DWM_WINDOW_CORNER_PREFERENCE rounding = DWMWCP_ROUND;
-            const HRESULT dwm = DwmSetWindowAttribute(
-                state.host, DWMWA_WINDOW_CORNER_PREFERENCE,
-                &rounding, sizeof(rounding));
-            // Windows 11 can draw a one-pixel dark frame even around a
-            // borderless WS_POPUP. This is distinct from the XAML Border.
-            // Suppress the DWM frame while preserving compositor rounding.
-            const COLORREF noBorder = DWMWA_COLOR_NONE;
-            const HRESULT borderHr = DwmSetWindowAttribute(
-                state.host, DWMWA_BORDER_COLOR,
-                &noBorder, sizeof(noBorder));
-            Wh_Log(L"XAML v1.0.16: DWM round=0x%08lX border-none=0x%08lX",
-                   static_cast<unsigned long>(dwm),
-                   static_cast<unsigned long>(borderHr));
-            if (!g_stopping.load()) {
-                state.manager =
-                    hosting::WindowsXamlManager::InitializeForCurrentThread();
-                state.source = hosting::DesktopWindowXamlSource{};
-                ComPtr<IDesktopWindowXamlSourceNative> interop;
-                winrt::check_hresult(winrt::get_unknown(state.source)->
-                    QueryInterface(kInteropIID,
-                        reinterpret_cast<void**>(interop.GetAddressOf())));
-                winrt::check_hresult(interop->AttachToWindow(state.host));
-                winrt::check_hresult(interop->get_WindowHandle(&state.island));
-                if (!state.island) winrt::throw_hresult(E_POINTER);
-                if (!SetWindowPos(state.island, nullptr, 0, 0, kWidth, kHeight,
-                     SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW))
-                    winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
-                CreateContent(state);
-                g_ready.store(state.host, std::memory_order_release);
-                Wh_Log(L"XAML v1.0.16: renderer ready");
-                while (!g_stopping.load() &&
-                       GetMessageW(&msg, nullptr, 0, 0) > 0) {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
+void CreateSurface(State& state, HINSTANCE instance) {
+    state.host = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kClass, L"", WS_POPUP, 0, 0, kWidth, kHeight,
+        nullptr, nullptr, instance, &state);
+    if (!state.host)
+        winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
+
+    const DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
+    const COLORREF noBorder = DWMWA_COLOR_NONE;
+    const HRESULT rounded = DwmSetWindowAttribute(
+        state.host, DWMWA_WINDOW_CORNER_PREFERENCE,
+        &corner, sizeof(corner));
+    const HRESULT border = DwmSetWindowAttribute(
+        state.host, DWMWA_BORDER_COLOR, &noBorder, sizeof(noBorder));
+    // A full-glass host has no opaque Win32 client-area paint behind
+    // the alpha-enabled XAML Island content. The top-level DWM window
+    // remains non-layered so its compositor-anti-aliased corners work.
+    const MARGINS glass{-1, -1, -1, -1};
+    const HRESULT frame = DwmExtendFrameIntoClientArea(state.host, &glass);
+    Wh_Log(L"XAML v1.0.17: rounded=0x%08lX border=0x%08lX frame=0x%08lX",
+        static_cast<unsigned long>(rounded),
+        static_cast<unsigned long>(border),
+        static_cast<unsigned long>(frame));
+
+    state.source = hosting::DesktopWindowXamlSource{};
+    ComPtr<IDesktopWindowXamlSourceNative> interop;
+    winrt::check_hresult(winrt::get_unknown(state.source)->
+        QueryInterface(kInteropIID,
+            reinterpret_cast<void**>(interop.GetAddressOf())));
+    winrt::check_hresult(interop->AttachToWindow(state.host));
+    winrt::check_hresult(interop->get_WindowHandle(&state.island));
+    if (!state.island) winrt::throw_hresult(E_POINTER);
+    if (!SetWindowPos(state.island, nullptr, 0, 0, kWidth, kHeight,
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW))
+        winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
+    CreateContent(state);
+
+    // Independent native hit targets; unlike the old GDI+ overlays
+    // these follow XAML track bounds and have their own HWND instances
+    // for each physical DDC target.
+    auto makeInput = [&]() -> HWND {
+        HWND window = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                WS_EX_LAYERED,
+            kClass, L"", WS_POPUP, 0, 0, 1, 1,
+            nullptr, nullptr, instance, &state);
+        if (!window) return nullptr;
+        if (!SetLayeredWindowAttributes(window, 0, 1, LWA_ALPHA)) {
+            DestroyWindow(window);
+            return nullptr;
         }
-    } catch (const winrt::hresult_error& ex) {
-        Wh_Log(L"XAML v1.0.16: startup failed 0x%08lX (%s)",
-               static_cast<unsigned long>(ex.code()), ex.message().c_str());
-        g_failed.store(true);
-    } catch (...) {
-        Wh_Log(L"XAML v1.0.16: startup exception");
-        g_failed.store(true);
-    }
-    g_ready.store(nullptr, std::memory_order_release);
-    if (state.host) KillTimer(state.host, kHideTimer);
+        return window;
+    };
+    state.barInput = makeInput();
+    state.iconInput = makeInput();
+    if (!state.barInput || !state.iconInput)
+        Wh_Log(L"XAML v1.0.17: an input overlay could not be created");
+}
+
+void CloseSurface(State& state) {
+    HideSurface(state);
+    if (state.barInput && GetCapture() == state.barInput) ReleaseCapture();
+    if (state.iconInput && GetCapture() == state.iconInput) ReleaseCapture();
+    if (state.barInput) DestroyWindow(state.barInput);
+    if (state.iconInput) DestroyWindow(state.iconInput);
+    state.barInput = state.iconInput = nullptr;
+
     state.thumb = nullptr;
     state.fillClip = nullptr;
     state.fill = nullptr;
@@ -1473,16 +1468,130 @@ DWORD WINAPI ThreadProc(void*) {
     state.card = nullptr;
     if (state.source) {
         try { state.source.Content(nullptr); state.source.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.16: island close failed"); }
+        catch (...) { Wh_Log(L"XAML v1.0.17: island close failed"); }
         state.source = nullptr;
     }
-    if (state.manager) {
-        try { state.manager.Close(); }
-        catch (...) { Wh_Log(L"XAML v1.0.16: manager close failed"); }
-        state.manager = nullptr;
-    }
+    state.island = nullptr;
     if (state.host) DestroyWindow(state.host);
-    if (registered) UnregisterClassW(kClass, inst);
+    state.host = nullptr;
+}
+
+// The primary STA HWND is the dispatcher. DDC uses one HWND and Island
+// per *physical* target. Every update is a complete snapshot batch,
+// so removed/unresolved targets do not retain stale visible windows.
+void DeliverPending(State& root) {
+    std::vector<Snapshot> batch;
+    AcquireSRWLockExclusive(&g_snapshotLock);
+    batch.swap(g_pending);
+    ReleaseSRWLockExclusive(&g_snapshotLock);
+    if (batch.empty()) return;
+
+    const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
+    if (!ddc) {
+        for (auto& peer : root.peers) HideSurface(*peer.second);
+        DrawSnapshot(root, batch.back());
+        return;
+    }
+    HideSurface(root);
+    std::unordered_set<std::wstring> requested;
+    for (const auto& snap : batch) {
+        if (snap.key.empty()) continue;
+        requested.insert(snap.key);
+        auto found = root.peers.find(snap.key);
+        if (found == root.peers.end()) {
+            auto fresh = std::make_unique<State>();
+            try {
+                CreateSurface(*fresh, GetModuleHandleW(nullptr));
+            } catch (const winrt::hresult_error& ex) {
+                Wh_Log(L"XAML v1.0.17: DDC target create failed 0x%08lX",
+                    static_cast<unsigned long>(ex.code()));
+                CloseSurface(*fresh);
+                continue;
+            }
+            found = root.peers.emplace(snap.key, std::move(fresh)).first;
+        }
+        DrawSnapshot(*found->second, snap);
+    }
+    for (auto& peer : root.peers)
+        if (requested.find(peer.first) == requested.end())
+            HideSurface(*peer.second);
+}
+
+void TryEnableIslandTransparency() {
+    // Official IXamlSourceTransparency applies to every Island on the
+    // current XAML STA. Log QI failure; do not silently claim opacity works.
+    try {
+        auto currentWindow = wx::Window::Current();
+        if (!currentWindow) {
+            Wh_Log(L"XAML v1.0.17: Window.Current unavailable for transparency");
+            return;
+        }
+        ComPtr<IXamlSourceTransparency> transparency;
+        HRESULT hr = winrt::get_unknown(currentWindow)->QueryInterface(
+            kTransparencyIID,
+            reinterpret_cast<void**>(transparency.GetAddressOf()));
+        if (SUCCEEDED(hr) && transparency)
+            hr = transparency->put_IsBackgroundTransparent(1);
+        Wh_Log(L"XAML v1.0.17: Island transparency HRESULT=0x%08lX",
+            static_cast<unsigned long>(hr));
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"XAML v1.0.17: transparency initialization exception 0x%08lX",
+            static_cast<unsigned long>(ex.code()));
+    }
+}
+
+DWORD WINAPI ThreadProc(void*) {
+    State root;
+    MSG msg{};
+    bool apartment = false, registered = false;
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    g_threadId.store(GetCurrentThreadId(), std::memory_order_release);
+    try {
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
+        apartment = true;
+        if (!g_stopping.load()) {
+            WNDCLASSEXW wc{sizeof(wc)};
+            wc.lpfnWndProc = WndProc;
+            wc.hInstance = instance;
+            wc.hbrBackground = nullptr; // Don't paint opaque host behind XAML.
+            wc.lpszClassName = kClass;
+            registered = RegisterClassExW(&wc) != 0;
+            if (!registered)
+                winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
+
+            root.manager =
+                hosting::WindowsXamlManager::InitializeForCurrentThread();
+            TryEnableIslandTransparency();
+            if (!g_stopping.load()) {
+                CreateSurface(root, instance);
+                g_ready.store(root.host, std::memory_order_release);
+                Wh_Log(L"XAML v1.0.17: renderer ready (per-display DDC)");
+                while (!g_stopping.load() &&
+                       GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"XAML v1.0.17: startup failed 0x%08lX (%s)",
+               static_cast<unsigned long>(ex.code()), ex.message().c_str());
+        g_failed.store(true);
+    } catch (...) {
+        Wh_Log(L"XAML v1.0.17: unexpected startup exception");
+        g_failed.store(true);
+    }
+    g_ready.store(nullptr, std::memory_order_release);
+    for (auto& peer : root.peers) CloseSurface(*peer.second);
+    root.peers.clear(); // Release peer WinRT refs while STA is still alive.
+    CloseSurface(root);
+    if (root.manager) {
+        try { root.manager.Close(); }
+        catch (...) { Wh_Log(L"XAML v1.0.17: manager close failed"); }
+        root.manager = nullptr;
+    }
+    if (registered) UnregisterClassW(kClass, instance);
     if (apartment) winrt::uninit_apartment();
     g_threadId.store(0, std::memory_order_release);
     return 0;
@@ -1496,14 +1605,19 @@ void Start() {
         Wh_Log(L"XAML v1.0.16: STA creation failed (%lu)", GetLastError());
     }
 }
-bool Show(const Snapshot& snapshot) {
+bool ShowBatch(const std::vector<Snapshot>& snapshots) {
     const HWND hwnd = g_ready.load(std::memory_order_acquire);
-    if (!hwnd || g_stopping.load() || g_failed.load()) return false;
+    if (!hwnd || g_stopping.load() || g_failed.load() ||
+        snapshots.empty()) return false;
     AcquireSRWLockExclusive(&g_snapshotLock);
-    g_pending = snapshot;
+    g_pending = snapshots;
     ReleaseSRWLockExclusive(&g_snapshotLock);
     return PostMessageW(hwnd, kShowMessage, 0, 0) != FALSE;
 }
+bool Show(const Snapshot& snapshot) {
+    return ShowBatch(std::vector<Snapshot>{snapshot});
+}
+
 void Hide() {
     const HWND hwnd = g_ready.load(std::memory_order_acquire);
     if (hwnd) PostMessageW(hwnd, kHideMessage, 0, 0);
