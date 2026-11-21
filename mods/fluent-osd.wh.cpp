@@ -692,6 +692,9 @@ UI assets are bundled; third-party names/trademarks belong to their owners.
 #include <winrt/base.h>
 #undef GetCurrentTime
 #include <winrt/Windows.Foundation.h>
+// WriteableBitmap::PixelBuffer returns Windows.Storage.Streams.IBuffer;
+// calling Length() needs its full projection (as with PointerPoint).
+#include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.UI.h>
 // PointerRoutedEventArgs::GetCurrentPoint returns Windows.UI.Input.PointerPoint.
 // Its Position/Properties members require the full projection, not just XAML.Input.
