@@ -2670,6 +2670,9 @@ void DeliverPending(State& root) {
         for (auto& peer : root.peers)
             if (peer.first != L"mixer") HideSurface(*peer.second);
         DrawSnapshot(root, batch.front());
+        // Mixer owns the active inactivity timer while open. Do not hide
+        // the parent volume card earlier than its attached panel.
+        if (root.host) KillTimer(root.host, kHideTimer);
         auto found = root.peers.find(L"mixer");
         if (found == root.peers.end()) {
             auto fresh = std::make_unique<State>();
@@ -9291,6 +9294,7 @@ void ShowXamlMixerPanel() {
     auto volume = MakeXamlSnapshot(
         PopupKind::NativeVolume, main, g_scale);
     volume.mixerChevron = g_showMixerArrow.load();
+    volume.durationMs = OsdDuration(DurationKind::Interactive);
     auto mixer = MakeXamlSnapshot(
         PopupKind::NativeVolume, panel, g_scale);
     mixer.kind = osd_model::Kind::Mixer;
@@ -9356,12 +9360,78 @@ struct PendingDdcWrite {
 std::vector<PendingDdcWrite> g_pendingDdcWrites; // UI thread only.
 struct ControlEffects {
     bool volume = false, nativeBrightness = false, ddc = false;
+    bool mixer = false;
 };
 ControlEffects ApplyOsdCommands(
         const std::vector<osd_control::Command>& commands) {
     ControlEffects effects;
     if (g_closing.load()) return effects;
     for (const auto& cmd : commands) {
+        if (cmd.target == osd_control::Target::Mixer) {
+            if (cmd.action == osd_control::Action::OpenMixer) {
+                if (g_xamlMixerOpen) {
+                    g_xamlMixerOpen = false;
+                    g_xamlMixerOutputExpanded = false;
+                    StopMixerOutputNotifications();
+                    CleanupMixerIcons();
+                    g_mixerEntries.clear();
+                    g_mixerMaster.Reset();
+                } else if (g_showMixerArrow.load() &&
+                           g_popupKind == PopupKind::NativeVolume) {
+                    ClosePanel();
+                    g_xamlMixerOutputExpanded = false;
+                    RefreshMixer();
+                    StartMixerOutputNotifications();
+                    g_xamlMixerOpen = true;
+                }
+                effects.mixer = true;
+                continue;
+            }
+            if (cmd.action == osd_control::Action::CloseMixer) {
+                if (g_xamlMixerOpen) {
+                    g_xamlMixerOpen = false;
+                    g_xamlMixerOutputExpanded = false;
+                    StopMixerOutputNotifications();
+                    CleanupMixerIcons();
+                    g_mixerEntries.clear();
+                    g_mixerMaster.Reset();
+                    effects.mixer = true;
+                }
+                continue;
+            }
+            if (!g_xamlMixerOpen ||
+                cmd.generation != g_xamlMixerGeneration) continue;
+            switch (cmd.action) {
+                case osd_control::Action::MixerSetPercent:
+                    (void)SetMixerPercent(cmd.index, cmd.value);
+                    // Never rebuild controls mid-drag: Slider keeps capture.
+                    break;
+                case osd_control::Action::MixerToggleMute:
+                    ToggleMixerMute(cmd.index);
+                    effects.mixer = true;
+                    break;
+                case osd_control::Action::MixerToggleOutput:
+                    if (!g_xamlMixerOutputExpanded) {
+                        RefreshMixer(); // Reconcile current endpoints.
+                        g_xamlMixerOutputExpanded = true;
+                    } else {
+                        g_xamlMixerOutputExpanded = false;
+                    }
+                    effects.mixer = true;
+                    break;
+                case osd_control::Action::MixerSelectOutput:
+                    if (cmd.index >= 0 &&
+                        cmd.index < static_cast<int>(
+                            g_mixerOutputOptions.size())) {
+                        SelectMixerOutput(cmd.index);
+                        g_xamlMixerOutputExpanded = false;
+                        effects.mixer = true;
+                    }
+                    break;
+                default: break;
+            }
+            continue;
+        }
         if (cmd.target == osd_control::Target::Volume) {
             if (g_popupKind != PopupKind::NativeVolume) continue;
             bool ok = false;
@@ -9457,8 +9527,13 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // does not read an XAML feature flag or depend on renderer types.
         if (g_xamlForMigrated.load()) {
             const auto effects = ApplyOsdCommands(commands);
-            if (effects.volume)
+            if (effects.mixer ||
+                (effects.volume && g_xamlMixerOpen)) {
+                if (g_xamlMixerOpen) ShowXamlMixerPanel();
+                else ShowMigratedXamlLevel(PopupKind::NativeVolume);
+            } else if (effects.volume) {
                 ShowMigratedXamlLevel(PopupKind::NativeVolume);
+            }
             if (effects.nativeBrightness)
                 ShowMigratedXamlLevel(PopupKind::NativeBrightness);
             if (effects.ddc)
@@ -9571,7 +9646,12 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == kAudioRefreshMessage && hwnd == g_receiveWnd) {
         if (g_mixerNotify) g_mixerNotify->ClearPending();
-        if (g_panelMode == PanelMode::Mixer && !g_closing.load()) {
+        if (g_xamlForMigrated.load() && g_xamlMixerOpen &&
+            !g_closing.load()) {
+            RefreshMixer();
+            ShowXamlMixerPanel();
+        } else if (g_panelMode == PanelMode::Mixer &&
+                   !g_closing.load()) {
             RefreshMixer();
             RenderPanel();
         }
