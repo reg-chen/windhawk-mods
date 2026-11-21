@@ -752,8 +752,103 @@ DWORD PercentToRaw(DWORD minimum, DWORD maximum, int percent) {
 }
 } // namespace osd_input
 
-// Optional native XAML volume renderer. WinRT and HWND ownership stay entirely
-// on a dedicated STA. The existing Hook/UI threads exchange only value data.
+// Data/intent contracts have no dependency on XAML or its STA. The Win32
+// receiver/RECT/device IDs are transport and placement facts, not UI objects.
+namespace osd_model {
+enum class Kind {
+    Volume, NativeBrightness, DdcBrightness, LockStatus, NoticeStatus,
+    NativeEvent, ClipboardImage
+};
+struct Snapshot {
+    Kind kind = Kind::Volume;
+    std::wstring key;       // Nonempty for a physical DDC display/window.
+    HWND receiver = nullptr;
+    WCHAR device[CCHDEVICENAME]{};
+    DWORD physicalIndex = 0, minimum = 0, maximum = 0;
+    int percent = 0;
+    int rawValue = 0;
+    bool valueKnown = true;
+    bool muted = false;
+    bool statusActive = false;
+    bool statusFontIcon = false;
+    std::wstring statusTitle, statusDetail, statusGlyph;
+    std::wstring noticeDetailsHeading;
+    std::vector<std::wstring> noticeDetails;
+    DWORD noticeInteractiveDurationMs = 8000;
+    uint32_t clipboardWidth = 0, clipboardHeight = 0;
+    std::vector<uint8_t> clipboardPixels; // Bounded 32-bit BGRA, no HBITMAP on STA.
+    bool brightness = false;
+    bool showIcon = true;
+    BYTE backgroundAlpha = 255;
+    bool borderless = true, fadeEnabled = false;
+    int cornerRadius = 17;
+    DWORD fadeDurationMs = 160;
+    DWORD durationMs = 3000;
+    RECT anchor{};          // Existing placement canvas in physical pixels.
+    float scale = 1.0f;     // Monitor DPI * user-defined size.
+    bool vertical = false;
+    bool showValue = true;
+    int innerPadding = 14;
+    int iconSize = 16, fontSize = 15, barThickness = 8, thumbDiameter = 11;
+    DWORD background = 0x232327, text = 0xf8f8fc;
+    DWORD accent = 0x67acff, track = 0x56565c;
+};
+} // namespace osd_model
+
+// Control adapter: XAML (or a future renderer) may emit a command, but
+// hardware and audio APIs are called only by the existing UI-thread handler.
+namespace osd_control {
+enum class Action { SetPercent, Wheel, ToggleMute };
+enum class Target { None, Volume, NativeBrightness, DdcBrightness };
+struct Command {
+    Target target = Target::None;
+    Action action = Action::SetPercent;
+    int value = 0;
+    WCHAR device[CCHDEVICENAME]{};
+    DWORD physicalIndex = 0, minimum = 0, maximum = 0;
+};
+constexpr UINT kMessage = WM_APP + 690;
+SRWLOCK g_lock = SRWLOCK_INIT;
+std::vector<Command> g_pending;
+
+Target ForCategory(osd_model::Kind kind) {
+    switch (kind) {
+        case osd_model::Kind::Volume: return Target::Volume;
+        case osd_model::Kind::NativeBrightness: return Target::NativeBrightness;
+        case osd_model::Kind::DdcBrightness: return Target::DdcBrightness;
+        default: return Target::None;
+    }
+}
+Command Build(const osd_model::Snapshot& source, Action action, int value) {
+    Command cmd;
+    cmd.target = ForCategory(source.kind);
+    cmd.action = action;
+    cmd.value = value;
+    wcscpy_s(cmd.device, source.device);
+    cmd.physicalIndex = source.physicalIndex;
+    cmd.minimum = source.minimum;
+    cmd.maximum = source.maximum;
+    return cmd;
+}
+void Submit(const Command& cmd, HWND receiver) {
+    if (!receiver || cmd.target == Target::None) return;
+    AcquireSRWLockExclusive(&g_lock);
+    if (g_pending.size() >= 64) g_pending.erase(g_pending.begin());
+    g_pending.push_back(cmd);
+    ReleaseSRWLockExclusive(&g_lock);
+    if (!PostMessageW(receiver, kMessage, 0, 0))
+        Wh_Log(L"OSD command post failed (%lu)", GetLastError());
+}
+std::vector<Command> Drain() {
+    std::vector<Command> result;
+    AcquireSRWLockExclusive(&g_lock);
+    result.swap(g_pending);
+    ReleaseSRWLockExclusive(&g_lock);
+    return result;
+}
+} // namespace osd_control
+
+// Optional native XAML backend. WinRT visual objects stay on its STA.
 namespace xaml_osd {
 namespace wx = winrt::Windows::UI::Xaml;
 namespace controls = winrt::Windows::UI::Xaml::Controls;
@@ -788,7 +883,7 @@ constexpr GUID kTransparencyIID = {
 constexpr wchar_t kClass[] = L"Windhawk.FluentOSD.XamlMigration.Host";
 constexpr UINT kShowMessage = WM_APP + 680;
 constexpr UINT kHideMessage = WM_APP + 681;
-constexpr UINT kInputMessage = WM_APP + 690; // To existing Explorer UI receiver.
+constexpr UINT kInputMessage = osd_control::kMessage; // Renderer-neutral command delivery.
 constexpr UINT_PTR kHideTimer = 683;
 constexpr UINT_PTR kFadeTimer = 684;
 constexpr UINT_PTR kStatusLineTimer = 685;
@@ -804,61 +899,11 @@ std::mutex g_startLock;
 SRWLOCK g_snapshotLock = SRWLOCK_INIT;
 HANDLE g_thread = nullptr;
 
-enum class LevelKind { Volume, NativeBrightness, DdcBrightness, LockStatus, NoticeStatus, NativeEvent, ClipboardImage };
-struct Snapshot {
-    LevelKind kind = LevelKind::Volume;
-    std::wstring key;       // Nonempty for a physical DDC display/window.
-    HWND receiver = nullptr;
-    WCHAR device[CCHDEVICENAME]{};
-    DWORD physicalIndex = 0, minimum = 0, maximum = 0;
-    int percent = 0;
-    int rawValue = 0;
-    bool valueKnown = true;
-    bool muted = false;
-    bool statusActive = false;
-    bool statusFontIcon = false;
-    std::wstring statusTitle, statusDetail, statusGlyph;
-    std::wstring noticeDetailsHeading;
-    std::vector<std::wstring> noticeDetails;
-    DWORD noticeInteractiveDurationMs = 8000;
-    uint32_t clipboardWidth = 0, clipboardHeight = 0;
-    std::vector<uint8_t> clipboardPixels; // Bounded 32-bit BGRA, no HBITMAP on STA.
-    bool brightness = false;
-    bool showIcon = true;
-    BYTE backgroundAlpha = 255;
-    bool borderless = true, fadeEnabled = false;
-    int cornerRadius = 17;
-    DWORD fadeDurationMs = 160;
-    DWORD durationMs = 3000;
-    RECT anchor{};          // Existing placement canvas in physical pixels.
-    float scale = 1.0f;     // Monitor DPI * user-defined size.
-    bool vertical = false;
-    bool showValue = true;
-    int innerPadding = 14;
-    int iconSize = 16, fontSize = 15, barThickness = 8, thumbDiameter = 11;
-    DWORD background = 0x232327, text = 0xf8f8fc;
-    DWORD accent = 0x67acff, track = 0x56565c;
-};
-std::vector<Snapshot> g_pending; // Batched, atomic DDC update across monitors.
-
-enum class InputAction { SetPercent, Wheel, ToggleMute };
-struct InputCommand {
-    LevelKind kind = LevelKind::Volume;
-    InputAction action = InputAction::SetPercent;
-    int value = 0;
-    WCHAR device[CCHDEVICENAME]{};
-    DWORD physicalIndex = 0, minimum = 0, maximum = 0;
-};
-SRWLOCK g_inputLock = SRWLOCK_INIT;
-std::vector<InputCommand> g_inputQueue;
-
-std::vector<InputCommand> TakeInputs() {
-    std::vector<InputCommand> result;
-    AcquireSRWLockExclusive(&g_inputLock);
-    result.swap(g_inputQueue);
-    ReleaseSRWLockExclusive(&g_inputLock);
-    return result;
-}
+using LevelKind = osd_model::Kind;
+using Snapshot = osd_model::Snapshot;
+using InputAction = osd_control::Action;
+using InputCommand = osd_control::Command;
+std::vector<Snapshot> g_pending; // Atomic update batches for the XAML STA.
 
 struct State {
     HWND host = nullptr, island = nullptr;
@@ -929,21 +974,9 @@ void ToggleNoticeDetails(State&);
 // The STA handles pointer geometry and sends only bounded POD commands.
 void SendInput(State& state, InputAction action, int value) {
     if (g_stopping.load() || !state.current.receiver) return;
-    InputCommand command;
-    command.kind = state.current.kind;
-    command.action = action;
-    command.value = value;
-    wcscpy_s(command.device, state.current.device);
-    command.physicalIndex = state.current.physicalIndex;
-    command.minimum = state.current.minimum;
-    command.maximum = state.current.maximum;
-    AcquireSRWLockExclusive(&g_inputLock);
-    if (g_inputQueue.size() >= 64) g_inputQueue.erase(g_inputQueue.begin());
-    g_inputQueue.push_back(command);
-    ReleaseSRWLockExclusive(&g_inputLock);
-    if (!PostMessageW(state.current.receiver, kInputMessage, 0, 0)) {
-        Wh_Log(L"XAML v1.0.24: input post failed (%lu)", GetLastError());
-    }
+    osd_control::Submit(
+        osd_control::Build(state.current, action, value),
+        state.current.receiver);
 }
 
 void HideSurface(State& state) {
@@ -8723,10 +8756,10 @@ struct XamlPendingDdcWrite {
 std::vector<XamlPendingDdcWrite> g_xamlPendingDdcWrites; // UI thread only.
 
 void ProcessXamlInputs() {
-    auto inputs = xaml_osd::TakeInputs();
+    auto inputs = osd_control::Drain();
     if (g_closing.load() || !g_xamlForMigrated.load()) return;
     for (const auto& cmd : inputs) {
-        if (cmd.kind == xaml_osd::LevelKind::Volume) {
+        if (cmd.target == osd_control::Target::Volume) {
             if (g_popupKind != PopupKind::NativeVolume) continue;
             bool ok = false;
             if (cmd.action == xaml_osd::InputAction::ToggleMute)
@@ -8740,7 +8773,7 @@ void ProcessXamlInputs() {
         }
         if (!g_wheelWriteWake) continue;
 
-        if (cmd.kind == xaml_osd::LevelKind::NativeBrightness) {
+        if (cmd.target == osd_control::Target::NativeBrightness) {
             if (g_popupKind != PopupKind::NativeBrightness ||
                 !g_nativePercentKnown) continue;
             if (cmd.action == xaml_osd::InputAction::ToggleMute) continue;
@@ -8761,7 +8794,7 @@ void ProcessXamlInputs() {
             continue;
         }
 
-        if (cmd.kind != xaml_osd::LevelKind::DdcBrightness ||
+        if (cmd.target != osd_control::Target::DdcBrightness ||
             g_popupKind != PopupKind::DdcBrightness ||
             cmd.action == xaml_osd::InputAction::ToggleMute) continue;
         const auto selected = std::find_if(
