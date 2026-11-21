@@ -83,9 +83,12 @@ Supported color values include `#RRGGBB`, `#AARRGGBB`,
 
 Copyright (c) Reg Chen. Licensed under **GPL-3.0**.
 
-The `WindhawkBlur` effect is adapted from
+The `WindhawkBlur` brush originates from
+[Windows 11 Taskbar Styler](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/windows-11-taskbar-styler.wh.cpp)
+by m417z, based on [TranslucentTB's XamlBlurBrush](https://github.com/TranslucentTB/TranslucentTB/blob/release/ExplorerTAP/XamlBlurBrush.cpp).
+This implementation also adapts
 [diogonevesofc/taskbar-styler](https://github.com/diogonevesofc/taskbar-styler)
-(GPL-3.0-or-later), which credits Windhawk Styler and TranslucentTB.
+(GPL-3.0-or-later), an independent derivative of the Windhawk mod.
 External project and product names/trademarks belong to their owners.
 */
 // ==/WindhawkModReadme==
@@ -1637,8 +1640,10 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
         static_cast<BYTE>(rgb)});
 }
 
-// Ported GPL-3.0-or-later Composition effect model from
-// diogonevesofc/taskbar-styler, based on upstream Windhawk / TranslucentTB.
+// WindhawkBlur originates from m417z's Windows 11 Taskbar Styler,
+// itself based on TranslucentTB's XamlBlurBrush. This implementation
+// ports GPL-3.0-or-later Composition effect code from the independent
+// diogonevesofc/taskbar-styler derivative.
 // No general style engine, theme-resource parser or XamlReader.
 namespace osd_blur {
 // Rec. 709 luminance coefficients used by the saturation and luminosity
