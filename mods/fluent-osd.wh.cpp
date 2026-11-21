@@ -1821,35 +1821,41 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
 
     // Construct WriteableBitmap only on the Island's STA. The original
     // Explorer UI thread transferred copied bytes, never an HBITMAP/HDC.
-    const size_t bytes = static_cast<size_t>(data.clipboardWidth) *
-        data.clipboardHeight * 4;
-    if (data.clipboardWidth && data.clipboardHeight &&
-        data.clipboardWidth <= 224 && data.clipboardHeight <= 164 &&
-        bytes == data.clipboardPixels.size()) {
-        imaging::WriteableBitmap bitmap{
-            static_cast<int32_t>(data.clipboardWidth),
-            static_cast<int32_t>(data.clipboardHeight)};
-        const auto buffer = bitmap.PixelBuffer();
-        if (buffer.Length() >= bytes) {
-            ComPtr<IBufferByteAccess> access;
-            winrt::check_hresult(winrt::get_unknown(buffer)->QueryInterface(
-                kBufferByteAccessIID,
-                reinterpret_cast<void**>(access.GetAddressOf())));
-            BYTE* output = nullptr;
-            winrt::check_hresult(access->Buffer(&output));
-            if (output) {
-                memcpy(output, data.clipboardPixels.data(), bytes);
-                bitmap.Invalidate();
-                state.clipboardImage.Source(bitmap);
-            }
-        }
-    }
+    if (auto bitmap = BitmapFromPixels(
+            data.clipboardWidth, data.clipboardHeight,
+            data.clipboardPixels))
+        state.clipboardImage.Source(bitmap);
     state.current = data;
     ShowPositionedSurface(state, data, insetX, insetY, bodyW, bodyH);
 }
 
 // Native, scrollable Mixer panel. All controls are constructed on the XAML
 // STA from a copied view-model; no Core Audio pointers are shared with it.
+// The only BGRA -> WriteableBitmap adapter. Both clipboard and Mixer icons
+// use an owned snapshot, with the bitmap allocated only on the XAML STA.
+imaging::WriteableBitmap BitmapFromPixels(
+        uint32_t width, uint32_t height,
+        const std::vector<uint8_t>& pixels) {
+    if (!width || !height || width > 224 || height > 164)
+        return nullptr;
+    const size_t bytes = static_cast<size_t>(width) * height * 4;
+    if (bytes != pixels.size()) return nullptr;
+    imaging::WriteableBitmap bitmap{
+        static_cast<int32_t>(width), static_cast<int32_t>(height)};
+    const auto buffer = bitmap.PixelBuffer();
+    if (buffer.Length() < bytes) return nullptr;
+    ComPtr<IBufferByteAccess> access;
+    winrt::check_hresult(winrt::get_unknown(buffer)->QueryInterface(
+        kBufferByteAccessIID,
+        reinterpret_cast<void**>(access.GetAddressOf())));
+    BYTE* output = nullptr;
+    winrt::check_hresult(access->Buffer(&output));
+    if (!output) return nullptr;
+    memcpy(output, pixels.data(), bytes);
+    bitmap.Invalidate();
+    return bitmap;
+}
+
 void DrawMixerSnapshot(State& state, const Snapshot& data) {
     if (!state.host || !state.canvas || !state.card ||
         !state.mixerSurface || !state.mixerColumn ||
@@ -1989,6 +1995,18 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         auto mute = makeButton(item.muted ? L"\uE74F" : L"\uE767",
                                muteW, 32.0);
         mute.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
+        if (item.iconPixels.size() == 20u * 20u * 4u) {
+            auto bitmap = BitmapFromPixels(20, 20, item.iconPixels);
+            if (bitmap) {
+                controls::Image picture;
+                picture.Width(20.0);
+                picture.Height(20.0);
+                picture.Stretch(media::Stretch::Uniform);
+                picture.Opacity(item.muted ? .35 : 1.0);
+                picture.Source(bitmap);
+                mute.Content(picture);
+            }
+        }
         mute.IsEnabled(item.enabled);
         mute.Click([&state, index](auto const&, auto const&) {
             SendMixerInput(state, InputAction::MixerToggleMute, index);
