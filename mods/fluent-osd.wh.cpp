@@ -1152,6 +1152,11 @@ void PaintStatusUnderline(State& state) {
     state.statusUnderline.Width(width);
     controls::Canvas::SetLeft(state.statusUnderline,
         state.statusLineCenterX - width / 2.0);
+    // Interpolate visual emphasis with the same eased width transition.
+    const double activeBlend = std::clamp(
+        (state.statusLineRatio - kOffLineRatio) /
+            (1.0 - kOffLineRatio), 0.0, 1.0);
+    state.statusUnderline.Opacity(.57 + .43 * activeBlend);
 }
 
 void AdvanceStatusUnderline(State& state, ULONGLONG now) {
@@ -1321,8 +1326,7 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.statusUnderline.Height(lineHeight);
     state.statusUnderline.RadiusX(lineHeight / 2.0);
     state.statusUnderline.RadiusY(lineHeight / 2.0);
-    state.statusUnderline.Fill(Brush(value.accent,
-        value.statusActive ? 255 : 145));
+    state.statusUnderline.Fill(Brush(value.accent));
     controls::Canvas::SetTop(state.statusUnderline, underlineTop);
     TransitionStatusUnderline(state, sameVisibleStatus, value.statusActive,
                               textX, textW);
