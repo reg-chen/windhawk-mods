@@ -2,7 +2,7 @@
 
 **Branch:** `fluent-osd-xaml`  
 **Baseline:** `fluent-osd` v1.0.1 (`8ff2d4352d8c081e78208266ff1561b5e5bfe31b`)  
-**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.22** now carries complete USB/Bluetooth/network notification behavior in native XAML: single events, aggregated event counts, expandable lists and scrolling, in addition to migrated levels and lock keys. The earlier v1.0.19 build received compiler feedback for `Windows.UI.Input` projection and the missing include was added; **v1.0.22 still requires a fresh Windhawk compilation and runtime test.**
+**Status:** standalone XAML probe v0.1.3 passed the earlier host test. Experimental `fluent-osd-xaml` **v1.0.23** now carries complete USB/Bluetooth/network notices, the six native non-level event categories, volume/brightness and lock-key status in native XAML. The earlier v1.0.19 build received compiler feedback for `Windows.UI.Input` projection and the missing include was added; **v1.0.23 still requires fresh Windhawk compilation and runtime testing.**
 
 ## Goal / non-goals
 
@@ -594,6 +594,36 @@ each OSD type.
   hover duration, long-name ellipsis, high DPI, different taskbar positions
   and small work areas; confirm Explorer remains responsive on disable/reload.
   No actual Windows runtime validation has been performed in this environment.
+
+## v1.0.23 — Native non-level events, complete category port
+
+- Route the existing hardware-confirmator system events through the same XAML
+  status card: **keyboard backlight**, **airplane mode**, **camera and access
+  permission**, **microphone**, **virtual desktop**, and **system text**.
+  No new hooks, workers, windows or independent renderer were introduced.
+- Keep the exact original information semantics. Keyboard backlight displays
+  percent only for values 0–100, otherwise a raw level. Camera event
+  `variant=1` describes access permission, not camera activity. For the
+  microphone's non-public event, only 0=unmuted and 1=muted are explicitly
+  interpreted. The virtual desktop and text event strings are preserved
+  rather than replaced with inferred machine state.
+- Native Windows 11 Segoe Fluent Icons, verified against
+  [Microsoft's font reference](https://learn.microsoft.com/en-us/windows/apps/design/iconography/segoe-fluent-icons-font):
+  KeyboardClassic `E765`, Airplane `E709`, Camera `E722`, Microphone
+  `E720`, TaskView `E7C4`, Page `E7C3`. A separate icon file or
+  GDI+ icon painter is no longer needed for the XAML path.
+- Continue to use the same theme, opacity, font size, corner geometry,
+  placement and fade lifecycle. The category is passive: no slider,
+  device-details expander or ON/OFF indicator is introduced.
+- With `experimentalXamlVolume` enabled, every supported native
+  non-level event goes directly to XAML with no GDI+ fallback. The
+  experimental off-position remains a temporary comparison path,
+  not the final dual-renderer architecture.
+- **Verification:** compile v1.0.23 on Windhawk; check the six kinds,
+  both camera variants, microphone 0/1/unknown, keyboard 0/100/>100,
+  long localized event text, placement on external monitor, display
+  switching, and hot-unload. Static review cannot establish runtime
+  reliability or glyph appearance.
 
 ## Migration gates
 
