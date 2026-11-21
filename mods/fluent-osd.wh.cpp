@@ -763,14 +763,14 @@ enum class Kind {
 struct MixerRow {
     std::wstring title;
     int percent = 0;
-    bool muted = false;
+    bool muted = false, enabled = true;
 };
 struct MixerOutput {
     std::wstring title;
     bool selected = false;
 };
 struct MixerModel {
-    std::wstring title, outputHeading;
+    std::wstring title, outputHeading, selectedOutput;
     std::vector<MixerRow> rows;
     std::vector<MixerOutput> outputs;
     uint32_t generation = 0;
@@ -1151,6 +1151,13 @@ struct State {
     controls::Border clipboardFrame{nullptr};
     controls::Image clipboardImage{nullptr};
     controls::TextBlock clipboardCaption{nullptr};
+    controls::Button mixerChevron{nullptr};
+    controls::Border mixerSurface{nullptr};
+    controls::StackPanel mixerColumn{nullptr}, mixerRows{nullptr},
+                         mixerOutputs{nullptr};
+    controls::ScrollViewer mixerRowsScroll{nullptr},
+                           mixerOutputsScroll{nullptr};
+    bool mixerPopulating = false;
     bool noticeExpanded = false;
     double noticeHeaderH = 0;
     DWORD noticeNormalDurationMs = 3000;
@@ -1180,6 +1187,7 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
 void DrawSnapshot(State&, const Snapshot&);
 void DrawStatusSnapshot(State&, const Snapshot&);
 void DrawClipboardImageSnapshot(State&, const Snapshot&);
+void DrawMixerSnapshot(State&, const Snapshot&);
 void ToggleNoticeDetails(State&);
 
 // All audio/WMI/DDC writes stay on the original Explorer OSD UI thread.
@@ -1188,6 +1196,13 @@ void SendInput(State& state, InputAction action, int value) {
     if (g_stopping.load() || !state.current.receiver) return;
     osd_control::Submit(
         osd_control::Build(state.current, action, value),
+        state.current.receiver);
+}
+void SendMixerInput(State& state, InputAction action, int index,
+                    int value = 0) {
+    if (g_stopping.load() || !state.current.receiver) return;
+    osd_control::Submit(
+        osd_control::BuildMixer(state.current, action, index, value),
         state.current.receiver);
 }
 
@@ -1275,7 +1290,8 @@ void DragTrack(State& state, double x, double y) {
 void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.canvas || !state.host ||
         (state.current.kind == LevelKind::LockStatus ||
-         state.current.kind == LevelKind::NativeEvent)) return;
+         state.current.kind == LevelKind::NativeEvent ||
+         state.current.kind == LevelKind::Mixer)) return;
     const auto point = args.GetCurrentPoint(state.canvas);
     if (!point.Properties().IsLeftButtonPressed()) return;
     const auto pos = point.Position();
@@ -1358,7 +1374,8 @@ void PointerWheel(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.current.valueKnown ||
         state.current.kind == LevelKind::LockStatus ||
         state.current.kind == LevelKind::NoticeStatus ||
-        state.current.kind == LevelKind::NativeEvent) return;
+        state.current.kind == LevelKind::NativeEvent ||
+        state.current.kind == LevelKind::Mixer) return;
     const int delta = args.GetCurrentPoint(state.canvas)
         .Properties().MouseWheelDelta();
     const int steps = osd_input::ConsumeWheelSteps(delta, state.wheelRemainder);
@@ -1848,6 +1865,8 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     state.statusLineAnimating = false;
     state.noticeExpanded = false;
     state.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerSurface.Visibility(wx::Visibility::Collapsed);
     state.noticeHeading.Visibility(wx::Visibility::Collapsed);
     state.noticeScroll.Visibility(wx::Visibility::Collapsed);
     state.statusTile.Visibility(wx::Visibility::Collapsed);
@@ -1999,8 +2018,9 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         // The outer inset follows the original painted-card cutout and
         // the user's configurable inner padding.
         const double minTrack = std::max(trackThickness, wantedThumb);
+        const double chevronSpace = value.mixerChevron ? 32.0 : 0.0;
         const double freeWidth = std::max(0.0,
-            bodyW - iconW - labelW - minTrack);
+            bodyW - iconW - labelW - minTrack - chevronSpace);
         const double pad = std::min(inner + insetX,
             freeWidth / (value.showValue ? 4.0 : 3.0));
         const double gap = std::min(std::max(iconH, labelH),
@@ -2008,7 +2028,8 @@ void DrawSnapshot(State& state, const Snapshot& value) {
                 (freeWidth - 2.0 * pad) /
                 (value.showValue ? 2.0 : 1.0)));
         const double iconX = pad;
-        const double valueX = bodyW - pad - labelW;
+        const double valueX = bodyW - pad - labelW -
+            (value.mixerChevron ? 32.0 : 0.0);
         const double trackX = iconX + iconW + gap;
         const double trackRight = value.showValue
             ? valueX - gap : bodyW - pad;
@@ -2063,6 +2084,17 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         state.iconH = iconH;
     }
 
+    if (value.kind == LevelKind::Volume && value.mixerChevron) {
+        const double size = std::clamp(bodyW * .09, 20.0, 28.0);
+        state.mixerChevron.Width(size);
+        state.mixerChevron.Height(size);
+        controls::Canvas::SetLeft(state.mixerChevron,
+            std::max(0.0, bodyW - size - 2.0));
+        controls::Canvas::SetTop(state.mixerChevron,
+            value.vertical ? std::max(0.0, bodyH - size - 2.0)
+                           : std::max(0.0, (bodyH - size) / 2.0));
+        state.mixerChevron.Visibility(wx::Visibility::Visible);
+    }
     ShowPositionedSurface(state, value, insetX, insetY, bodyW, bodyH);
 }
 void DeliverPending(State& root); // Defined after native/XAML host creation.
