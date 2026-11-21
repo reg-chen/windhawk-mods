@@ -3,7 +3,7 @@
 // @name            Fluent OSD
 // @description     Native XAML on-screen displays for volume, brightness, media, mixer and Windows system events.
 // @description:zh-TW 以原生 XAML 顯示音量、亮度、媒體、混音器及 Windows 系統事件提示。
-// @version         1.1.3
+// @version         1.1.4
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -47,7 +47,7 @@ Actual Windows 11 captures, cropped to consistent dimensions.
 
 | Horizontal volume + mixer | Vertical volume + mixer |
 | :---: | :---: |
-| ![Horizontal volume + mixer](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/horizontal_mixer.png) | ![Vertical volume + mixer](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/vertical_mixer.png) |
+| ![Horizontal volume + mixer](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/horizontal_mixer.png?v=1.1.4) | ![Vertical volume + mixer](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/vertical_mixer.png?v=1.1.4) |
 
 ### Brightness
 
@@ -765,6 +765,7 @@ External project and product names/trademarks belong to their owners.
 #include <physicalmonitorenumerationapi.h>
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <cwchar>
@@ -1120,8 +1121,27 @@ struct Command {
     DWORD physicalIndex = 0, minimum = 0, maximum = 0;
 };
 constexpr UINT kMessage = WM_APP + 690;
-SRWLOCK g_lock = SRWLOCK_INIT;
-std::vector<Command> g_pending;
+// XAML's producer and the controller's consumer share only owned POD commands.
+// The mailbox owns its SRW lock and preserves the existing FIFO/cap semantics.
+struct CommandMailbox {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<Command> pending;
+
+    void Enqueue(const Command& command) {
+        AcquireSRWLockExclusive(&lock);
+        if (pending.size() >= 64) pending.erase(pending.begin());
+        pending.push_back(command);
+        ReleaseSRWLockExclusive(&lock);
+    }
+    std::vector<Command> Take() {
+        std::vector<Command> result;
+        AcquireSRWLockExclusive(&lock);
+        result.swap(pending);
+        ReleaseSRWLockExclusive(&lock);
+        return result;
+    }
+};
+CommandMailbox g_commands;
 
 Target ForCategory(osd_model::Kind kind) {
     switch (kind) {
@@ -1166,19 +1186,12 @@ Command BuildMedia(const osd_model::Snapshot& source, Action action,
 }
 void Submit(const Command& cmd, HWND receiver) {
     if (!receiver || cmd.target == Target::None) return;
-    AcquireSRWLockExclusive(&g_lock);
-    if (g_pending.size() >= 64) g_pending.erase(g_pending.begin());
-    g_pending.push_back(cmd);
-    ReleaseSRWLockExclusive(&g_lock);
+    g_commands.Enqueue(cmd);
     if (!PostMessageW(receiver, kMessage, 0, 0))
         Wh_Log(L"OSD command post failed (%lu)", GetLastError());
 }
 std::vector<Command> Drain() {
-    std::vector<Command> result;
-    AcquireSRWLockExclusive(&g_lock);
-    result.swap(g_pending);
-    ReleaseSRWLockExclusive(&g_lock);
-    return result;
+    return g_commands.Take();
 }
 } // namespace osd_control
 
@@ -1544,23 +1557,6 @@ Status StatusGeometry(const osd_model::Snapshot& value) {
     g.textTop = g.lock ? std::min(centeredTop, availableTop) : centeredTop;
     return g;
 }
-struct Details {
-    double rowH = 0, headingH = 0, viewportH = 0, totalH = 0;
-};
-Details DetailsGeometry(size_t rowCount, int fontSize, double workHeight,
-                        double headerH, double insetY, double pad) {
-    Details g;
-    g.rowH = std::max(26.0, fontSize * 1.8);
-    g.headingH = std::max(20.0, fontSize * 1.5);
-    const double maxExtra = std::max(g.rowH,
-        workHeight - headerH - 2.0 * insetY - 3.0 * pad);
-    g.viewportH = std::min({
-        static_cast<double>(rowCount) * g.rowH,
-        6.0 * g.rowH,
-        std::max(g.rowH, maxExtra - g.headingH - 2.0 * pad)});
-    g.totalH = headerH + g.headingH + g.viewportH + 2.0 * pad;
-    return g;
-}
 struct Clipboard {
     Frame frame;
     double inset = 0, radius = 0, previewW = 0, previewH = 0;
@@ -1657,18 +1653,87 @@ constexpr int kWidth = 354, kHeight = 49; // Default horizontal card pixels.
 constexpr double kFallbackTrackThickness = 8.0;
 constexpr double kNativeSliderLayoutClearance = 20.0;
 
-std::atomic<HWND> g_ready{nullptr};
-std::atomic<DWORD> g_threadId{0};
-std::atomic<bool> g_stopping{false};
-std::atomic<bool> g_failed{false};
-std::mutex g_startLock;
-SRWLOCK g_snapshotLock = SRWLOCK_INIT;
-HANDLE g_thread = nullptr;
+DWORD WINAPI ThreadProc(void*);
+
+// XAML/WinRT objects remain STA-owned. This owner only publishes the
+// cross-thread lifetime state and joins the STA before module unload.
+class XamlLifecycleState {
+    std::atomic<HWND> ready_{nullptr};
+    std::atomic<DWORD> threadId_{0};
+    std::atomic<bool> stopping_{false};
+    std::atomic<bool> failed_{false};
+    std::mutex startLock_;
+    HANDLE thread_ = nullptr;
+
+public:
+    bool IsStopping() const noexcept { return stopping_.load(); }
+    bool IsFailed() const noexcept { return failed_.load(); }
+    void MarkFailed() noexcept { failed_.store(true); }
+    void MarkFailedAndWithdrawReady() noexcept {
+        MarkFailed();
+        WithdrawReady();
+    }
+    void PublishReady(HWND hwnd) noexcept {
+        ready_.store(hwnd, std::memory_order_release);
+    }
+    void WithdrawReady() noexcept {
+        ready_.store(nullptr, std::memory_order_release);
+    }
+    HWND ReadyWindow() const noexcept {
+        return ready_.load(std::memory_order_acquire);
+    }
+    void PublishThreadId(DWORD id) noexcept {
+        threadId_.store(id, std::memory_order_release);
+    }
+    void Start() {
+        std::lock_guard<std::mutex> guard(startLock_);
+        if (thread_ || IsStopping() || IsFailed()) return;
+        thread_ = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
+        if (!thread_) {
+            MarkFailed();
+            Wh_Log(L"Fluent OSD/XAML: STA creation failed (%lu)", GetLastError());
+        }
+    }
+    void Stop() {
+        std::lock_guard<std::mutex> guard(startLock_);
+        stopping_.store(true);
+        const HWND hwnd = ready_.exchange(nullptr);
+        if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        const DWORD id = threadId_.load(std::memory_order_acquire);
+        if (id) PostThreadMessageW(id, WM_QUIT, 0, 0);
+        if (thread_) {
+            // Join rather than unloading while XAML/WinRT still executes.
+            WaitForSingleObject(thread_, INFINITE);
+            CloseHandle(thread_);
+            thread_ = nullptr;
+        }
+    }
+};
+XamlLifecycleState g_lifecycle;
 
 using LevelKind = osd_model::Kind;
 using Snapshot = osd_model::Snapshot;
 using InputAction = osd_control::Action;
-std::vector<Snapshot> g_pending; // Atomic update batches for the XAML STA.
+// The controller publishes complete, owned snapshot batches to the XAML STA.
+// As before, a newer batch replaces a not-yet-consumed one.
+struct SnapshotMailbox {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<Snapshot> pending;
+
+    void Publish(const std::vector<Snapshot>& snapshots) {
+        AcquireSRWLockExclusive(&lock);
+        pending = snapshots;
+        ReleaseSRWLockExclusive(&lock);
+    }
+    std::vector<Snapshot> Take() {
+        std::vector<Snapshot> batch;
+        AcquireSRWLockExclusive(&lock);
+        batch.swap(pending);
+        ReleaseSRWLockExclusive(&lock);
+        return batch;
+    }
+};
+SnapshotMailbox g_snapshots;
 
 struct State {
     HWND host = nullptr, island = nullptr;
@@ -1766,11 +1831,6 @@ media::SolidColorBrush Brush(DWORD rgb, BYTE alpha = 255) {
 // parser, STA-safe noise cache, and independent XAML Island lifetime.
 // No Styler theme engine, XamlReader or taskbar-specific code is included.
 namespace osd_blur {
-// Rec. 709 luminance coefficients used by the saturation and luminosity
-// matrices. Keep them together with the effect graph when porting.
-constexpr float kLumaR = 0.2126f;
-constexpr float kLumaG = 0.7152f;
-constexpr float kLumaB = 0.0722f;
 namespace wf = winrt::Windows::Foundation;
 namespace wge = winrt::Windows::Graphics::Effects;
 namespace awge = ABI::Windows::Graphics::Effects;
@@ -3237,14 +3297,14 @@ bool PointerInsideHost(const State&);
 // All audio/WMI/DDC writes stay on the original Explorer OSD UI thread.
 // The STA handles pointer geometry and sends only bounded POD commands.
 void SendInput(State& state, InputAction action, int value) {
-    if (state.viewOnly || g_stopping.load() || !state.current.receiver) return;
+    if (state.viewOnly || g_lifecycle.IsStopping() || !state.current.receiver) return;
     osd_control::Submit(
         osd_control::Build(state.current, action, value),
         state.current.receiver);
 }
 void SendMixerInput(State& state, InputAction action, int index,
                     int value = 0) {
-    if (state.viewOnly || g_stopping.load() || !state.current.receiver) return;
+    if (state.viewOnly || g_lifecycle.IsStopping() || !state.current.receiver) return;
     osd_control::Submit(
         osd_control::BuildMixer(state.current, action, index, value),
         state.current.receiver);
@@ -3253,7 +3313,7 @@ void SendMixerInput(State& state, InputAction action, int index,
 void ArmInteractionTimer(State&, bool);
 void SendMediaCommand(State& state, InputAction action,
                       int value = 0, int64_t pos = 0) {
-    if (state.viewOnly || g_stopping.load() || !state.current.receiver) return;
+    if (state.viewOnly || g_lifecycle.IsStopping() || !state.current.receiver) return;
     osd_control::Submit(osd_control::BuildMedia(
         state.current, action, value, pos), state.current.receiver);
 }
@@ -3320,9 +3380,9 @@ void HideSurface(State& state) {
             if (peer.second->viewOnly) HideSurface(*peer.second);
     // Mirror the native panel's lifetime in its UI-thread controller.
     // The action is idempotent and generation-checked at the receiver.
-    if (state.current.kind == LevelKind::Mixer && !g_stopping.load())
+    if (state.current.kind == LevelKind::Mixer && !g_lifecycle.IsStopping())
         SendMixerInput(state, InputAction::CloseMixer, -1);
-    if (state.current.kind == LevelKind::Media && !g_stopping.load())
+    if (state.current.kind == LevelKind::Media && !g_lifecycle.IsStopping())
         SendMediaCommand(state, InputAction::CloseMedia);
     if ((state.current.kind == LevelKind::Media ||
          state.current.kind == LevelKind::Mixer ||
@@ -4521,9 +4581,12 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     state.mixerRowsScroll.Height(viewportH);
     state.mixerRows.Children().Clear();
     const double muteW = 34.0, percentW = 43.0;
-    const double nameW = std::clamp(contentW * .28, 58.0, 144.0);
+    // Give the app name less of each row; preserve a dedicated gap between
+    // the right-aligned percent label and the ScrollViewer's vertical bar.
+    const double nameW = std::clamp(contentW * .22, 54.0, 112.0);
+    const double scrollBarGap = 22.0;
     const double sliderW = std::max(40.0,
-        contentW - muteW - nameW - percentW - 6.0);
+        contentW - muteW - nameW - percentW - scrollBarGap);
     for (size_t i = 0; i < model.rows.size(); ++i) {
         const auto& item = model.rows[i];
         const int index = static_cast<int>(i);
@@ -4938,13 +5001,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 catch (const winrt::hresult_error& ex) {
                     Wh_Log(L"Fluent OSD/XAML: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
-                    g_failed.store(true);
-                    g_ready.store(nullptr, std::memory_order_release);
+                    g_lifecycle.MarkFailedAndWithdrawReady();
                     HideAll(*state);
                 } catch (...) {
                     Wh_Log(L"Fluent OSD/XAML: unexpected draw exception; disabling renderer");
-                    g_failed.store(true);
-                    g_ready.store(nullptr, std::memory_order_release);
+                    g_lifecycle.MarkFailedAndWithdrawReady();
                     HideAll(*state);
                 }
             }
@@ -5363,10 +5424,7 @@ void CloseSurface(State& state) {
 // per *physical* target. Every update is a complete snapshot batch,
 // so removed/unresolved targets do not retain stale visible windows.
 void DeliverPending(State& root) {
-    std::vector<Snapshot> batch;
-    AcquireSRWLockExclusive(&g_snapshotLock);
-    batch.swap(g_pending);
-    ReleaseSRWLockExclusive(&g_snapshotLock);
+    std::vector<Snapshot> batch = g_snapshots.Take();
     if (batch.empty()) return;
     const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
     const bool attached = batch.size() >= 2 &&
@@ -5472,11 +5530,11 @@ DWORD WINAPI ThreadProc(void*) {
     bool apartment = false, registered = false;
     const HINSTANCE instance = GetModuleHandleW(nullptr);
     PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
-    g_threadId.store(GetCurrentThreadId(), std::memory_order_release);
+    g_lifecycle.PublishThreadId(GetCurrentThreadId());
     try {
         winrt::init_apartment(winrt::apartment_type::single_threaded);
         apartment = true;
-        if (!g_stopping.load()) {
+        if (!g_lifecycle.IsStopping()) {
             WNDCLASSEXW wc{sizeof(wc)};
             wc.lpfnWndProc = WndProc;
             wc.hInstance = instance;
@@ -5488,14 +5546,14 @@ DWORD WINAPI ThreadProc(void*) {
 
             root.manager =
                 hosting::WindowsXamlManager::InitializeForCurrentThread();
-            if (!g_stopping.load()) {
+            if (!g_lifecycle.IsStopping()) {
                 CreateSurface(root, instance);
                 // Window.Current is available once the first Island has
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
-                g_ready.store(root.host, std::memory_order_release);
+                g_lifecycle.PublishReady(root.host);
                 Wh_Log(L"Fluent OSD/XAML: renderer ready (per-display DDC)");
-                while (!g_stopping.load() &&
+                while (!g_lifecycle.IsStopping() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -5505,12 +5563,12 @@ DWORD WINAPI ThreadProc(void*) {
     } catch (const winrt::hresult_error& ex) {
         Wh_Log(L"Fluent OSD/XAML: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
-        g_failed.store(true);
+        g_lifecycle.MarkFailed();
     } catch (...) {
         Wh_Log(L"Fluent OSD/XAML: unexpected startup exception");
-        g_failed.store(true);
+        g_lifecycle.MarkFailed();
     }
-    g_ready.store(nullptr, std::memory_order_release);
+    g_lifecycle.WithdrawReady();
     // Break STA-only peer references before either Island is destroyed;
     // CloseSurface releases pointer captures and may invoke callbacks.
     root.attachedPeerOpen = false;
@@ -5528,48 +5586,29 @@ DWORD WINAPI ThreadProc(void*) {
     }
     if (registered) UnregisterClassW(kClass, instance);
     if (apartment) winrt::uninit_apartment();
-    g_threadId.store(0, std::memory_order_release);
+    g_lifecycle.PublishThreadId(0);
     return 0;
 }
 void Start() {
-    std::lock_guard<std::mutex> guard(g_startLock);
-    if (g_thread || g_stopping.load() || g_failed.load()) return;
-    g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
-    if (!g_thread) {
-        g_failed.store(true);
-        Wh_Log(L"Fluent OSD/XAML: STA creation failed (%lu)", GetLastError());
-    }
+    g_lifecycle.Start();
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
-    const HWND hwnd = g_ready.load(std::memory_order_acquire);
-    if (!hwnd || g_stopping.load() || g_failed.load() ||
+    const HWND hwnd = g_lifecycle.ReadyWindow();
+    if (!hwnd || g_lifecycle.IsStopping() || g_lifecycle.IsFailed() ||
         snapshots.empty()) return false;
-    AcquireSRWLockExclusive(&g_snapshotLock);
-    g_pending = snapshots;
-    ReleaseSRWLockExclusive(&g_snapshotLock);
+    g_snapshots.Publish(snapshots);
     return PostMessageW(hwnd, kShowMessage, 0, 0) != FALSE;
 }
 bool IsPrimaryVisible() {
-    const HWND hwnd=g_ready.load(std::memory_order_acquire);
+    const HWND hwnd=g_lifecycle.ReadyWindow();
     return hwnd && IsWindowVisible(hwnd)!=FALSE;
 }
 void Hide() {
-    const HWND hwnd = g_ready.load(std::memory_order_acquire);
+    const HWND hwnd = g_lifecycle.ReadyWindow();
     if (hwnd) PostMessageW(hwnd, kHideMessage, 0, 0);
 }
 void Stop() {
-    std::lock_guard<std::mutex> guard(g_startLock);
-    g_stopping.store(true);
-    const HWND hwnd = g_ready.exchange(nullptr);
-    if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);
-    const DWORD id = g_threadId.load(std::memory_order_acquire);
-    if (id) PostThreadMessageW(id, WM_QUIT, 0, 0);
-    if (g_thread) {
-        // Do not unload executing code. Shutdown of legacy XAML may block.
-        WaitForSingleObject(g_thread, INFINITE);
-        CloseHandle(g_thread);
-        g_thread = nullptr;
-    }
+    g_lifecycle.Stop();
 }
 } // namespace xaml_osd
 
@@ -5880,118 +5919,129 @@ using WindowsCreateString_t = HRESULT(WINAPI*)(PCWSTR, UINT, void**);
 using WindowsDeleteString_t = HRESULT(WINAPI*)(void*);
 using RoActivateInstance_t = HRESULT(WINAPI*)(void*, IUnknown**);
 
-// --- Settings / UI / device state ---
-std::atomic<int> g_displayLanguage{0}; // 0=Auto, 1=English, 2=zh-TW
-std::atomic<bool> g_hideAllNativeOsd{false};
-std::atomic<bool> g_hide[static_cast<int>(Kind::Count)]{};
-std::atomic<bool> g_showCustomNative[static_cast<int>(Kind::Count)]{};
-std::atomic<bool> g_showDdcBrightness{false};
-std::atomic<bool> g_verticalVolumeBrightness{true};
-std::atomic<bool> g_fromExplorer{true};
-std::atomic<bool> g_fromTwinkle{true};
-std::atomic<int> g_vcpCode{16};
+// --- Config state, read across UI and Windhawk settings threads ---
+struct OsdSettingsState {
+    std::atomic<int> displayLanguage{0}; // 0=Auto, 1=English, 2=zh-TW
+    std::atomic<bool> hideAllNativeOsd{false};
+    std::atomic<bool> hide[static_cast<int>(Kind::Count)]{};
+    std::atomic<bool> showCustomNative[static_cast<int>(Kind::Count)]{};
+    std::atomic<bool> showDdcBrightness{false};
+    std::atomic<bool> verticalVolumeBrightness{true};
+    std::atomic<bool> fromExplorer{true};
+    std::atomic<bool> fromTwinkle{true};
+    std::atomic<int> vcpCode{16};
 
-std::atomic<int> g_globalDurationMs{3000};
-std::atomic<bool> g_individualDurations{false};
-std::atomic<int> g_durationOverrides[static_cast<int>(DurationKind::Count)]{};
-// Only the dedicated OSD UI thread reads/writes this current category.
+    std::atomic<int> globalDurationMs{3000};
+    std::atomic<bool> individualDurations{false};
+    std::atomic<int> durationOverrides[static_cast<int>(DurationKind::Count)]{};
+    // Only the dedicated OSD UI thread reads/writes this current category.
 
-std::atomic<int> g_ddcTheme{0};
-std::atomic<int> g_ddcSizePercent{75};
-// Independent logical dimensions; global DPI and size % are applied later.
-std::atomic<int> g_horizontalOsdWidth{380};
-std::atomic<int> g_horizontalOsdHeight{72};
-std::atomic<int> g_verticalOsdWidth{72};
-std::atomic<int> g_verticalOsdHeight{200};
-std::atomic<int> g_horizontalSmtcHeight{200};
-std::atomic<int> g_horizontalMixerHeight{200};
-std::atomic<int> g_verticalSmtcWidth{380};
-std::atomic<int> g_verticalMixerWidth{380};
-std::atomic<bool> g_ddcBorderless{true};
-std::atomic<bool> g_showSmtcOnVolume{false};
-std::atomic<bool> g_showMediaArtwork{true};
-std::atomic<bool> g_showMediaControls{true};
-std::atomic<int> g_mediaControlSizePercent{100};
-std::atomic<bool> g_controlButtonSquare{false};
-std::atomic<int> g_controlButtonCornerRadius{6};
-std::atomic<bool> g_showMixerArrow{false};
-std::atomic<int> g_mixerMaxRows{6};
-std::atomic<bool> g_showLockKeys[4]{};
-std::atomic<int> g_innerPadding{14};
-std::atomic<bool> g_showClipboardOsd{false};
-std::atomic<bool> g_clipboardTextPreview{false};
-std::atomic<bool> g_clipboardImagePreview{true};
-std::atomic<int> g_clipboardChars{48};
-std::atomic<bool> g_showUsbEvents{false};
-std::atomic<bool> g_showBluetoothEvents{false};
-std::atomic<bool> g_showNetworkEvents{false};
-std::atomic<bool> g_fadeEnabled{true};
-std::atomic<int> g_fadeDuration{160};
-// Layout and palette options. Values are atomic because settings can be
-// reloaded outside the Explorer OSD UI thread.
-std::atomic<int> g_accentMode{0};
-std::atomic<DWORD> g_customAccent{0};
-std::atomic<bool> g_validCustomAccent{false};
-std::atomic<int> g_backgroundMode{0};
-std::atomic<DWORD> g_customBackground{0};
-std::atomic<bool> g_validCustomBackground{false};
-std::atomic<int> g_textMode{0};
-std::atomic<DWORD> g_customText{0};
-std::atomic<bool> g_validCustomText{false};
-std::atomic<int> g_trackMode{0};
-std::atomic<DWORD> g_customTrack{0};
-std::atomic<bool> g_validCustomTrack{false};
-std::atomic<int> g_backgroundOpacity{96};
-std::atomic<bool> g_useLayeredBackground{false};
-std::mutex g_backgroundLayersMutex;
-std::vector<osd_model::BrushLayer> g_backgroundLayers;
-std::atomic<int> g_cornerRadius{17};
-std::atomic<int> g_fontSize{15};
-std::atomic<int> g_iconSize{16};
-std::atomic<bool> g_showSun{true};
-std::atomic<bool> g_showValue{true};
-// 0=source, 1=primary, 2=selected DISPLAYn, 3=all screens
-std::atomic<int> g_displayOutputMode{0};
-std::atomic<int> g_displayOutputNumber{1};
-std::atomic<int> g_position{5};
-std::atomic<int> g_offsetX{0};
-std::atomic<int> g_offsetY{0};
+    std::atomic<int> ddcTheme{0};
+    std::atomic<int> ddcSizePercent{75};
+    // Independent logical dimensions; global DPI and size % are applied later.
+    std::atomic<int> horizontalOsdWidth{380};
+    std::atomic<int> horizontalOsdHeight{72};
+    std::atomic<int> verticalOsdWidth{72};
+    std::atomic<int> verticalOsdHeight{200};
+    std::atomic<int> horizontalSmtcHeight{200};
+    std::atomic<int> horizontalMixerHeight{200};
+    std::atomic<int> verticalSmtcWidth{380};
+    std::atomic<int> verticalMixerWidth{380};
+    std::atomic<bool> ddcBorderless{true};
+    std::atomic<bool> showSmtcOnVolume{false};
+    std::atomic<bool> showMediaArtwork{true};
+    std::atomic<bool> showMediaControls{true};
+    std::atomic<int> mediaControlSizePercent{100};
+    std::atomic<bool> controlButtonSquare{false};
+    std::atomic<int> controlButtonCornerRadius{6};
+    std::atomic<bool> showMixerArrow{false};
+    std::atomic<int> mixerMaxRows{6};
+    std::atomic<bool> showLockKeys[4]{};
+    std::atomic<int> innerPadding{14};
+    std::atomic<bool> showClipboardOsd{false};
+    std::atomic<bool> clipboardTextPreview{false};
+    std::atomic<bool> clipboardImagePreview{true};
+    std::atomic<int> clipboardChars{48};
+    std::atomic<bool> showUsbEvents{false};
+    std::atomic<bool> showBluetoothEvents{false};
+    std::atomic<bool> showNetworkEvents{false};
+    std::atomic<bool> fadeEnabled{true};
+    std::atomic<int> fadeDuration{160};
+    // Layout and palette options. Values are atomic because settings can be
+    // reloaded outside the Explorer OSD UI thread.
+    std::atomic<int> accentMode{0};
+    std::atomic<DWORD> customAccent{0};
+    std::atomic<bool> validCustomAccent{false};
+    std::atomic<int> backgroundMode{0};
+    std::atomic<DWORD> customBackground{0};
+    std::atomic<bool> validCustomBackground{false};
+    std::atomic<int> textMode{0};
+    std::atomic<DWORD> customText{0};
+    std::atomic<bool> validCustomText{false};
+    std::atomic<int> trackMode{0};
+    std::atomic<DWORD> customTrack{0};
+    std::atomic<bool> validCustomTrack{false};
+    std::atomic<int> backgroundOpacity{96};
+    std::atomic<bool> useLayeredBackground{false};
+    std::mutex backgroundLayersMutex;
+    std::vector<osd_model::BrushLayer> backgroundLayers;
+    std::atomic<int> cornerRadius{17};
+    std::atomic<int> fontSize{15};
+    std::atomic<int> iconSize{16};
+    std::atomic<bool> showSun{true};
+    std::atomic<bool> showValue{true};
+    // 0=source, 1=primary, 2=selected DISPLAYn, 3=all screens
+    std::atomic<int> displayOutputMode{0};
+    std::atomic<int> displayOutputNumber{1};
+    std::atomic<int> position{5};
+    std::atomic<int> offsetX{0};
+    std::atomic<int> offsetY{0};
 
-bool g_isExplorer = false;
-HMODULE g_ddcDll = nullptr;
-HMODULE g_confirmatorDll = nullptr;
-std::atomic<bool> g_loggedUnmapped{false};
-HANDLE g_uiThread = nullptr;
-HANDLE g_uiReady = nullptr;
-DWORD g_uiThreadId = 0;
-HWND g_receiveWnd = nullptr;
-DWORD g_wheelWriteGeneration = 0;
-int g_lastConfirmedNativeBrightness = -1;
-DWORD g_lastConfirmedDdcBrightness = 0;
-bool g_clipboardListener = false;
-HDEVNOTIFY g_usbNotification = nullptr;
-HMODULE g_networkDll = nullptr;
-HANDLE g_networkNotification = nullptr;
-HANDLE g_networkIpNotification = nullptr;
-HANDLE g_networkAddressNotification = nullptr;
-std::atomic<int> g_networkPreviousLevel{-1};
-// The following coalescing state is owned only by the OSD receiver thread.
-bool g_networkRefreshPending = false;
-bool g_networkRefreshSecondPass = false;
-bool g_networkSawInterfaceTransition = false;
-bool g_networkHintPending = false;
-int g_networkHintLevel = -1;
-bool g_networkUiSettingEnabled = false;
-std::atomic<HWND> g_networkReceiver{nullptr};
-std::atomic<bool> g_closing{false};
-// Only the OSD controller thread writes this one-shot startup state.
-bool g_shellXamlStarted = false;
-std::wstring g_noticeTitle;
-std::wstring g_noticeBody;
-NoticeIcon g_noticeIcon = NoticeIcon::Clipboard; // UI thread only.
-bool g_noticePanelOpen = false;
-uint32_t g_noticeGeneration = 1;
-DurationKind g_noticeDuration = DurationKind::Devices;
+    // The background mode and its ordered layers form one coherent snapshot.
+    // Windhawk may reload settings outside the dedicated controller thread.
+    void SetBrushLayers(bool layered, std::vector<osd_model::BrushLayer> layers) {
+        std::lock_guard<std::mutex> lock(backgroundLayersMutex);
+        backgroundLayers = std::move(layers);
+        useLayeredBackground.store(layered, std::memory_order_release);
+    }
+    void CopyBrushLayers(bool& layered, std::vector<osd_model::BrushLayer>& layers) {
+        std::lock_guard<std::mutex> lock(backgroundLayersMutex);
+        layered = useLayeredBackground.load(std::memory_order_acquire);
+        if (layered) layers = backgroundLayers;
+        else layers.clear();
+    }
+};
+OsdSettingsState g_config;
+
+// Entry points and OSD receiver lifecycle; workers keep their own handles.
+struct ModuleRuntimeState {
+    bool isExplorer = false;
+    HMODULE ddcDll = nullptr, confirmatorDll = nullptr;
+    std::atomic<bool> loggedUnmapped{false};
+    HANDLE uiThread = nullptr, uiReady = nullptr;
+    DWORD uiThreadId = 0;
+    HWND receiveWnd = nullptr; // Controller-thread only.
+    // The single cross-thread publication of the receiver HWND.
+    std::atomic<HWND> publishedReceiver{nullptr};
+    bool clipboardListener = false;
+    HDEVNOTIFY usbNotification = nullptr;
+    std::atomic<bool> closing{false};
+    bool shellXamlStarted = false;
+
+    void PublishReceiver(HWND hwnd) {
+        publishedReceiver.store(hwnd, std::memory_order_release);
+    }
+    HWND ReceiverForCallbacks() const {
+        const HWND hwnd = publishedReceiver.load(std::memory_order_acquire);
+        return closing.load(std::memory_order_acquire) ? nullptr : hwnd;
+    }
+    void BeginShutdown() {
+        closing.store(true, std::memory_order_release);
+        publishedReceiver.store(nullptr, std::memory_order_release);
+    }
+};
+ModuleRuntimeState g_module;
+
 struct NoticeBatch {
     NoticeCategory category = NoticeCategory::Usb;
     NoticeAction action = NoticeAction::Connected;
@@ -6001,9 +6051,24 @@ struct NoticeBatch {
     bool iconKnown = false, mixedIcons = false;
     bool pending = false;
 };
-NoticeBatch g_noticeBatch;
-std::vector<std::wstring> g_noticeDetails;
-std::unordered_map<std::wstring, std::wstring> g_usbNames;
+
+struct NoticeRuntimeState {
+    // All non-atomic fields are owned by the OSD receiver thread.
+    std::wstring title, body;
+    NoticeIcon icon = NoticeIcon::Clipboard;
+    bool panelOpen = false;
+    uint32_t generation = 1;
+    DurationKind duration = DurationKind::Devices;
+    NoticeBatch batch;
+    std::vector<std::wstring> details;
+    std::unordered_map<std::wstring, std::wstring> usbNames;
+    // Clipboard data is opt-in, and the owned bitmap is released explicitly.
+    HBITMAP clipboardThumbnail = nullptr;
+
+    void ResetBatch() { batch = NoticeBatch{}; }
+};
+NoticeRuntimeState g_notice;
+
 struct NetInterfaceState {
     std::wstring name;
     bool connected = false;
@@ -6012,11 +6077,36 @@ struct NetInterfaceState {
     bool wlanRadioKnown = false; // Independent of association/connected.
     bool wlanRadioOn = false;
 };
-std::unordered_map<std::string, NetInterfaceState> g_networkInterfaces;
+struct NetworkRuntimeState {
+    // Callback-shared references are atomic. Other fields are receiver-thread owned.
+    HMODULE dll = nullptr;
+    HANDLE notification = nullptr;
+    HANDLE ipNotification = nullptr;
+    HANDLE addressNotification = nullptr;
+    std::atomic<int> previousLevel{-1};
+    bool refreshPending = false;
+    bool refreshSecondPass = false;
+    bool sawInterfaceTransition = false;
+    bool hintPending = false;
+    int hintLevel = -1;
+    bool uiSettingEnabled = false;
+    std::unordered_map<std::string, NetInterfaceState> interfaces;
 
-// Owned thumbnail, created only when the user enables clipboard previews.
-// Its dimensions are bounded before display; never store clipboard data.
-HBITMAP g_clipboardThumbnail = nullptr;
+    void ResetRefresh() {
+        refreshPending = false;
+        refreshSecondPass = false;
+        sawInterfaceTransition = false;
+        hintPending = false;
+        hintLevel = -1;
+    }
+    // Stop subscriptions before WLAN teardown; release iphlpapi.dll last.
+    void CancelCallbacksOnControllerThread();
+    void ReleaseLibraryOnControllerThread() {
+        if (dll) FreeLibrary(dll);
+        dll = nullptr;
+    }
+};
+NetworkRuntimeState g_network;
 
 // The SMTC worker never touches HWND/GDI+/CoreAudio objects directly.
 struct MediaSnapshot {
@@ -6044,21 +6134,90 @@ struct MediaSnapshot {
     INT64 timelinePosition = 0;
     ULONGLONG timelineObservedTick = 0;
 };
-SRWLOCK g_mediaLock = SRWLOCK_INIT;
-MediaSnapshot g_mediaPending;
-MediaSnapshot g_mediaCurrent;             // Explorer UI thread only
-ULONGLONG g_mediaLastRefreshTick = 0;
-HANDLE g_mediaWake = nullptr;
-HANDLE g_mediaThread = nullptr;
-std::atomic<bool> g_mediaStop{false};
-SRWLOCK g_mediaCommandLock = SRWLOCK_INIT;
 struct MediaCommand {
     int action = 0;  // 1-3=transport; 4=seek; 5-6=shuffle/repeat; 7=next SMTC session
     INT64 position = 0; // SMTC 100-ns ticks for action 4
 };
-std::vector<MediaCommand> g_mediaCommands; // Bounded, worker-owned after swap.
+struct MediaRuntimeState {
+    // Snapshot publication is worker -> controller; UI owns current.
+    SRWLOCK snapshotLock = SRWLOCK_INIT;
+    MediaSnapshot pending;
+    MediaSnapshot current;
+    ULONGLONG lastRefreshTick = 0;
+    HANDLE wake = nullptr, thread = nullptr;
+    std::atomic<bool> stop{false};
+    SRWLOCK commandLock = SRWLOCK_INIT;
+    std::vector<MediaCommand> commands;
 
-float g_scale = 1.0f;
+    void Publish(MediaSnapshot value) {
+        AcquireSRWLockExclusive(&snapshotLock);
+        pending = std::move(value);
+        ReleaseSRWLockExclusive(&snapshotLock);
+    }
+    void ConsumeOnControllerThread() {
+        AcquireSRWLockShared(&snapshotLock);
+        current = pending;
+        ReleaseSRWLockShared(&snapshotLock);
+        lastRefreshTick = GetTickCount64();
+    }
+    // Wake handle publication and signalling share the command lock, so a
+    // controller request cannot race CloseHandle during worker shutdown.
+    void PublishWake(HANDLE handle) {
+        AcquireSRWLockExclusive(&commandLock);
+        wake = handle;
+        ReleaseSRWLockExclusive(&commandLock);
+    }
+    void Request(int action, INT64 position) {
+        AcquireSRWLockExclusive(&commandLock);
+        if (wake && !stop.load()) {
+            // Repeated seeking keeps its latest value; transport stays FIFO.
+            if (action == 4)
+                commands.erase(std::remove_if(commands.begin(), commands.end(),
+                    [](const MediaCommand& entry) { return entry.action == 4; }),
+                    commands.end());
+            if (action && commands.size() < 32)
+                commands.push_back(MediaCommand{action, position});
+            SetEvent(wake);
+        }
+        ReleaseSRWLockExclusive(&commandLock);
+    }
+    void SignalStop() {
+        AcquireSRWLockExclusive(&commandLock);
+        stop.store(true);
+        if (wake) SetEvent(wake);
+        ReleaseSRWLockExclusive(&commandLock);
+    }
+    void CloseWakeAfterWorkerStops() {
+        AcquireSRWLockExclusive(&commandLock);
+        if (wake) CloseHandle(wake);
+        wake = nullptr;
+        ReleaseSRWLockExclusive(&commandLock);
+    }
+    std::vector<MediaCommand> TakeCommands() {
+        std::vector<MediaCommand> result;
+        AcquireSRWLockExclusive(&commandLock);
+        result.swap(commands);
+        ReleaseSRWLockExclusive(&commandLock);
+        return result;
+    }
+    // Normal mod unload only: both SMTC worker and controller are joined.
+    // no_destroy intentionally prevents DLL_PROCESS_DETACH destructors.
+    void ReleaseStorageAfterThreadsStop() {
+        MediaSnapshot oldPending, oldCurrent;
+        std::vector<MediaCommand> oldCommands;
+        AcquireSRWLockExclusive(&snapshotLock);
+        std::swap(pending, oldPending);
+        std::swap(current, oldCurrent);
+        lastRefreshTick = 0;
+        ReleaseSRWLockExclusive(&snapshotLock);
+        AcquireSRWLockExclusive(&commandLock);
+        commands.swap(oldCommands);
+        ReleaseSRWLockExclusive(&commandLock);
+        // Old storage is destroyed after both locks are released.
+    }
+};
+[[clang::no_destroy]] MediaRuntimeState g_media;
+
 struct MixerEntry {
     std::wstring title;
     HICON appIcon = nullptr; // owned; released before clear
@@ -6068,18 +6227,7 @@ struct MixerEntry {
     bool muted = false;
 };
 std::vector<uint8_t> MixerIconPixels(HICON);
-[[clang::no_destroy]] std::vector<MixerEntry> g_mixerEntries;    // Explorer UI thread only
-[[clang::no_destroy]] Microsoft::WRL::ComPtr<IAudioEndpointVolume> g_mixerMaster;
-float g_mixerMasterLevel = 0;
-bool g_mixerMasterMuted = false;
-// UI-thread controller state; XAML visual tree never owns Core Audio pointers.
-bool g_xamlMixerOpen = false, g_xamlMixerOutputExpanded = false;
-bool g_xamlMediaOpen = false;
-uint32_t g_xamlMixerGeneration = 1, g_xamlMediaGeneration = 1;
 struct AudioOutputOption { std::wstring id; std::wstring name; };
-[[clang::no_destroy]] std::vector<AudioOutputOption> g_mixerOutputOptions; // UI thread only
-[[clang::no_destroy]] std::wstring g_mixerOutputId;
-bool g_mixerOutputSwitchFailed = false;
 // Endpoint listener is registered only while the interactive mixer is open.
 class MixerOutputNotifications final : public IMMNotificationClient {
     std::atomic<ULONG> refs_{1};
@@ -6127,54 +6275,380 @@ public:
         return S_OK;
     }
 };
-[[clang::no_destroy]] Microsoft::WRL::ComPtr<IMMDeviceEnumerator> g_mixerNotifyEnumerator;
-[[clang::no_destroy]] Microsoft::WRL::ComPtr<MixerOutputNotifications> g_mixerNotify;
-// Hook callback and UI message loop share the same dedicated UI thread.
-HHOOK g_lockHook = nullptr;
-bool g_lockPressed[4]{};
-bool g_lockToggle[4]{};
-int g_lastLock = 0;
-bool g_lastLockValue = false;
+// Mixer COM interfaces never enter the XAML STA.
+struct MixerRuntimeState {
+    std::vector<MixerEntry> entries;
+    Microsoft::WRL::ComPtr<IAudioEndpointVolume> master;
+    float masterLevel = 0;
+    bool masterMuted = false;
+    std::vector<AudioOutputOption> outputOptions;
+    std::wstring outputId;
+    bool outputSwitchFailed = false;
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> notifyEnumerator;
+    Microsoft::WRL::ComPtr<MixerOutputNotifications> notify;
+
+    // All these operations stay on the dedicated controller's COM apartment.
+    // A callback can still arrive until its registration is revoked.
+    void StopNotificationsOnControllerThread() {
+        if (notify) notify->Stop();
+        if (notify && notifyEnumerator) {
+            (void)notifyEnumerator->UnregisterEndpointNotificationCallback(
+                notify.Get());
+        }
+        notify.Reset();
+        notifyEnumerator.Reset();
+    }
+    void ClearSessionsOnControllerThread() {
+        // HICON ownership is independent of the Core Audio ComPtr objects.
+        for (auto& entry : entries) {
+            if (entry.appIcon) DestroyIcon(entry.appIcon);
+            entry.appIcon = nullptr;
+        }
+        entries.clear();
+        master.Reset();
+    }
+    void ClearOutputDevicesOnControllerThread() {
+        outputOptions.clear();
+        outputId.clear();
+    }
+    void PrepareRefreshOnControllerThread() {
+        // Preserve previously selected output metadata until enumeration
+        // actually starts, just as the prior refresh path did.
+        ClearSessionsOnControllerThread();
+        masterLevel = 0;
+        masterMuted = false;
+    }
+    void ClosePanelOnControllerThread() {
+        StopNotificationsOnControllerThread();
+        ClearSessionsOnControllerThread();
+        // Retain outputId and status fields as in the existing close path.
+        outputOptions.clear();
+    }
+    void ReleaseStorageOnControllerThread() {
+        // Called during controller shutdown, before CoUninitialize().
+        StopNotificationsOnControllerThread();
+        ClearSessionsOnControllerThread();
+        ClearOutputDevicesOnControllerThread();
+        masterLevel = 0;
+        masterMuted = false;
+        outputSwitchFailed = false;
+        // no_destroy means these capacities are not freed at DLL detach.
+        std::vector<MixerEntry> oldEntries;
+        std::vector<AudioOutputOption> oldOptions;
+        std::wstring oldOutputId;
+        entries.swap(oldEntries);
+        outputOptions.swap(oldOptions);
+        outputId.swap(oldOutputId);
+    }
+};
+[[clang::no_destroy]] MixerRuntimeState g_mixer;
+
+// Interactive panel state is independent of Core Audio ownership.
+struct PanelControllerState {
+    float scale = 1.0f;
+    bool mixerOpen = false, mixerOutputExpanded = false;
+    bool mediaOpen = false;
+    uint32_t mixerGeneration = 1, mediaGeneration = 1;
+};
+PanelControllerState g_panel;
+
+// Low-level keyboard hook and key latches share a single UI-thread owner.
+struct LockKeyState {
+    HHOOK hook = nullptr;
+    bool pressed[4]{};
+    bool toggle[4]{};
+    int last = 0;
+    bool lastValue = false;
+};
+LockKeyState g_keys;
 
 // --- Event state and worker coordination ---
-SRWLOCK g_nativeEventLock = SRWLOCK_INIT;
-NativeEventInfo g_nativeEventPending;
-bool g_nativeEventPosted = false;
+struct NativeEventMailbox {
+    SRWLOCK lock = SRWLOCK_INIT;
+    NativeEventInfo pending;
+    bool posted = false;
 
-SRWLOCK g_handleLock = SRWLOCK_INIT;
-std::unordered_map<ULONG_PTR, PhysicalInfo> g_handles;
+    bool Offer(NativeEventInfo value) {
+        AcquireSRWLockExclusive(&lock);
+        pending = std::move(value);
+        const bool needsPost = !posted;
+        posted = true;
+        ReleaseSRWLockExclusive(&lock);
+        return needsPost;
+    }
+    void PostFailed() {
+        AcquireSRWLockExclusive(&lock);
+        posted = false;
+        ReleaseSRWLockExclusive(&lock);
+    }
+    NativeEventInfo Take() {
+        AcquireSRWLockExclusive(&lock);
+        NativeEventInfo value = std::move(pending);
+        pending = NativeEventInfo{};
+        posted = false;
+        ReleaseSRWLockExclusive(&lock);
+        return value;
+    }
+    // Invoked only after Windhawk removes native hooks and the receiver exits.
+    void ReleaseAfterHooksRemoved() {
+        NativeEventInfo oldPending;
+        AcquireSRWLockExclusive(&lock);
+        std::swap(pending, oldPending);
+        posted = false;
+        ReleaseSRWLockExclusive(&lock);
+    }
+};
+[[clang::no_destroy]] NativeEventMailbox g_nativeMailbox;
 
-std::vector<BrightnessEvent> g_ddcBatchEvents;  // UI thread only
-std::vector<DdcTargetState> g_ddcTargets;      // UI thread only
-bool g_ddcBatchPending = false;
-WCHAR g_ddcLastUnresolved[CCHDEVICENAME]{}; // UI thread, log only changed failures
-WCHAR g_ddcLastTarget[CCHDEVICENAME]{}; // UI thread, log target transitions
+struct DdcRuntimeState {
+    // Handle identity cache is hook-thread shared; batches and pending writes
+    // are exclusively owned by the native controller thread.
+    struct PendingWrite {
+        BrightnessEvent event{};
+        DWORD previousValue = 0, generation = 0;
+    };
 
-SRWLOCK g_wheelWriteLock = SRWLOCK_INIT;
-std::vector<BrightnessWheelTask> g_wheelWritePending; // At most one latest write per physical display.
-HANDLE g_wheelWriteWake = nullptr;
-HANDLE g_wheelWriteThread = nullptr;
-std::atomic<bool> g_wheelWriteStop{false};
+    SRWLOCK handleLock = SRWLOCK_INIT;
+    std::unordered_map<ULONG_PTR, PhysicalInfo> handles;
+    std::vector<BrightnessEvent> batchEvents;
+    std::vector<DdcTargetState> targets;
+    std::vector<PendingWrite> pendingWrites;
+    bool batchPending = false;
+    WCHAR lastUnresolved[CCHDEVICENAME]{};
+    WCHAR lastTarget[CCHDEVICENAME]{};
+    int lastConfirmedNative = -1;
+    DWORD lastConfirmedDdc = 0;
 
-HMODULE g_combase = nullptr;               // UI thread only
-RoUninitialize_t g_roUninitialize = nullptr;
-bool g_roInitialized = false;
-IUiSettings3Raw* g_uiSettings = nullptr;    // UI thread only
+    // DDC hooks can run concurrently in Explorer or Twinkle Tray. Keep
+    // identity lookup, range adjustment and handle lifetime under one lock.
+    PhysicalInfo LookupHandle(HANDLE handle) {
+        AcquireSRWLockShared(&handleLock);
+        auto it = handles.find(reinterpret_cast<ULONG_PTR>(handle));
+        PhysicalInfo result = it == handles.end() ? PhysicalInfo{} : it->second;
+        ReleaseSRWLockShared(&handleLock);
+        return result;
+    }
+    void UpdateHandleRange(HANDLE handle, DWORD low, DWORD high) {
+        if (high <= low) return;
+        AcquireSRWLockExclusive(&handleLock);
+        auto it = handles.find(reinterpret_cast<ULONG_PTR>(handle));
+        if (it != handles.end()) {
+            it->second.minimum = low;
+            it->second.maximum = high;
+        }
+        ReleaseSRWLockExclusive(&handleLock);
+    }
+    void RememberHandles(PCWSTR device, DWORD count,
+                         LPPHYSICAL_MONITOR items) {
+        AcquireSRWLockExclusive(&handleLock);
+        for (DWORD i = 0; i < count; ++i) {
+            PhysicalInfo info{};
+            wcscpy_s(info.device, device);
+            info.physicalIndex = i;
+            handles[reinterpret_cast<ULONG_PTR>(items[i].hPhysicalMonitor)] = info;
+        }
+        ReleaseSRWLockExclusive(&handleLock);
+    }
+    void ForgetHandle(HANDLE handle) {
+        AcquireSRWLockExclusive(&handleLock);
+        handles.erase(reinterpret_cast<ULONG_PTR>(handle));
+        ReleaseSRWLockExclusive(&handleLock);
+    }
+    void ForgetHandles(DWORD count, LPPHYSICAL_MONITOR items) {
+        if (!items || count > 32) return;
+        AcquireSRWLockExclusive(&handleLock);
+        for (DWORD i = 0; i < count; ++i)
+            handles.erase(reinterpret_cast<ULONG_PTR>(items[i].hPhysicalMonitor));
+        ReleaseSRWLockExclusive(&handleLock);
+    }
 
-// --- Active master flyout state (dedicated UI thread) ---
-BrightnessEvent g_visible{};  // UI thread only
-PopupKind g_popupKind = PopupKind::DdcBrightness; // UI thread only
-NativeEventInfo g_nativeEventCurrent;         // UI thread only
-int g_nativePercent = 0;                        // UI thread only
-bool g_nativePercentKnown = false;              // UI thread only
-bool g_nativeMuted = false;                     // UI thread only
+    // Batch state belongs solely to the controller. Its most-recent write
+    // wins per physical monitor; a refreshed monitor moves to the back.
+    bool AccumulateOnControllerThread(const BrightnessEvent& event) {
+        const bool firstInBatch = !batchPending;
+        auto sameTarget = [&](const BrightnessEvent& existing) {
+            return existing.physicalIndex == event.physicalIndex &&
+                   _wcsicmp(existing.device, event.device) == 0;
+        };
+        auto same = std::find_if(batchEvents.begin(), batchEvents.end(),
+                                 sameTarget);
+        if (same != batchEvents.end()) {
+            batchEvents.erase(same);
+            batchEvents.push_back(event);
+        } else if (batchEvents.size() < kMaxDdcTargets) {
+            batchEvents.push_back(event);
+        }
+        if (batchEvents.empty()) return false;
+        batchPending = true;
+        return firstInBatch;
+    }
+    std::vector<BrightnessEvent> TakeBatchOnControllerThread() {
+        if (!batchPending) return {};
+        batchPending = false;
+        std::vector<BrightnessEvent> events = std::move(batchEvents);
+        batchEvents.clear();
+        return events;
+    }
+    // Pending writes have a different lifetime from event batches. Repeated
+    // writes preserve the first known-good value for failure rollback.
+    void RememberPendingWriteOnControllerThread(
+            const BrightnessEvent& event, DWORD generation) {
+        auto pending = std::find_if(pendingWrites.begin(), pendingWrites.end(),
+            [&](const PendingWrite& item) {
+                return item.event.physicalIndex == event.physicalIndex &&
+                    _wcsicmp(item.event.device, event.device) == 0;
+            });
+        if (pending == pendingWrites.end()) {
+            if (pendingWrites.size() >= kMaxDdcTargets)
+                pendingWrites.erase(pendingWrites.begin());
+            pendingWrites.push_back({event, event.value, generation});
+        } else {
+            pending->generation = generation;
+        }
+    }
+    bool TakePendingWriteOnControllerThread(
+            DWORD generation, PendingWrite& result) {
+        auto pending = std::find_if(pendingWrites.begin(), pendingWrites.end(),
+            [generation](const PendingWrite& item) {
+                return item.generation == generation;
+            });
+        if (pending == pendingWrites.end()) return false;
+        result = *pending;
+        pendingWrites.erase(pending);
+        return true;
+    }
+    void ClearPendingOnControllerThread() {
+        batchPending = false;
+        batchEvents.clear();
+        targets.clear();
+        pendingWrites.clear();
+    }
+    // DDC hooks still exist during BeforeUninit; clear their identity cache
+    // only in ModUninit, after Windhawk has removed those hooks.
+    void ReleaseAfterHooksRemoved() {
+        std::unordered_map<ULONG_PTR, PhysicalInfo> oldHandles;
+        AcquireSRWLockExclusive(&handleLock);
+        handles.swap(oldHandles);
+        ReleaseSRWLockExclusive(&handleLock);
+        std::vector<BrightnessEvent> oldEvents;
+        std::vector<DdcTargetState> oldTargets;
+        std::vector<PendingWrite> oldPendingWrites;
+        batchEvents.swap(oldEvents);
+        targets.swap(oldTargets);
+        pendingWrites.swap(oldPendingWrites);
+        batchPending = false;
+    }
+};
+[[clang::no_destroy]] DdcRuntimeState g_ddc;
+
+struct BrightnessWriterState {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<BrightnessWheelTask> pending;
+    HANDLE wake = nullptr, thread = nullptr;
+    std::atomic<bool> stop{false};
+    DWORD generation = 0;
+
+    static bool SameTarget(const BrightnessWheelTask& a,
+                           const BrightnessWheelTask& b) {
+        return a.native == b.native &&
+            (a.native ||
+             (a.monitor.physicalIndex == b.monitor.physicalIndex &&
+              _wcsicmp(a.monitor.device, b.monitor.device) == 0));
+    }
+    // The existing queue lock also protects wake-handle publication and
+    // signalling against shutdown closing the handle on another thread.
+    void PublishWake(HANDLE handle) {
+        AcquireSRWLockExclusive(&lock);
+        wake = handle;
+        ReleaseSRWLockExclusive(&lock);
+    }
+    bool ReadyForCommands() {
+        AcquireSRWLockShared(&lock);
+        const bool ready = wake && !stop.load();
+        ReleaseSRWLockShared(&lock);
+        return ready;
+    }
+    // Preserve one latest write per physical target and the hard queue cap.
+    void EnqueueAndSignal(const BrightnessWheelTask& task) {
+        AcquireSRWLockExclusive(&lock);
+        if (!wake || stop.load()) {
+            ReleaseSRWLockExclusive(&lock);
+            return;
+        }
+        auto found = std::find_if(pending.begin(), pending.end(),
+            [&](const BrightnessWheelTask& queued) {
+                return SameTarget(queued, task);
+            });
+        if (found != pending.end()) {
+            *found = task;
+        } else if (pending.size() < kMaxDdcTargets + 1) {
+            pending.push_back(task);
+        } else {
+            pending.erase(pending.begin());
+            pending.push_back(task);
+        }
+        SetEvent(wake);
+        ReleaseSRWLockExclusive(&lock);
+    }
+    void SignalStop() {
+        AcquireSRWLockExclusive(&lock);
+        stop.store(true);
+        if (wake) SetEvent(wake);
+        ReleaseSRWLockExclusive(&lock);
+    }
+    void CloseWakeAfterWorkerStops() {
+        AcquireSRWLockExclusive(&lock);
+        if (wake) CloseHandle(wake);
+        wake = nullptr;
+        ReleaseSRWLockExclusive(&lock);
+    }
+    bool IsSuperseded(const BrightnessWheelTask& task) {
+        AcquireSRWLockShared(&lock);
+        const bool superseded = std::any_of(pending.begin(), pending.end(),
+            [&](const BrightnessWheelTask& newer) {
+                return newer.generation > task.generation &&
+                       SameTarget(newer, task);
+            });
+        ReleaseSRWLockShared(&lock);
+        return superseded;
+    }
+    std::vector<BrightnessWheelTask> TakePending() {
+        std::vector<BrightnessWheelTask> result;
+        AcquireSRWLockExclusive(&lock);
+        result.swap(pending);
+        ReleaseSRWLockExclusive(&lock);
+        return result;
+    }
+    void ReleaseStorageAfterWorkerStops() {
+        std::vector<BrightnessWheelTask> oldPending;
+        AcquireSRWLockExclusive(&lock);
+        pending.swap(oldPending);
+        ReleaseSRWLockExclusive(&lock);
+    }
+};
+[[clang::no_destroy]] BrightnessWriterState g_writer;
+
+// UI-thread-owned platform provider and current on-screen event.
+struct UiPresentationState {
+    HMODULE combase = nullptr;
+    RoUninitialize_t roUninitialize = nullptr;
+    bool roInitialized = false;
+    IUiSettings3Raw* uiSettings = nullptr;
+    BrightnessEvent visible{};
+    PopupKind popupKind = PopupKind::DdcBrightness;
+    NativeEventInfo nativeEventCurrent;
+    int nativePercent = 0;
+    bool nativePercentKnown = false;
+    bool nativeMuted = false;
+};
+UiPresentationState g_presentation;
 
 // ============================================================
 // Shared helpers: localization, settings, UI state and geometry
 // ============================================================
 
 bool UseTraditionalChinese() {
-    const int selected = g_displayLanguage.load(std::memory_order_relaxed);
+    const int selected = g_config.displayLanguage.load(std::memory_order_relaxed);
     if (selected == 2) return true;
     if (selected == 1) return false;
     const LANGID lang = GetUserDefaultUILanguage();
@@ -6191,9 +6665,9 @@ PCWSTR Tr(OsdText id) {
                                    : kLocalizedText[index].en;
 }
 UINT OsdDuration(DurationKind kind) {
-    if (!g_individualDurations.load(std::memory_order_relaxed))
-        return static_cast<UINT>(g_globalDurationMs.load(std::memory_order_relaxed));
-    return static_cast<UINT>(g_durationOverrides[static_cast<int>(kind)]
+    if (!g_config.individualDurations.load(std::memory_order_relaxed))
+        return static_cast<UINT>(g_config.globalDurationMs.load(std::memory_order_relaxed));
+    return static_cast<UINT>(g_config.durationOverrides[static_cast<int>(kind)]
         .load(std::memory_order_relaxed));
 }
 bool ParseRgbHex(PCWSTR str, DWORD& rgb) {
@@ -6275,18 +6749,18 @@ void LoadBoolSettings(std::atomic<bool> (&target)[N],
 
 
 BYTE OsdBackgroundAlpha() {
-    return static_cast<BYTE>((g_backgroundOpacity.load() * 255 + 50) / 100);
+    return static_cast<BYTE>((g_config.backgroundOpacity.load() * 255 + 50) / 100);
 }
 
 // A single direction and anchor rule drives panel placement and chevrons.
 // --- Common placement, sizing and monitor identity ---
 float MainLogicalWidth() {
-    return static_cast<float>(g_verticalVolumeBrightness.load()
-        ? g_verticalOsdWidth.load() : g_horizontalOsdWidth.load());
+    return static_cast<float>(g_config.verticalVolumeBrightness.load()
+        ? g_config.verticalOsdWidth.load() : g_config.horizontalOsdWidth.load());
 }
 float MainLogicalHeight() {
-    return static_cast<float>(g_verticalVolumeBrightness.load()
-        ? g_verticalOsdHeight.load() : g_horizontalOsdHeight.load());
+    return static_cast<float>(g_config.verticalVolumeBrightness.load()
+        ? g_config.verticalOsdHeight.load() : g_config.horizontalOsdHeight.load());
 }
 bool PositionIsTop(int pos) {
     return pos == 3 || pos == 5 || pos == 6;
@@ -6407,25 +6881,25 @@ void LoadSettings() {
     const int chosen = selectedLanguage &&
         _wcsicmp(selectedLanguage, L"zh-TW") == 0 ? 2 :
         selectedLanguage && _wcsicmp(selectedLanguage, L"en") == 0 ? 1 : 0;
-    g_displayLanguage.store(chosen, std::memory_order_relaxed);
+    g_config.displayLanguage.store(chosen, std::memory_order_relaxed);
     Wh_FreeStringSetting(selectedLanguage);
-    g_hideAllNativeOsd.store(
+    g_config.hideAllNativeOsd.store(
         Wh_GetIntSetting(L"NativeHide.hideAllNativeOsd") != 0);
-    LoadBoolSettings(g_hide, kNativeHideSettingKeys);
-    LoadBoolSettings(g_showCustomNative, kCustomNativeSettingKeys);
-    g_showDdcBrightness.store(Wh_GetIntSetting(L"CustomOSD.Switches.showDdcBrightness") != 0);
-    g_verticalVolumeBrightness.store(Wh_GetIntSetting(L"CustomOSD.Layout.verticalVolumeBrightness") != 0);
-    g_fromExplorer.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromExplorer") != 0);
-    g_fromTwinkle.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromTwinkle") != 0);
-    g_vcpCode.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcVcpCode"), 0, 255));
-    g_globalDurationMs.store(std::clamp(
+    LoadBoolSettings(g_config.hide, kNativeHideSettingKeys);
+    LoadBoolSettings(g_config.showCustomNative, kCustomNativeSettingKeys);
+    g_config.showDdcBrightness.store(Wh_GetIntSetting(L"CustomOSD.Switches.showDdcBrightness") != 0);
+    g_config.verticalVolumeBrightness.store(Wh_GetIntSetting(L"CustomOSD.Layout.verticalVolumeBrightness") != 0);
+    g_config.fromExplorer.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromExplorer") != 0);
+    g_config.fromTwinkle.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromTwinkle") != 0);
+    g_config.vcpCode.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcVcpCode"), 0, 255));
+    g_config.globalDurationMs.store(std::clamp(
         Wh_GetIntSetting(L"CustomOSD.Timing.globalDurationMs"), 500, 20000));
-    g_individualDurations.store(
+    g_config.individualDurations.store(
         Wh_GetIntSetting(L"CustomOSD.Timing.individualDurations") != 0);
     for (int i = 0; i < static_cast<int>(DurationKind::Count); ++i) {
         std::wstring path = L"CustomOSD.Timing.";
         path += kDurationSettingKeys[i];
-        g_durationOverrides[i].store(std::clamp(
+        g_config.durationOverrides[i].store(std::clamp(
             Wh_GetIntSetting(path.c_str()), 500, 20000));
     }
     PCWSTR selectedTheme = Wh_GetStringSetting(L"CustomOSD.Appearance.ddcTheme");
@@ -6434,52 +6908,52 @@ void LoadSettings() {
         ? 1 : selectedTheme &&
         (_wcsicmp(selectedTheme, L"dark") == 0 || wcscmp(selectedTheme, L"2") == 0)
         ? 2 : 0;
-    g_ddcTheme.store(selectedMode);
+    g_config.ddcTheme.store(selectedMode);
     Wh_FreeStringSetting(selectedTheme);
-    g_ddcSizePercent.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcSizePercent"), 55, 120));
-    g_horizontalOsdWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdWidth"), 300, 650));
-    g_horizontalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdHeight"), 72, 220));
-    g_verticalOsdWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.verticalOsdWidth"), 72, 180));
-    g_verticalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.verticalOsdHeight"), 160, 430));
-    g_horizontalSmtcHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.horizontalSmtcHeight"), 176, 480));
-    g_horizontalMixerHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.horizontalMixerHeight"), 176, 480));
-    g_verticalSmtcWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.verticalSmtcWidth"), 300, 650));
-    g_verticalMixerWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.verticalMixerWidth"), 300, 650));
-    g_ddcBorderless.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBorderless") != 0);
-    g_showSmtcOnVolume.store(Wh_GetIntSetting(L"CustomOSD.Switches.showSmtcOnVolume") != 0);
-    g_showMediaArtwork.store(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.showMediaArtwork") != 0);
-    g_showMediaControls.store(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.showMediaControls") != 0);
-    g_mediaControlSizePercent.store(std::clamp(
+    g_config.ddcSizePercent.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcSizePercent"), 55, 120));
+    g_config.horizontalOsdWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdWidth"), 300, 650));
+    g_config.horizontalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdHeight"), 72, 220));
+    g_config.verticalOsdWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.verticalOsdWidth"), 72, 180));
+    g_config.verticalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.verticalOsdHeight"), 160, 430));
+    g_config.horizontalSmtcHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.horizontalSmtcHeight"), 176, 480));
+    g_config.horizontalMixerHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.horizontalMixerHeight"), 176, 480));
+    g_config.verticalSmtcWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.verticalSmtcWidth"), 300, 650));
+    g_config.verticalMixerWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.verticalMixerWidth"), 300, 650));
+    g_config.ddcBorderless.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBorderless") != 0);
+    g_config.showSmtcOnVolume.store(Wh_GetIntSetting(L"CustomOSD.Switches.showSmtcOnVolume") != 0);
+    g_config.showMediaArtwork.store(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.showMediaArtwork") != 0);
+    g_config.showMediaControls.store(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.showMediaControls") != 0);
+    g_config.mediaControlSizePercent.store(std::clamp(
         Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.mediaControlSizePercent"), 90, 135));
     {
         PCWSTR shape = Wh_GetStringSetting(L"CustomOSD.Appearance.controlButtonShape");
-        g_controlButtonSquare.store(shape && _wcsicmp(shape, L"square") == 0);
+        g_config.controlButtonSquare.store(shape && _wcsicmp(shape, L"square") == 0);
         Wh_FreeStringSetting(shape);
     }
-    g_controlButtonCornerRadius.store(std::clamp(
+    g_config.controlButtonCornerRadius.store(std::clamp(
         Wh_GetIntSetting(L"CustomOSD.Appearance.controlButtonCornerRadius"), 0, 16));
-    g_showMixerArrow.store(Wh_GetIntSetting(L"CustomOSD.Switches.showVolumeMixerArrow") != 0);
-    g_mixerMaxRows.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.mixerMaxRows"), 3, 16));
-    LoadBoolSettings(g_showLockKeys, kLockSettingKeys);
-    g_innerPadding.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcInnerPadding"), 6, 22));
-    g_showClipboardOsd.store(Wh_GetIntSetting(L"CustomOSD.Switches.showClipboardOsd") != 0);
-    g_clipboardTextPreview.store(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardTextPreview") != 0);
-    g_clipboardImagePreview.store(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardImagePreview") != 0);
-    g_clipboardChars.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardMaxChars"), 12, 100));
-    g_showUsbEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showUsbEvents") != 0);
-    g_showBluetoothEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showBluetoothEvents") != 0);
-    g_showNetworkEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showNetworkEvents") != 0);
-    g_fadeEnabled.store(Wh_GetIntSetting(L"CustomOSD.Layout.fadeOsd") != 0);
-    g_fadeDuration.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.fadeDurationMs"), 60, 450));
-    g_accentMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcAccentMode"));
-    g_backgroundMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcBackgroundMode"));
-    g_textMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcTextMode"));
-    g_trackMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcTrackMode"));
-    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomAccent", g_customAccent, g_validCustomAccent);
-    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomBackground", g_customBackground, g_validCustomBackground);
-    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomText", g_customText, g_validCustomText);
-    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomTrack", g_customTrack, g_validCustomTrack);
-    g_backgroundOpacity.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBackgroundOpacity"), 0, 100));
+    g_config.showMixerArrow.store(Wh_GetIntSetting(L"CustomOSD.Switches.showVolumeMixerArrow") != 0);
+    g_config.mixerMaxRows.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.mixerMaxRows"), 3, 16));
+    LoadBoolSettings(g_config.showLockKeys, kLockSettingKeys);
+    g_config.innerPadding.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcInnerPadding"), 6, 22));
+    g_config.showClipboardOsd.store(Wh_GetIntSetting(L"CustomOSD.Switches.showClipboardOsd") != 0);
+    g_config.clipboardTextPreview.store(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardTextPreview") != 0);
+    g_config.clipboardImagePreview.store(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardImagePreview") != 0);
+    g_config.clipboardChars.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardMaxChars"), 12, 100));
+    g_config.showUsbEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showUsbEvents") != 0);
+    g_config.showBluetoothEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showBluetoothEvents") != 0);
+    g_config.showNetworkEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showNetworkEvents") != 0);
+    g_config.fadeEnabled.store(Wh_GetIntSetting(L"CustomOSD.Layout.fadeOsd") != 0);
+    g_config.fadeDuration.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.fadeDurationMs"), 60, 450));
+    g_config.accentMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcAccentMode"));
+    g_config.backgroundMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcBackgroundMode"));
+    g_config.textMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcTextMode"));
+    g_config.trackMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcTrackMode"));
+    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomAccent", g_config.customAccent, g_config.validCustomAccent);
+    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomBackground", g_config.customBackground, g_config.validCustomBackground);
+    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomText", g_config.customText, g_config.validCustomText);
+    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomTrack", g_config.customTrack, g_config.validCustomTrack);
+    g_config.backgroundOpacity.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBackgroundOpacity"), 0, 100));
     {
         PCWSTR effect = Wh_GetStringSetting(L"CustomOSD.Appearance.ddcBackgroundEffect");
         const bool layered = effect && _wcsicmp(effect, L"layers") == 0;
@@ -6507,28 +6981,24 @@ void LoadSettings() {
             Wh_Log(L"Fluent OSD/XAML: layered settings loaded=%u",
                    static_cast<unsigned>(layers.size()));
         // Publish the entire array as one snapshot for the OSD controller.
-        {
-            std::lock_guard<std::mutex> lock(g_backgroundLayersMutex);
-            g_backgroundLayers = std::move(layers);
-            g_useLayeredBackground.store(layered, std::memory_order_release);
-        }
+        g_config.SetBrushLayers(layered, std::move(layers));
     }
-    g_cornerRadius.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcCornerRadius"), 0, 34));
-    g_fontSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcFontSize"), 10, 24));
-    g_iconSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcIconSize"), 10, 24));
-    g_showSun.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowSun") != 0);
-    g_showValue.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowValue") != 0);
+    g_config.cornerRadius.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcCornerRadius"), 0, 34));
+    g_config.fontSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcFontSize"), 10, 24));
+    g_config.iconSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcIconSize"), 10, 24));
+    g_config.showSun.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowSun") != 0);
+    g_config.showValue.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowValue") != 0);
     PCWSTR outputMode = Wh_GetStringSetting(L"CustomOSD.Layout.displayOutputMode");
     const int displayMode = outputMode && _wcsicmp(outputMode, L"all") == 0 ? 3 :
         outputMode && _wcsicmp(outputMode, L"selected") == 0 ? 2 :
         outputMode && _wcsicmp(outputMode, L"primary") == 0 ? 1 : 0;
-    g_displayOutputMode.store(displayMode);
+    g_config.displayOutputMode.store(displayMode);
     Wh_FreeStringSetting(outputMode);
-    g_displayOutputNumber.store(std::clamp(
+    g_config.displayOutputNumber.store(std::clamp(
         Wh_GetIntSetting(L"CustomOSD.Layout.displayOutputNumber"), 1, 16));
-    g_position.store(ReadPositionSetting());
-    g_offsetX.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetX"), -500, 500));
-    g_offsetY.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetY"), -500, 500));
+    g_config.position.store(ReadPositionSetting());
+    g_config.offsetX.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetX"), -500, 500));
+    g_config.offsetY.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetY"), -500, 500));
 }
 
 // ============================================================
@@ -6537,12 +7007,12 @@ void LoadSettings() {
 bool Hidden(Kind k) {
     // Hide never changes whether the custom OSD is displayed. A master
     // override hides all native categories, even if their local Hide is off.
-    return g_hideAllNativeOsd.load(std::memory_order_relaxed) ||
-           g_hide[static_cast<int>(k)].load(std::memory_order_relaxed);
+    return g_config.hideAllNativeOsd.load(std::memory_order_relaxed) ||
+           g_config.hide[static_cast<int>(k)].load(std::memory_order_relaxed);
 }
 
 bool ShowCustomNative(Kind kind) {
-    return g_showCustomNative[static_cast<int>(kind)].load(
+    return g_config.showCustomNative[static_cast<int>(kind)].load(
         std::memory_order_relaxed);
 }
 
@@ -6574,26 +7044,17 @@ bool RouteNativeExtra(Kind kind, int value, int variant = 0,
     if (!ShowCustomNative(kind)) return false;
     HWND receiver = FindWindowExW(HWND_MESSAGE, nullptr, kWindowClass, nullptr);
     if (!receiver) return false;
-    bool mustPost = false;
-    AcquireSRWLockExclusive(&g_nativeEventLock);
-    g_nativeEventPending = NativeEventInfo{kind, value, variant, std::move(text)};
-    if (!g_nativeEventPosted) {
-        g_nativeEventPosted = true;
-        mustPost = true;
-    }
-    ReleaseSRWLockExclusive(&g_nativeEventLock);
-    if (!mustPost) return true;
+    if (!g_nativeMailbox.Offer(
+            NativeEventInfo{kind, value, variant, std::move(text)})) return true;
     if (PostMessageW(receiver, kNativeExtraMessage, 0, 0)) return true;
-    AcquireSRWLockExclusive(&g_nativeEventLock);
-    g_nativeEventPosted = false;
-    ReleaseSRWLockExclusive(&g_nativeEventLock);
+    g_nativeMailbox.PostFailed();
     return false;
 }
 
 bool DdcAllowed() {
-    return g_showDdcBrightness.load(std::memory_order_relaxed) &&
-        (g_isExplorer ? g_fromExplorer.load(std::memory_order_relaxed)
-                      : g_fromTwinkle.load(std::memory_order_relaxed));
+    return g_config.showDdcBrightness.load(std::memory_order_relaxed) &&
+        (g_module.isExplorer ? g_config.fromExplorer.load(std::memory_order_relaxed)
+                      : g_config.fromTwinkle.load(std::memory_order_relaxed));
 }
 
 // Display routing is independent of native visibility. Show controls whether
@@ -6691,10 +7152,10 @@ int WINAPI TextHook(void* self, void* text, bool value) {
 }
 
 void HookNativeOsd() {
-    g_confirmatorDll = LoadLibraryExW(
+    g_module.confirmatorDll = LoadLibraryExW(
         L"Windows.Internal.HardwareConfirmator.dll", nullptr,
         LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!g_confirmatorDll) {
+    if (!g_module.confirmatorDll) {
         Wh_Log(L"Windows HardwareConfirmator DLL not available");
         return;
     }
@@ -6715,7 +7176,7 @@ void HookNativeOsd() {
         {{LR"(private: struct winrt::fire_and_forget __cdecl winrt::Windows::Internal::HardwareConfirmator::implementation::HardwareConfirmatorHost::ShowCameraOnAsync(bool))"}, &CameraAsync_Original, CameraAsync_Hook, true},
         {{LR"(private: struct winrt::fire_and_forget __cdecl winrt::Windows::Internal::HardwareConfirmator::implementation::HardwareConfirmatorHost::ShowCameraAccessEnabledAsync(bool))"}, &CameraAccessAsync_Original, CameraAccessAsync_Hook, true},
     };
-    if (!WindhawkUtils::HookSymbols(g_confirmatorDll, hooks, ARRAYSIZE(hooks)))
+    if (!WindhawkUtils::HookSymbols(g_module.confirmatorDll, hooks, ARRAYSIZE(hooks)))
         Wh_Log(L"HardwareConfirmator HookSymbols failed");
     Wh_Log(L"Native OSD hooks: volume=%d brightness=%d microphone=%d text=%d",
            VolumeThunk_Original || VolumeAsync_Original,
@@ -6727,25 +7188,6 @@ void HookNativeOsd() {
 // DDC source hooks, target cache and cross-process events
 // ============================================================
 // --- DDC hooks and per-process HANDLE -> display identity / range cache ---
-PhysicalInfo GetPhysicalInfo(HANDLE handle) {
-    AcquireSRWLockShared(&g_handleLock);
-    auto it = g_handles.find(reinterpret_cast<ULONG_PTR>(handle));
-    PhysicalInfo copy = it == g_handles.end() ? PhysicalInfo{} : it->second;
-    ReleaseSRWLockShared(&g_handleLock);
-    return copy;
-}
-
-void UpdateRange(HANDLE handle, DWORD low, DWORD high) {
-    if (high <= low) return;
-    AcquireSRWLockExclusive(&g_handleLock);
-    auto it = g_handles.find(reinterpret_cast<ULONG_PTR>(handle));
-    if (it != g_handles.end()) {
-        it->second.minimum = low;
-        it->second.maximum = high;
-    }
-    ReleaseSRWLockExclusive(&g_handleLock);
-}
-
 using GetPhysical_t = BOOL(WINAPI*)(HMONITOR, DWORD, LPPHYSICAL_MONITOR);
 GetPhysical_t GetPhysicalOriginal = nullptr;
 BOOL WINAPI GetPhysicalHook(HMONITOR display, DWORD count,
@@ -6755,35 +7197,21 @@ BOOL WINAPI GetPhysicalHook(HMONITOR display, DWORD count,
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
     if (!GetMonitorInfoW(display, &mi)) return ok;
-    AcquireSRWLockExclusive(&g_handleLock);
-    for (DWORD i = 0; i < count; ++i) {
-        PhysicalInfo p{};
-        wcscpy_s(p.device, mi.szDevice);
-        p.physicalIndex = i;
-        g_handles[reinterpret_cast<ULONG_PTR>(items[i].hPhysicalMonitor)] = p;
-    }
-    ReleaseSRWLockExclusive(&g_handleLock);
+    g_ddc.RememberHandles(mi.szDevice, count, items);
     return ok;
 }
 
 using DestroyPhysical_t = BOOL(WINAPI*)(HANDLE);
 DestroyPhysical_t DestroyPhysicalOriginal = nullptr;
 BOOL WINAPI DestroyPhysicalHook(HANDLE handle) {
-    AcquireSRWLockExclusive(&g_handleLock);
-    g_handles.erase(reinterpret_cast<ULONG_PTR>(handle));
-    ReleaseSRWLockExclusive(&g_handleLock);
+    g_ddc.ForgetHandle(handle);
     return DestroyPhysicalOriginal(handle);
 }
 
 using DestroyPhysicalArray_t = BOOL(WINAPI*)(DWORD, LPPHYSICAL_MONITOR);
 DestroyPhysicalArray_t DestroyPhysicalArrayOriginal = nullptr;
 BOOL WINAPI DestroyPhysicalArrayHook(DWORD count, LPPHYSICAL_MONITOR items) {
-    if (items && count <= 32) {
-        AcquireSRWLockExclusive(&g_handleLock);
-        for (DWORD i = 0; i < count; ++i)
-            g_handles.erase(reinterpret_cast<ULONG_PTR>(items[i].hPhysicalMonitor));
-        ReleaseSRWLockExclusive(&g_handleLock);
-    }
+    g_ddc.ForgetHandles(count, items);
     return DestroyPhysicalArrayOriginal(count, items);
 }
 
@@ -6792,7 +7220,7 @@ GetBrightness_t GetBrightnessOriginal = nullptr;
 BOOL WINAPI GetBrightnessHook(HANDLE handle, LPDWORD low, LPDWORD current,
                               LPDWORD high) {
     BOOL ok = GetBrightnessOriginal(handle, low, current, high);
-    if (ok && low && high) UpdateRange(handle, *low, *high);
+    if (ok && low && high) g_ddc.UpdateHandleRange(handle, *low, *high);
     return ok;
 }
 
@@ -6802,46 +7230,26 @@ GetVcp_t GetVcpOriginal = nullptr;
 BOOL WINAPI GetVcpHook(HANDLE handle, BYTE code, LPMC_VCP_CODE_TYPE type,
                        LPDWORD current, LPDWORD maximum) {
     BOOL ok = GetVcpOriginal(handle, code, type, current, maximum);
-    if (ok && maximum && code == static_cast<BYTE>(g_vcpCode.load()))
-        UpdateRange(handle, 0, *maximum);
+    if (ok && maximum && code == static_cast<BYTE>(g_config.vcpCode.load()))
+        g_ddc.UpdateHandleRange(handle, 0, *maximum);
     return ok;
 }
 
 void QueueBrightnessWheelTask(const BrightnessWheelTask& task) {
-    if (!g_wheelWriteWake || g_wheelWriteStop.load()) return;
-    AcquireSRWLockExclusive(&g_wheelWriteLock);
-    auto sameTarget = [&](const BrightnessWheelTask& pending) {
-        return pending.native == task.native &&
-            (task.native ||
-             (pending.monitor.physicalIndex == task.monitor.physicalIndex &&
-              _wcsicmp(pending.monitor.device, task.monitor.device) == 0));
-    };
-    const auto found = std::find_if(g_wheelWritePending.begin(),
-                                   g_wheelWritePending.end(), sameTarget);
-    if (found != g_wheelWritePending.end()) {
-        *found = task; // Coalesce only within the same physical target.
-    } else if (g_wheelWritePending.size() < kMaxDdcTargets + 1) {
-        g_wheelWritePending.push_back(task);
-    } else {
-        // Hard bound against malformed/rapid producer floods.
-        g_wheelWritePending.erase(g_wheelWritePending.begin());
-        g_wheelWritePending.push_back(task);
-    }
-    ReleaseSRWLockExclusive(&g_wheelWriteLock);
-    SetEvent(g_wheelWriteWake);
+    g_writer.EnqueueAndSignal(task);
 }
 
 void Publish(HANDLE handle, DWORD value) {
     if (!DdcAllowed()) return;
-    PhysicalInfo info = GetPhysicalInfo(handle);
+    PhysicalInfo info = g_ddc.LookupHandle(handle);
     if (!info.device[0]) {
-        if (!g_loggedUnmapped.exchange(true))
+        if (!g_module.loggedUnmapped.exchange(true))
             Wh_Log(L"DDC target monitor unknown: handle was not observed in "
                    L"GetPhysicalMonitorsFromHMONITOR. Fully quit/restart "
                    L"Twinkle Tray to rebuild its physical-monitor handle map.");
         // The Event target monitor mode must not silently move an unknown
         // target to DISPLAY1. Other output modes are location-independent.
-        if (g_displayOutputMode.load(std::memory_order_relaxed) == 0)
+        if (g_config.displayOutputMode.load(std::memory_order_relaxed) == 0)
             return;
     }
     BrightnessEvent ev{};
@@ -6884,16 +7292,16 @@ BOOL WINAPI SetVcpHook(HANDLE handle, BYTE code, DWORD value) {
     BOOL ok = SetVcpOriginal(handle, code, value);
     DWORD lastError = GetLastError();
     if (ok && !g_insideHighLevelSet &&
-        code == static_cast<BYTE>(g_vcpCode.load()))
+        code == static_cast<BYTE>(g_config.vcpCode.load()))
         Publish(handle, value);
     SetLastError(lastError);
     return ok;
 }
 
 void HookDdc() {
-    g_ddcDll = LoadLibraryExW(L"dxva2.dll", nullptr,
+    g_module.ddcDll = LoadLibraryExW(L"dxva2.dll", nullptr,
                               LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!g_ddcDll) {
+    if (!g_module.ddcDll) {
         Wh_Log(L"Cannot load dxva2.dll");
         return;
     }
@@ -6908,7 +7316,7 @@ void HookDdc() {
         {"SetVCPFeature", reinterpret_cast<void*>(SetVcpHook), reinterpret_cast<void**>(&SetVcpOriginal)},
     };
     for (auto& e : entries) {
-        void* address = reinterpret_cast<void*>(GetProcAddress(g_ddcDll, e.name));
+        void* address = reinterpret_cast<void*>(GetProcAddress(g_module.ddcDll, e.name));
         if (!address || !Wh_SetFunctionHook(address, e.detour, e.original))
             Wh_Log(L"DDC Hook failed: %hs", e.name);
     }
@@ -6918,26 +7326,26 @@ void HookDdc() {
 // Windows accent/theme helpers
 // ============================================================
 void InitWindowsAccentProvider() {
-    g_combase = LoadLibraryExW(L"combase.dll", nullptr,
+    g_presentation.combase = LoadLibraryExW(L"combase.dll", nullptr,
                                LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!g_combase) return;
+    if (!g_presentation.combase) return;
     auto roInit = reinterpret_cast<RoInitialize_t>(
-        GetProcAddress(g_combase, "RoInitialize"));
+        GetProcAddress(g_presentation.combase, "RoInitialize"));
     auto activate = reinterpret_cast<RoActivateInstance_t>(
-        GetProcAddress(g_combase, "RoActivateInstance"));
+        GetProcAddress(g_presentation.combase, "RoActivateInstance"));
     auto createString = reinterpret_cast<WindowsCreateString_t>(
-        GetProcAddress(g_combase, "WindowsCreateString"));
+        GetProcAddress(g_presentation.combase, "WindowsCreateString"));
     auto deleteString = reinterpret_cast<WindowsDeleteString_t>(
-        GetProcAddress(g_combase, "WindowsDeleteString"));
-    g_roUninitialize = reinterpret_cast<RoUninitialize_t>(
-        GetProcAddress(g_combase, "RoUninitialize"));
+        GetProcAddress(g_presentation.combase, "WindowsDeleteString"));
+    g_presentation.roUninitialize = reinterpret_cast<RoUninitialize_t>(
+        GetProcAddress(g_presentation.combase, "RoUninitialize"));
     if (!roInit || !activate || !createString || !deleteString ||
-        !g_roUninitialize) return;
+        !g_presentation.roUninitialize) return;
 
     // Dedicated UI thread: initialize WinRT on this same thread.
     HRESULT hr = roInit(1); // RO_INIT_MULTITHREADED
     if (FAILED(hr)) return;
-    g_roInitialized = true;
+    g_presentation.roInitialized = true;
     void* classId = nullptr;
     if (FAILED(createString(kUiSettingsRuntimeClass, ARRAYSIZE(kUiSettingsRuntimeClass) - 1, &classId)))
         return;
@@ -6946,7 +7354,7 @@ void InitWindowsAccentProvider() {
     deleteString(classId);
     if (SUCCEEDED(hr) && object) {
         hr = object->QueryInterface(kIUiSettings3,
-                                    reinterpret_cast<void**>(&g_uiSettings));
+                                    reinterpret_cast<void**>(&g_presentation.uiSettings));
         object->Release();
     }
     if (FAILED(hr))
@@ -6955,24 +7363,24 @@ void InitWindowsAccentProvider() {
 }
 
 void ReleaseWindowsAccentProvider() {
-    if (g_uiSettings) {
-        g_uiSettings->Release();
-        g_uiSettings = nullptr;
+    if (g_presentation.uiSettings) {
+        g_presentation.uiSettings->Release();
+        g_presentation.uiSettings = nullptr;
     }
-    if (g_roInitialized && g_roUninitialize)
-        g_roUninitialize();
-    g_roInitialized = false;
-    g_roUninitialize = nullptr;
-    if (g_combase) FreeLibrary(g_combase);
-    g_combase = nullptr;
+    if (g_presentation.roInitialized && g_presentation.roUninitialize)
+        g_presentation.roUninitialize();
+    g_presentation.roInitialized = false;
+    g_presentation.roUninitialize = nullptr;
+    if (g_presentation.combase) FreeLibrary(g_presentation.combase);
+    g_presentation.combase = nullptr;
 }
 
 DWORD SystemAccentRgb() {
     // Reading UISettings for each actual render supports changes to the
     // Windows accent without a timer, additional thread, or injected hook.
-    if (g_uiSettings) {
+    if (g_presentation.uiSettings) {
         UiColor c{};
-        if (SUCCEEDED(g_uiSettings->GetColorValue(5, &c))) // UIColorType.Accent
+        if (SUCCEEDED(g_presentation.uiSettings->GetColorValue(5, &c))) // UIColorType.Accent
             return (DWORD(c.r) << 16) | (DWORD(c.g) << 8) | DWORD(c.b);
     }
     DWORD value = 0, bytes = sizeof(value);
@@ -7003,7 +7411,7 @@ DWORD SystemAccentRgb() {
 }
 
 bool IsLightTheme() {
-    const int setting = g_ddcTheme.load(std::memory_order_relaxed);
+    const int setting = g_config.ddcTheme.load(std::memory_order_relaxed);
     if (setting == 1) return true;
     if (setting == 2) return false;
     DWORD light = 0;
@@ -7023,22 +7431,22 @@ DWORD ConfiguredOsdRgb(const std::atomic<int>& mode,
     return mode.load() && valid.load() ? rgb.load() : fallback;
 }
 DWORD OsdBackgroundRgb(bool light) {
-    return ConfiguredOsdRgb(g_backgroundMode, g_validCustomBackground,
-                            g_customBackground, light ? 0xFAFAFC : 0x26262A);
+    return ConfiguredOsdRgb(g_config.backgroundMode, g_config.validCustomBackground,
+                            g_config.customBackground, light ? 0xFAFAFC : 0x26262A);
 }
 DWORD OsdTextRgb(bool light) {
-    return ConfiguredOsdRgb(g_textMode, g_validCustomText,
-                            g_customText, light ? 0x1C1C20 : 0xFAFAFB);
+    return ConfiguredOsdRgb(g_config.textMode, g_config.validCustomText,
+                            g_config.customText, light ? 0x1C1C20 : 0xFAFAFB);
 }
 DWORD OsdTrackRgb(bool light, bool mixer = false) {
-    return ConfiguredOsdRgb(g_trackMode, g_validCustomTrack,
-                            g_customTrack, mixer
+    return ConfiguredOsdRgb(g_config.trackMode, g_config.validCustomTrack,
+                            g_config.customTrack, mixer
                                 ? (light ? 0xE0E1E7 : 0x5E5E65)
                                 : (light ? 0xDEDFE3 : 0x595A60));
 }
 DWORD OsdAccentRgb() {
-    return g_accentMode.load() && g_validCustomAccent.load()
-        ? g_customAccent.load() : SystemAccentRgb();
+    return g_config.accentMode.load() && g_config.validCustomAccent.load()
+        ? g_config.customAccent.load() : SystemAccentRgb();
 }
 
 int BrightnessPercent(const BrightnessEvent& brightness, bool* known) {
@@ -7095,7 +7503,7 @@ bool ReadDefaultAudioVolume(int& percent, bool& muted) {
 
 // Core Audio operation: the XAML controller owns rendering and timeouts.
 bool AdjustDefaultAudioWheel(int steps) {
-    if (!steps || g_popupKind != PopupKind::NativeVolume) return false;
+    if (!steps || g_presentation.popupKind != PopupKind::NativeVolume) return false;
     Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
     if (!OpenDefaultAudioEndpointVolume(volume)) return false;
     float scalar = 0.0f;
@@ -7108,10 +7516,10 @@ bool AdjustDefaultAudioWheel(int steps) {
         scalar = requested;
     BOOL muted = FALSE;
     (void)volume->GetMute(&muted);
-    g_nativePercent = static_cast<int>(std::lround(
+    g_presentation.nativePercent = static_cast<int>(std::lround(
         std::clamp(scalar, 0.0f, 1.0f) * 100.0f));
-    g_nativePercentKnown = true;
-    g_nativeMuted = muted != FALSE;
+    g_presentation.nativePercentKnown = true;
+    g_presentation.nativeMuted = muted != FALSE;
     return true;
 }
 
@@ -7119,9 +7527,9 @@ bool AdjustDefaultAudioWheel(int steps) {
 // is a separate user state, and moving the track should not silently clear it.
 bool SetDefaultAudioBarPercent(int percent) {
     percent = std::clamp(percent, 0, 100);
-    if (g_popupKind != PopupKind::NativeVolume || !g_nativePercentKnown)
+    if (g_presentation.popupKind != PopupKind::NativeVolume || !g_presentation.nativePercentKnown)
         return false;
-    if (percent == g_nativePercent) return true;
+    if (percent == g_presentation.nativePercent) return true;
     Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
     if (!OpenDefaultAudioEndpointVolume(volume)) return false;
     HRESULT hr = volume->SetMasterVolumeLevelScalar(percent / 100.0f, nullptr);
@@ -7132,15 +7540,15 @@ bool SetDefaultAudioBarPercent(int percent) {
         volume->GetMute(&muted);
     }
     if (FAILED(hr)) return false;
-    g_nativePercent = static_cast<int>(std::lround(
+    g_presentation.nativePercent = static_cast<int>(std::lround(
         std::clamp(actual, 0.0f, 1.0f) * 100.0f));
-    g_nativeMuted = muted != FALSE;
+    g_presentation.nativeMuted = muted != FALSE;
     return true;
 }
 
 // Toggle the default endpoint's mute without changing its stored volume.
 bool ToggleDefaultAudioMute() {
-    if (g_popupKind != PopupKind::NativeVolume || g_closing.load())
+    if (g_presentation.popupKind != PopupKind::NativeVolume || g_module.closing.load())
         return false;
     Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
     if (!OpenDefaultAudioEndpointVolume(volume)) return false;
@@ -7152,21 +7560,21 @@ bool ToggleDefaultAudioMute() {
     (void)volume->GetMute(&actual);
     float scalar = 0.0f;
     if (SUCCEEDED(volume->GetMasterVolumeLevelScalar(&scalar))) {
-        g_nativePercent = static_cast<int>(std::lround(
+        g_presentation.nativePercent = static_cast<int>(std::lround(
             std::clamp(scalar, 0.0f, 1.0f) * 100.0f));
-        g_nativePercentKnown = true;
+        g_presentation.nativePercentKnown = true;
     }
-    g_nativeMuted = actual != FALSE;
-    if (g_xamlMixerOpen) g_mixerMasterMuted = g_nativeMuted;
+    g_presentation.nativeMuted = actual != FALSE;
+    if (g_panel.mixerOpen) g_mixer.masterMuted = g_presentation.nativeMuted;
     return true;
 }
 
 // Clipboard image acquisition uses an ephemeral Win32 HBITMAP. Only
 // bounded pixel bytes cross to the XAML STA renderer.
 void ClearClipboardThumbnail() {
-    if (g_clipboardThumbnail) {
-        DeleteObject(g_clipboardThumbnail);
-        g_clipboardThumbnail = nullptr;
+    if (g_notice.clipboardThumbnail) {
+        DeleteObject(g_notice.clipboardThumbnail);
+        g_notice.clipboardThumbnail = nullptr;
     }
 }
 
@@ -7176,45 +7584,45 @@ void ClearClipboardThumbnail() {
 void AddNoticeEvent(NoticeCategory category, NoticeAction action,
                     std::wstring identity, std::wstring label,
                     NoticeIcon deviceIcon = NoticeIcon::Bluetooth) {
-    if (!g_receiveWnd || g_closing.load()) return;
+    if (!g_module.receiveWnd || g_module.closing.load()) return;
     if (identity.empty()) identity = label;
     if (label.empty()) label = std::wstring(NoticeCategoryLabel(category)) +
         L" " + Tr(OsdText::Device);
-    if (g_noticeBatch.pending &&
-        (g_noticeBatch.category != category || g_noticeBatch.action != action))
+    if (g_notice.batch.pending &&
+        (g_notice.batch.category != category || g_notice.batch.action != action))
         FlushNoticeBatch();
-    if (!g_noticeBatch.pending) {
-        g_noticeBatch = NoticeBatch{};
-        g_noticeBatch.pending = true;
-        g_noticeBatch.category = std::move(category);
-        g_noticeBatch.action = std::move(action);
+    if (!g_notice.batch.pending) {
+        g_notice.ResetBatch();
+        g_notice.batch.pending = true;
+        g_notice.batch.category = std::move(category);
+        g_notice.batch.action = std::move(action);
     }
     if (label.size() > 120) label.resize(120);
     if (identity.size() > 2048) identity.resize(2048);
-    if (g_noticeBatch.identities.insert(identity).second &&
-        g_noticeBatch.names.size() < 64) {
+    if (g_notice.batch.identities.insert(identity).second &&
+        g_notice.batch.names.size() < 64) {
         if (category == NoticeCategory::Bluetooth ||
             category == NoticeCategory::Network) {
-            if (!g_noticeBatch.iconKnown) {
-                g_noticeBatch.icon = deviceIcon;
-                g_noticeBatch.iconKnown = true;
-            } else if (g_noticeBatch.icon != deviceIcon) {
-                g_noticeBatch.mixedIcons = true;
+            if (!g_notice.batch.iconKnown) {
+                g_notice.batch.icon = deviceIcon;
+                g_notice.batch.iconKnown = true;
+            } else if (g_notice.batch.icon != deviceIcon) {
+                g_notice.batch.mixedIcons = true;
             }
         }
-        g_noticeBatch.names.push_back(std::move(label));
+        g_notice.batch.names.push_back(std::move(label));
     }
     // 320 ms debounce; repeated device-interface announcements coalesce.
-    SetTimer(g_receiveWnd, kEventBatchTimer, 320, nullptr);
+    SetTimer(g_module.receiveWnd, kEventBatchTimer, 320, nullptr);
 }
 
 void FlushNoticeBatch() {
-    if (g_receiveWnd) KillTimer(g_receiveWnd, kEventBatchTimer);
-    if (!g_noticeBatch.pending) return;
-    NoticeBatch batch = std::move(g_noticeBatch);
-    g_noticeBatch = NoticeBatch{};
+    if (g_module.receiveWnd) KillTimer(g_module.receiveWnd, kEventBatchTimer);
+    if (!g_notice.batch.pending) return;
+    NoticeBatch batch = std::move(g_notice.batch);
+    g_notice.ResetBatch();
     if (batch.names.empty()) return;
-    g_noticeDetails = batch.names;
+    g_notice.details = batch.names;
     std::wstring title;
     std::wstring body;
     if (batch.names.size() == 1) {
@@ -7242,15 +7650,15 @@ void FlushNoticeBatch() {
 
 void ShowNotice(std::wstring title, std::wstring body, DurationKind kind,
                 NoticeIcon icon) {
-    if (g_closing.load() || !g_receiveWnd) return;
+    if (g_module.closing.load() || !g_module.receiveWnd) return;
     if (kind != DurationKind::Clipboard) ClearClipboardThumbnail();
-    g_popupKind = PopupKind::Notification;
-    g_noticePanelOpen = false;
-    ++g_noticeGeneration;
-    g_noticeDuration = kind;
-    g_noticeTitle = std::move(title);
-    g_noticeBody = std::move(body);
-    g_noticeIcon = icon;
+    g_presentation.popupKind = PopupKind::Notification;
+    g_notice.panelOpen = false;
+    ++g_notice.generation;
+    g_notice.duration = kind;
+    g_notice.title = std::move(title);
+    g_notice.body = std::move(body);
+    g_notice.icon = icon;
     BrightnessEvent event{};
     MovePopupToDisplay(event);
     if (kind == DurationKind::Clipboard)
@@ -7264,8 +7672,8 @@ void ShowNotice(std::wstring title, std::wstring body, DurationKind kind,
 // Clipboard event processing
 // ============================================================
 void ProcessClipboard() {
-    if (!g_showClipboardOsd.load()) return;
-    if (!OpenClipboard(g_receiveWnd)) return;
+    if (!g_config.showClipboardOsd.load()) return;
+    if (!OpenClipboard(g_module.receiveWnd)) return;
     std::wstring title = Tr(OsdText::Clipboard), body = Tr(OsdText::ContentCopied);
     HBITMAP newThumbnail = nullptr;
     NoticeIcon icon = NoticeIcon::Clipboard;
@@ -7280,7 +7688,7 @@ void ProcessClipboard() {
                IsClipboardFormatAvailable(CF_DIBV5)) {
         title = Tr(OsdText::ImageCopied);
         body = Tr(OsdText::ClipboardImage);
-        if (g_clipboardImagePreview.load()) {
+        if (g_config.clipboardImagePreview.load()) {
             HBITMAP source = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
             BITMAP bm{};
             if (source && GetObjectW(source, sizeof(bm), &bm) == sizeof(bm) &&
@@ -7305,21 +7713,21 @@ void ProcessClipboard() {
         title = Tr(OsdText::TextCopied);
         body = Tr(OsdText::ClipboardText);
         icon = NoticeIcon::ClipboardText;
-        if (g_clipboardTextPreview.load()) {
+        if (g_config.clipboardTextPreview.load()) {
             HANDLE handle = GetClipboardData(CF_UNICODETEXT);
             SIZE_T cb = handle ? GlobalSize(handle) : 0;
             if (handle && cb >= sizeof(wchar_t)) {
                 const wchar_t* text = static_cast<const wchar_t*>(GlobalLock(handle));
                 if (text) {
                     const size_t bound = std::min<size_t>(cb / sizeof(wchar_t),
-                            static_cast<size_t>(g_clipboardChars.load()) + 1);
+                            static_cast<size_t>(g_config.clipboardChars.load()) + 1);
                     body.clear();
                     for (size_t i = 0; i < bound && text[i]; ++i) {
                         const wchar_t ch = text[i];
                         body.push_back(ch < 0x20 || ch == 0x7f ? L' ' : ch);
                     }
                     if (cb / sizeof(wchar_t) > body.size() &&
-                        body.size() >= static_cast<size_t>(g_clipboardChars.load()))
+                        body.size() >= static_cast<size_t>(g_config.clipboardChars.load()))
                         body += L"…";
                     GlobalUnlock(handle);
                 }
@@ -7329,8 +7737,8 @@ void ProcessClipboard() {
     }
     CloseClipboard();
     ClearClipboardThumbnail();
-    g_noticeDetails.clear();
-    g_clipboardThumbnail = newThumbnail;
+    g_notice.details.clear();
+    g_notice.clipboardThumbnail = newThumbnail;
     ShowNotice(std::move(title), std::move(body), DurationKind::Clipboard,
                icon);
 }
@@ -7357,6 +7765,24 @@ using RegisterNetworkHint = DWORD (WINAPI*)(NetworkCallback, void*, BOOLEAN, HAN
 using GetNetworkHint = DWORD (WINAPI*)(NetworkHintAbi*);
 using CancelNetworkHint = DWORD (WINAPI*)(HANDLE);
 
+void NetworkRuntimeState::CancelCallbacksOnControllerThread() {
+    if (dll) {
+        const auto cancel = reinterpret_cast<CancelNetworkHint>(
+            GetProcAddress(dll, "CancelMibChangeNotify2"));
+        if (cancel) {
+            if (addressNotification)
+                (void)cancel(addressNotification);
+            if (ipNotification)
+                (void)cancel(ipNotification);
+            if (notification)
+                (void)cancel(notification);
+        }
+    }
+    notification = nullptr;
+    ipNotification = nullptr;
+    addressNotification = nullptr;
+}
+
 // Native Wi-Fi callbacks expose association changes even when the physical
 // adapter stays enabled and GetAdaptersAddresses reports the same OperStatus.
 // The old Windhawk MinGW SDK lacks newer WLAN declarations, so use a strict,
@@ -7371,9 +7797,6 @@ using WlanNotificationCallback = void (WINAPI*)(WlanNotificationCompat*, void*);
 using WlanRegisterNotify = DWORD (WINAPI*)(
     HANDLE, DWORD, BOOL, WlanNotificationCallback, void*, void*, DWORD*);
 using WlanClose = DWORD (WINAPI*)(HANDLE, void*);
-HMODULE g_wlanDll = nullptr;
-HANDLE g_wlanClient = nullptr;
-bool g_wlanNotifyRegistered = false; // UI thread only.
 constexpr DWORD kWlanAcmSource = 0x00000008;
 constexpr DWORD kWlanMsmSource = 0x00000010;
 constexpr DWORD kWlanRadioStateChanged = 7; // wlan_notification_msm_radio_state_change
@@ -7384,8 +7807,46 @@ struct WlanLiveState {
     bool radioKnown = false;
     bool radioOn = false;
 };
-std::unordered_map<ULONGLONG, WlanLiveState> g_liveWlan; // UI thread only.
-bool g_wlanInventoryValid = false; // Only true after a successful enumeration.
+// WLAN subscriptions are separate from aggregate/IP-interface notifications.
+struct WlanRuntimeState {
+    HMODULE dll = nullptr;
+    HANDLE client = nullptr;
+    bool notifyRegistered = false; // OSD receiver thread only.
+    std::unordered_map<ULONGLONG, WlanLiveState> live;
+    std::unordered_set<ULONGLONG> physicalLuids;
+    bool inventoryValid = false;
+
+    // A disabled WLAN may disappear from enumeration. Keep known physical
+    // LUIDs across refreshes so virtual SoftAP children remain suppressed.
+    void RememberPhysicalLuid(ULONGLONG luid) {
+        if (physicalLuids.size() < 64) physicalLuids.insert(luid);
+    }
+    bool HasPhysicalLuids() const { return !physicalLuids.empty(); }
+    bool IsPhysicalLuid(ULONGLONG luid) const {
+        return physicalLuids.count(luid) != 0;
+    }
+    void StopClientOnControllerThread() {
+        if (client && dll) {
+            const auto registerNotify = reinterpret_cast<WlanRegisterNotify>(
+                GetProcAddress(dll, "WlanRegisterNotification"));
+            // Revoke callbacks synchronously before closing the WLAN handle.
+            if (notifyRegistered && registerNotify)
+                (void)registerNotify(client, 0, FALSE, nullptr,
+                                     nullptr, nullptr, nullptr);
+            const auto closeWlan = reinterpret_cast<WlanClose>(
+                GetProcAddress(dll, "WlanCloseHandle"));
+            if (closeWlan) (void)closeWlan(client, nullptr);
+        }
+        client = nullptr;
+        notifyRegistered = false;
+        if (dll) FreeLibrary(dll);
+        dll = nullptr;
+        live.clear();
+        physicalLuids.clear();
+        inventoryValid = false;
+    }
+};
+WlanRuntimeState g_wlan;
 
 void QueueNetworkRefreshEvent(WPARAM source, LPARAM hintLevel);
 void WINAPI WlanChanged(WlanNotificationCompat* notice, void*) {
@@ -7409,14 +7870,14 @@ using RegisterNetworkMib = DWORD (WINAPI*)(
     ADDRESS_FAMILY, NetworkMibCallback, void*, BOOLEAN, HANDLE*);
 
 void QueueNetworkRefreshEvent(WPARAM source, LPARAM hintLevel) {
-    if (!g_showNetworkEvents.load() || g_closing.load()) return;
-    const HWND receiver = g_networkReceiver.load(std::memory_order_acquire);
+    if (!g_config.showNetworkEvents.load()) return;
+    const HWND receiver = g_module.ReceiverForCallbacks();
     if (receiver) (void)PostMessageW(
         receiver, kNetworkNoticeMessage, source, hintLevel);
 }
 
 void WINAPI NetworkChanged(void*, NetworkHintAbi hint) {
-    const int prior = g_networkPreviousLevel.exchange(hint.connectivityLevel);
+    const int prior = g_network.previousLevel.exchange(hint.connectivityLevel);
     if (prior < 0 || prior == hint.connectivityLevel) return;
     QueueNetworkRefreshEvent(1, static_cast<LPARAM>(hint.connectivityLevel));
 }
@@ -7433,27 +7894,27 @@ void CaptureNetworkBaseline() {
         Wh_Log(L"Fluent OSD/network: adapter baseline unavailable");
         return;
     }
-    g_networkInterfaces.clear();
+    g_network.interfaces.clear();
     for (auto& item : current)
-        g_networkInterfaces.emplace(std::move(item.first),
+        g_network.interfaces.emplace(std::move(item.first),
                                     std::move(item.second));
 }
 
 void RefreshNetworkHintBaseline() {
-    if (!g_networkDll) return;
+    if (!g_network.dll) return;
     const auto hint = reinterpret_cast<GetNetworkHint>(
-        GetProcAddress(g_networkDll, "GetNetworkConnectivityHint"));
+        GetProcAddress(g_network.dll, "GetNetworkConnectivityHint"));
     NetworkHintAbi state{};
     if (hint && hint(&state) == NO_ERROR)
-        g_networkPreviousLevel.store(state.connectivityLevel);
+        g_network.previousLevel.store(state.connectivityLevel);
 }
 
 void InitNetworkEvents() {
-    g_networkDll = LoadLibraryExW(
+    g_network.dll = LoadLibraryExW(
         L"iphlpapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     CaptureNetworkBaseline();
-    g_networkUiSettingEnabled = g_showNetworkEvents.load();
-    if (!g_networkDll) {
+    g_network.uiSettingEnabled = g_config.showNetworkEvents.load();
+    if (!g_network.dll) {
         Wh_Log(L"Fluent OSD/network: iphlpapi unavailable (%lu)",
                GetLastError());
         return;
@@ -7461,12 +7922,12 @@ void InitNetworkEvents() {
 
     RefreshNetworkHintBaseline();
     const auto subscribeHint = reinterpret_cast<RegisterNetworkHint>(
-        GetProcAddress(g_networkDll, "NotifyNetworkConnectivityHintChange"));
+        GetProcAddress(g_network.dll, "NotifyNetworkConnectivityHintChange"));
     if (subscribeHint) {
         const DWORD err = subscribeHint(NetworkChanged, nullptr, FALSE,
-                                       &g_networkNotification);
+                                       &g_network.notification);
         if (err != NO_ERROR) {
-            g_networkNotification = nullptr;
+            g_network.notification = nullptr;
             Wh_Log(L"Fluent OSD/network: hint registration failed (%lu)", err);
         }
     }
@@ -7475,12 +7936,12 @@ void InitNetworkEvents() {
     // still provides Internet access. Both are needed for interface and IP
     // transitions on Wi-Fi, Ethernet, and virtual adapters.
     const auto subscribeInterface = reinterpret_cast<RegisterNetworkMib>(
-        GetProcAddress(g_networkDll, "NotifyIpInterfaceChange"));
+        GetProcAddress(g_network.dll, "NotifyIpInterfaceChange"));
     if (subscribeInterface) {
         const DWORD err = subscribeInterface(AF_UNSPEC, NetworkMibChanged,
-            nullptr, FALSE, &g_networkIpNotification);
+            nullptr, FALSE, &g_network.ipNotification);
         if (err != NO_ERROR) {
-            g_networkIpNotification = nullptr;
+            g_network.ipNotification = nullptr;
             Wh_Log(L"Fluent OSD/network: interface registration failed (%lu)", err);
         }
     } else {
@@ -7488,21 +7949,21 @@ void InitNetworkEvents() {
     }
 
     const auto subscribeAddress = reinterpret_cast<RegisterNetworkMib>(
-        GetProcAddress(g_networkDll, "NotifyUnicastIpAddressChange"));
+        GetProcAddress(g_network.dll, "NotifyUnicastIpAddressChange"));
     if (subscribeAddress) {
         const DWORD err = subscribeAddress(AF_UNSPEC, NetworkMibChanged,
-            nullptr, FALSE, &g_networkAddressNotification);
+            nullptr, FALSE, &g_network.addressNotification);
         if (err != NO_ERROR) {
-            g_networkAddressNotification = nullptr;
+            g_network.addressNotification = nullptr;
             Wh_Log(L"Fluent OSD/network: address registration failed (%lu)", err);
         }
     } else {
         Wh_Log(L"Fluent OSD/network: address notification API unavailable");
     }
     Wh_Log(L"Fluent OSD/network: subscriptions hint=%d interface=%d address=%d",
-           g_networkNotification != nullptr,
-           g_networkIpNotification != nullptr,
-           g_networkAddressNotification != nullptr);
+           g_network.notification != nullptr,
+           g_network.ipNotification != nullptr,
+           g_network.addressNotification != nullptr);
 }
 
 void InitDeviceEvents() {
@@ -7510,51 +7971,19 @@ void InitDeviceEvents() {
     usb.dbcc_size = sizeof(usb);
     usb.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
     usb.dbcc_classguid = kUsbDeviceInterface;
-    g_usbNotification = RegisterDeviceNotificationW(
-        g_receiveWnd, &usb, DEVICE_NOTIFY_WINDOW_HANDLE);
+    g_module.usbNotification = RegisterDeviceNotificationW(
+        g_module.receiveWnd, &usb, DEVICE_NOTIFY_WINDOW_HANDLE);
     bt_monitor::Start(); // No-op unless opt-in is enabled.
 }
 
 void StopDeviceEvents() {
     // Revoke WinRT callbacks before destroying the UI receiver or COM MTA.
     bt_monitor::Stop();
-    if (g_usbNotification) UnregisterDeviceNotification(g_usbNotification);
-    g_usbNotification = nullptr;
-    if (g_networkDll) {
-        const auto cancel = reinterpret_cast<CancelNetworkHint>(
-            GetProcAddress(g_networkDll, "CancelMibChangeNotify2"));
-        if (cancel) {
-            if (g_networkAddressNotification)
-                (void)cancel(g_networkAddressNotification);
-            if (g_networkIpNotification)
-                (void)cancel(g_networkIpNotification);
-            if (g_networkNotification)
-                (void)cancel(g_networkNotification);
-        }
-    }
-    g_networkNotification = nullptr;
-    g_networkIpNotification = nullptr;
-    g_networkAddressNotification = nullptr;
-    if (g_wlanClient && g_wlanDll) {
-        const auto registerNotify = reinterpret_cast<WlanRegisterNotify>(
-            GetProcAddress(g_wlanDll, "WlanRegisterNotification"));
-        // Unregister synchronously before releasing client/module. Windows
-        // waits for any in-flight notification callback to finish.
-        if (g_wlanNotifyRegistered && registerNotify)
-            (void)registerNotify(g_wlanClient, 0, FALSE, nullptr,
-                                 nullptr, nullptr, nullptr);
-        const auto closeWlan = reinterpret_cast<WlanClose>(
-            GetProcAddress(g_wlanDll, "WlanCloseHandle"));
-        if (closeWlan) (void)closeWlan(g_wlanClient, nullptr);
-    }
-    g_wlanClient = nullptr;
-    g_wlanNotifyRegistered = false;
-    if (g_wlanDll) FreeLibrary(g_wlanDll);
-    g_wlanDll = nullptr;
-    g_liveWlan.clear();
-    g_wlanInventoryValid = false;
-    if (g_networkDll) FreeLibrary(g_networkDll);
-    g_networkDll = nullptr;
+    if (g_module.usbNotification) UnregisterDeviceNotification(g_module.usbNotification);
+    g_module.usbNotification = nullptr;
+    g_network.CancelCallbacksOnControllerThread();
+    g_wlan.StopClientOnControllerThread();
+    g_network.ReleaseLibraryOnControllerThread();
 }
 
 // This may fail for removed devices; the arrival-side path cache is
@@ -7599,8 +8028,6 @@ struct WlanInterfaceListCompat {
 };
 static_assert(sizeof(WlanInterfaceInfoCompat) == 532);
 static_assert(offsetof(WlanInterfaceListCompat, interfaces) == 8);
-std::unordered_set<ULONGLONG> g_physicalWlanLuids; // Receiver thread only.
-
 // Only the beginning of WLAN_CONNECTION_ATTRIBUTES is needed to read the
 // current connection's exact configured profile name. It is not an SSID guess.
 struct WlanConnectionPrefix {
@@ -7626,34 +8053,34 @@ static_assert(sizeof(WlanPhyRadioCompat) == 12);
 static_assert(offsetof(WlanRadioCompat, phys) == sizeof(DWORD));
 
 bool EnsureWlanClient() {
-    if (!g_wlanDll) {
-        g_wlanDll = LoadLibraryExW(
+    if (!g_wlan.dll) {
+        g_wlan.dll = LoadLibraryExW(
             L"wlanapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!g_wlanDll) return false;
+        if (!g_wlan.dll) return false;
     }
-    if (!g_wlanClient) {
+    if (!g_wlan.client) {
         using Open = DWORD (WINAPI*)(DWORD, PVOID, PDWORD, PHANDLE);
         const auto open = reinterpret_cast<Open>(
-            GetProcAddress(g_wlanDll, "WlanOpenHandle"));
+            GetProcAddress(g_wlan.dll, "WlanOpenHandle"));
         DWORD negotiated = 0;
-        if (!open || open(2, nullptr, &negotiated, &g_wlanClient) !=
-                ERROR_SUCCESS || !g_wlanClient)
+        if (!open || open(2, nullptr, &negotiated, &g_wlan.client) !=
+                ERROR_SUCCESS || !g_wlan.client)
             return false; // WLAN AutoConfig unavailable; retry next refresh.
     }
-    if (!g_wlanNotifyRegistered) {
+    if (!g_wlan.notifyRegistered) {
         const auto subscribe = reinterpret_cast<WlanRegisterNotify>(
-            GetProcAddress(g_wlanDll, "WlanRegisterNotification"));
-        if (subscribe && subscribe(g_wlanClient,
+            GetProcAddress(g_wlan.dll, "WlanRegisterNotification"));
+        if (subscribe && subscribe(g_wlan.client,
                 kWlanAcmSource | kWlanMsmSource, FALSE,
                 WlanChanged, nullptr, nullptr, nullptr) == ERROR_SUCCESS)
-            g_wlanNotifyRegistered = true;
+            g_wlan.notifyRegistered = true;
     }
     return true;
 }
 
 void RefreshPhysicalWlanLuids() {
-    g_wlanInventoryValid = false;
-    if (!g_networkDll || !EnsureWlanClient()) return;
+    g_wlan.inventoryValid = false;
+    if (!g_network.dll || !EnsureWlanClient()) return;
     using Enumerate = DWORD (WINAPI*)(
         HANDLE, PVOID, WlanInterfaceListCompat**);
     using Query = DWORD (WINAPI*)(
@@ -7661,28 +8088,27 @@ void RefreshPhysicalWlanLuids() {
     using Free = void (WINAPI*)(void*);
     using GuidToLuid = DWORD (WINAPI*)(const GUID*, void*);
     const auto convert = reinterpret_cast<GuidToLuid>(
-        GetProcAddress(g_networkDll, "ConvertInterfaceGuidToLuid"));
+        GetProcAddress(g_network.dll, "ConvertInterfaceGuidToLuid"));
     const auto enumerate = reinterpret_cast<Enumerate>(
-        GetProcAddress(g_wlanDll, "WlanEnumInterfaces"));
+        GetProcAddress(g_wlan.dll, "WlanEnumInterfaces"));
     const auto query = reinterpret_cast<Query>(
-        GetProcAddress(g_wlanDll, "WlanQueryInterface"));
+        GetProcAddress(g_wlan.dll, "WlanQueryInterface"));
     const auto freeMemory = reinterpret_cast<Free>(
-        GetProcAddress(g_wlanDll, "WlanFreeMemory"));
+        GetProcAddress(g_wlan.dll, "WlanFreeMemory"));
     if (!convert || !enumerate || !freeMemory) return;
     WlanInterfaceListCompat* list = nullptr;
-    if (enumerate(g_wlanClient, nullptr, &list) != ERROR_SUCCESS ||
+    if (enumerate(g_wlan.client, nullptr, &list) != ERROR_SUCCESS ||
         !list) {
         if (list) freeMemory(list);
         return;
     }
-    g_wlanInventoryValid = true;
+    g_wlan.inventoryValid = true;
     std::unordered_map<ULONGLONG, WlanLiveState> live;
     for (DWORD i = 0; i < std::min<DWORD>(list->count, 64); ++i) {
         ULONGLONG luid = 0;
         if (convert(&list->interfaces[i].guid, &luid) != NO_ERROR ||
             !luid) continue;
-        if (g_physicalWlanLuids.size() < 64)
-            g_physicalWlanLuids.insert(luid);
+        g_wlan.RememberPhysicalLuid(luid);
         WlanLiveState entry;
         // The Native Wi-Fi interface state reflects 802.11 association,
         // independently of NDIS OperStatus and IPv4/IPv6 addressing.
@@ -7691,7 +8117,7 @@ void RefreshPhysicalWlanLuids() {
             DWORD dataSize = 0, opcodeType = 0;
             void* data = nullptr;
             // wlan_intf_opcode_radio_state == 4; not a profile query.
-            if (query(g_wlanClient, &list->interfaces[i].guid, 4, nullptr,
+            if (query(g_wlan.client, &list->interfaces[i].guid, 4, nullptr,
                     &dataSize, &data, &opcodeType) == ERROR_SUCCESS &&
                 data && dataSize >= offsetof(WlanRadioCompat, phys)) {
                 const auto* radio = reinterpret_cast<const WlanRadioCompat*>(data);
@@ -7725,7 +8151,7 @@ void RefreshPhysicalWlanLuids() {
             DWORD dataSize = 0, opcodeType = 0;
             void* data = nullptr;
             // wlan_intf_opcode_current_connection == 7.
-            if (query(g_wlanClient, &list->interfaces[i].guid, 7, nullptr,
+            if (query(g_wlan.client, &list->interfaces[i].guid, 7, nullptr,
                     &dataSize, &data, &opcodeType) == ERROR_SUCCESS &&
                 data && dataSize >= sizeof(WlanConnectionPrefix)) {
                 const auto* info =
@@ -7743,7 +8169,7 @@ void RefreshPhysicalWlanLuids() {
         live.emplace(luid, std::move(entry));
     }
     freeMemory(list);
-    g_liveWlan = std::move(live);
+    g_wlan.live = std::move(live);
 }
 
 // Bluetooth PAN is an IP/Ethernet-like adapter (often IfType 6), not an
@@ -7858,11 +8284,11 @@ std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot(
         // interfaces; leave Ethernet, VPN and TUN adapters untouched.
         bool physicalWifi = false;
         if (adapter->IfType == IF_TYPE_IEEE80211 &&
-            !g_physicalWlanLuids.empty()) {
+            g_wlan.HasPhysicalLuids()) {
             ULONGLONG luid = 0;
             static_assert(sizeof(luid) == sizeof(adapter->Luid));
             memcpy(&luid, &adapter->Luid, sizeof(luid));
-            physicalWifi = g_physicalWlanLuids.count(luid) != 0;
+            physicalWifi = g_wlan.IsPhysicalLuid(luid);
             if (!physicalWifi) continue;
         }
         NetInterfaceState state;
@@ -7871,13 +8297,13 @@ std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot(
         if (physicalWifi) {
             ULONGLONG luid = 0;
             memcpy(&luid, &adapter->Luid, sizeof(luid));
-            const auto wlan = g_liveWlan.find(luid);
-            if (wlan != g_liveWlan.end()) {
+            const auto wlan = g_wlan.live.find(luid);
+            if (wlan != g_wlan.live.end()) {
                 state.connected = wlan->second.connected;
                 state.wlanProfile = wlan->second.profile;
                 state.wlanRadioKnown = wlan->second.radioKnown;
                 state.wlanRadioOn = wlan->second.radioOn;
-            } else if (g_wlanInventoryValid) {
+            } else if (g_wlan.inventoryValid) {
                 // The physical adapter remains in IP Helper's inventory but
                 // disappeared from a *successful* Native WLAN enumeration.
                 // That means its WLAN interface is disabled/unavailable,
@@ -7901,14 +8327,14 @@ bool CaptureNetworkEvents() {
     if (!succeeded) return false;
     bool changed = false;
     std::unordered_map<std::string, NetInterfaceState> next;
-    next.reserve(current.size() + g_networkInterfaces.size());
+    next.reserve(current.size() + g_network.interfaces.size());
 
     for (auto& item : current) {
         if (item.first.empty()) continue;
-        const auto previous = g_networkInterfaces.find(item.first);
+        const auto previous = g_network.interfaces.find(item.first);
         // A new active adapter is also a connection event. Initial adapters
         // were captured at registration and are not announced at startup.
-        const bool wasConnected = previous != g_networkInterfaces.end()
+        const bool wasConnected = previous != g_network.interfaces.end()
             && previous->second.connected;
         // On a WLAN disconnect, WlanQueryInterface no longer returns the
         // previous profile. Use our snapshot from when it was connected.
@@ -7917,11 +8343,11 @@ bool CaptureNetworkEvents() {
             !item.second.wlanProfile.empty()
             ? item.second.wlanProfile : item.second.name;
         const std::wstring previousLabel = wifi &&
-            previous != g_networkInterfaces.end() &&
+            previous != g_network.interfaces.end() &&
             !previous->second.wlanProfile.empty()
             ? previous->second.wlanProfile : item.second.name;
         const bool radioChanged = wifi &&
-            previous != g_networkInterfaces.end() &&
+            previous != g_network.interfaces.end() &&
             previous->second.wlanRadioKnown &&
             item.second.wlanRadioKnown &&
             previous->second.wlanRadioOn != item.second.wlanRadioOn;
@@ -7937,7 +8363,7 @@ bool CaptureNetworkEvents() {
         }
         const bool switchedProfile = wifi && wasConnected &&
             item.second.connected &&
-            previous != g_networkInterfaces.end() &&
+            previous != g_network.interfaces.end() &&
             !previous->second.wlanProfile.empty() &&
             !item.second.wlanProfile.empty() &&
             previous->second.wlanProfile != item.second.wlanProfile;
@@ -7964,12 +8390,12 @@ bool CaptureNetworkEvents() {
         // eventual adapter removal can still identify the old connection.
         if (wifi && !item.second.connected &&
             item.second.wlanProfile.empty() &&
-            previous != g_networkInterfaces.end())
+            previous != g_network.interfaces.end())
             item.second.wlanProfile = previous->second.wlanProfile;
         // A temporary radio-query failure is not evidence that the radio
         // changed state; preserve the last known radio state.
         if (wifi && !item.second.wlanRadioKnown &&
-            previous != g_networkInterfaces.end() &&
+            previous != g_network.interfaces.end() &&
             previous->second.wlanRadioKnown) {
             item.second.wlanRadioKnown = true;
             item.second.wlanRadioOn = previous->second.wlanRadioOn;
@@ -7979,7 +8405,7 @@ bool CaptureNetworkEvents() {
 
     // Disabled adapters can disappear from the returned list altogether.
     // Preserve their last identity as "down" so re-enabling is reported.
-    for (const auto& prior : g_networkInterfaces) {
+    for (const auto& prior : g_network.interfaces) {
         if (next.find(prior.first) != next.end()) continue;
         if (prior.second.icon == NoticeIcon::Wifi &&
             prior.second.wlanRadioKnown && prior.second.wlanRadioOn) {
@@ -8006,28 +8432,20 @@ bool CaptureNetworkEvents() {
             next.emplace(prior.first, std::move(down));
         }
     }
-    g_networkInterfaces = std::move(next);
+    g_network.interfaces = std::move(next);
     return changed;
 }
 
-void ResetNetworkRefreshState() {
-    g_networkRefreshPending = false;
-    g_networkRefreshSecondPass = false;
-    g_networkSawInterfaceTransition = false;
-    g_networkHintPending = false;
-    g_networkHintLevel = -1;
-}
-
 void FinishNetworkRefresh() {
-    if (g_networkHintPending && !g_networkSawInterfaceTransition) {
+    if (g_network.hintPending && !g_network.sawInterfaceTransition) {
         // A genuine aggregate change without any observed NIC transition.
         // A level hint is not proof that any specific interface changed.
-        AddNoticeEvent(NoticeCategory::Network, g_networkHintLevel == 1 ?
+        AddNoticeEvent(NoticeCategory::Network, g_network.hintLevel == 1 ?
             NoticeAction::Disconnected : NoticeAction::NetworkChanged,
             L"aggregate-connectivity", Tr(OsdText::WindowsNetwork),
             NoticeIcon::Network);
     }
-    ResetNetworkRefreshState();
+    g_network.ResetRefresh();
 }
 
 bool HandleDeviceChange(WPARAM type, LPARAM value) {
@@ -8040,7 +8458,7 @@ bool HandleDeviceChange(WPARAM type, LPARAM value) {
             return false;
         const auto* dev = reinterpret_cast<const DEV_BROADCAST_DEVICEINTERFACE_W*>(value);
         if (!IsEqualGUID(dev->dbcc_classguid, kUsbDeviceInterface)) return false;
-        if (!g_showUsbEvents.load()) return true;
+        if (!g_config.showUsbEvents.load()) return true;
         const size_t pathMax = (header->dbch_size -
             offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name)) / sizeof(WCHAR);
         if (pathMax == 0) return true;
@@ -8050,14 +8468,14 @@ bool HandleDeviceChange(WPARAM type, LPARAM value) {
         const std::wstring path(dev->dbcc_name, pathChars);
         if (path.empty()) return true;
         std::wstring label;
-        auto known = g_usbNames.find(path);
-        if (known != g_usbNames.end()) label = known->second;
+        auto known = g_notice.usbNames.find(path);
+        if (known != g_notice.usbNames.end()) label = known->second;
         else label = UsbDeviceLabel(path);
         if (type == DBT_DEVICEARRIVAL) {
-            if (g_usbNames.size() >= 256) g_usbNames.clear();
-            g_usbNames[path] = label;
+            if (g_notice.usbNames.size() >= 256) g_notice.usbNames.clear();
+            g_notice.usbNames[path] = label;
         } else {
-            g_usbNames.erase(path);
+            g_notice.usbNames.erase(path);
         }
         AddNoticeEvent(NoticeCategory::Usb, type == DBT_DEVICEARRIVAL ?
             NoticeAction::Connected : NoticeAction::Removed,
@@ -8085,10 +8503,23 @@ struct Event {
     bool connectionPresent = false, connected = false;
     NoticeIcon icon = NoticeIcon::Bluetooth;
 };
+enum class ConnectionTransition : uint8_t { None, Connected, Disconnected };
 struct DeviceState {
     std::wstring name;
     bool connectionKnown = false, connected = false;
     NoticeIcon icon = NoticeIcon::Bluetooth;
+
+    // Enumeration is an observation, not an arrival event. The first
+    // explicit IsConnected value is a silent baseline; only a later live
+    // Updated event may yield a notification.
+    ConnectionTransition ObserveConnection(bool next, bool liveUpdate) {
+        const bool changed = connectionKnown && connected != next;
+        connected = next;
+        connectionKnown = true;
+        if (!liveUpdate || !changed) return ConnectionTransition::None;
+        return next ? ConnectionTransition::Connected
+                    : ConnectionTransition::Disconnected;
+    }
 };
 struct CallbackGate {
     std::atomic<bool> enabled{true};
@@ -8109,6 +8540,18 @@ struct Watcher {
 std::array<bool, 2> enumerationComplete{};
 std::atomic<HWND> receiver{nullptr};
 std::atomic<bool> accepting{false};
+constexpr auto kInitialSnapshotTimeout = std::chrono::milliseconds(1800);
+
+// Share exactly the same AEP property list across initial enumeration and
+// live Watcher events, including IsConnected and Bluetooth device class.
+auto ObservedProperties() {
+    return winrt::single_threaded_vector<winrt::hstring>(
+        std::vector<winrt::hstring>{kConnectedProperty,
+            L"System.Devices.Aep.Bluetooth.Cod.Major",
+            L"System.Devices.Aep.Bluetooth.Cod.Minor",
+            L"System.Devices.Aep.Bluetooth.Le.Appearance.Category",
+            L"System.Devices.Aep.Bluetooth.Le.Appearance.Subcategory"});
+}
 
 std::wstring Limited(winrt::hstring const& input, size_t maxChars) {
     return {input.c_str(), std::min<size_t>(input.size(), maxChars)};
@@ -8170,7 +8613,7 @@ bool TryConnected(fc::IMapView<winrt::hstring, winrt::Windows::Foundation::IInsp
 
 void Post(Event&& event) {
     if (!accepting.load(std::memory_order_acquire) ||
-        g_closing.load(std::memory_order_relaxed)) return;
+        g_module.closing.load(std::memory_order_relaxed)) return;
     HWND target = receiver.load(std::memory_order_acquire);
     if (!target) return;
     bool queued = false;
@@ -8227,26 +8670,71 @@ void Stop() {
             Sleep(1);
         watcher.reset();
     }
+    std::vector<Event> oldQueue;
     {
         std::lock_guard<std::mutex> lock(queueMutex);
-        queue.clear();
+        queue.swap(oldQueue);
     }
-    known.clear();
+    // Stop already revoked every watcher and joined in-flight callbacks.
+    // Release buckets instead of only clearing values in no_destroy globals.
+    std::unordered_map<std::wstring, DeviceState> oldKnown;
+    known.swap(oldKnown);
     enumerationComplete = {false, false};
+}
+
+// Capture existing paired AEPs during monitor initialization, before
+// subscribing to watcher callbacks; never notify for the initial snapshot.
+void SeedInitialState(int transport, winrt::hstring const& selector) {
+    try {
+        auto operation = de::DeviceInformation::FindAllAsync(
+            selector, ObservedProperties(),
+            de::DeviceInformationKind::AssociationEndpoint);
+        const auto status = operation.wait_for(kInitialSnapshotTimeout);
+        if (status != winrt::Windows::Foundation::AsyncStatus::Completed) {
+            // The device broker must not block the OSD receiver indefinitely.
+            // Unknown IsConnected stays unknown, never assumed false.
+            operation.Cancel();
+            Wh_Log(L"Fluent OSD/Bluetooth: initial query transport=%d status=%d",
+                   transport, static_cast<int>(status));
+            return;
+        }
+        size_t seeded = 0, unknown = 0;
+        for (auto const& info : operation.GetResults()) {
+            if (known.size() >= kMaxKnownDevices) break;
+            try {
+                const std::wstring id = Limited(info.Id(), 512);
+                if (id.empty()) continue;
+                const std::wstring key =
+                    (transport ? L"ble:" : L"classic:") + id;
+                DeviceState state;
+                state.name = Limited(info.Name(), 80);
+                state.icon = Classify(info.Properties(), transport);
+                state.connectionKnown =
+                    TryConnected(info.Properties(), state.connected);
+                if (!state.connectionKnown) ++unknown;
+                if (known.emplace(key, std::move(state)).second) ++seeded;
+            } catch (...) {
+                ++unknown; // One malformed device must not discard the set.
+            }
+        }
+        Wh_Log(L"Fluent OSD/Bluetooth: initial state transport=%d seeded=%u unknown=%u",
+               transport, static_cast<unsigned>(seeded),
+               static_cast<unsigned>(unknown));
+    } catch (winrt::hresult_error const& error) {
+        Wh_Log(L"Fluent OSD/Bluetooth: initial query transport=%d failed=0x%08lX",
+               transport, static_cast<unsigned long>(error.code().value));
+    } catch (...) {
+        Wh_Log(L"Fluent OSD/Bluetooth: initial query transport=%d failed", transport);
+    }
 }
 
 void StartOne(int transport, winrt::hstring const& selector) {
     auto item = std::make_unique<Watcher>();
     item->gate = std::make_shared<CallbackGate>();
     auto weak = std::weak_ptr<CallbackGate>(item->gate);
-    auto properties = winrt::single_threaded_vector<winrt::hstring>(
-        std::vector<winrt::hstring>{kConnectedProperty,
-            L"System.Devices.Aep.Bluetooth.Cod.Major",
-            L"System.Devices.Aep.Bluetooth.Cod.Minor",
-            L"System.Devices.Aep.Bluetooth.Le.Appearance.Category",
-            L"System.Devices.Aep.Bluetooth.Le.Appearance.Subcategory"});
     item->value = de::DeviceInformation::CreateWatcher(
-        selector, properties, de::DeviceInformationKind::AssociationEndpoint);
+        selector, ObservedProperties(),
+        de::DeviceInformationKind::AssociationEndpoint);
 
     item->added = item->value.Added([weak, transport](
         de::DeviceWatcher const&, de::DeviceInformation const& info) {
@@ -8304,21 +8792,27 @@ void StartOne(int transport, winrt::hstring const& selector) {
 }
 
 void Start() {
-    if (!g_receiveWnd || g_closing.load() ||
-        !g_showBluetoothEvents.load()) return;
+    if (!g_module.receiveWnd || g_module.closing.load() ||
+        !g_config.showBluetoothEvents.load()) return;
     if (watchers[0] || watchers[1]) return;
-    receiver.store(g_receiveWnd, std::memory_order_release);
+    receiver.store(g_module.receiveWnd, std::memory_order_release);
     accepting.store(true, std::memory_order_release);
     try {
         // Paired-only selectors do not trigger scans for arbitrary unpaired
         // nearby BLE devices. Classic and LE are both tracked as AEPs.
-        StartOne(0, db::BluetoothDevice::GetDeviceSelectorFromPairingState(true));
+        const auto selector =
+            db::BluetoothDevice::GetDeviceSelectorFromPairingState(true);
+        SeedInitialState(0, selector);
+        StartOne(0, selector);
     } catch (winrt::hresult_error const& error) {
         Wh_Log(L"Bluetooth Classic watcher failed: 0x%08lX",
                static_cast<unsigned long>(error.code().value));
     } catch (...) { Wh_Log(L"Bluetooth Classic watcher failed"); }
     try {
-        StartOne(1, db::BluetoothLEDevice::GetDeviceSelectorFromPairingState(true));
+        const auto selector =
+            db::BluetoothLEDevice::GetDeviceSelectorFromPairingState(true);
+        SeedInitialState(1, selector);
+        StartOne(1, selector);
     } catch (winrt::hresult_error const& error) {
         Wh_Log(L"Bluetooth LE watcher failed: 0x%08lX",
                static_cast<unsigned long>(error.code().value));
@@ -8359,21 +8853,23 @@ void Drain() {
         // Partial updates without classification cannot erase a known icon.
         if (event.icon != NoticeIcon::Bluetooth) current.icon = event.icon;
         if (!event.connectionPresent) continue;
-        // Added means an AEP entered the enumeration, not that it just
-        // connected. The first explicit IsConnected value is a baseline.
-        // Only a subsequent Updated with a known changed value can notify.
-        const bool shouldNotify = enumerationComplete[transport] &&
-            event.change == Change::Updated && current.connectionKnown &&
-            current.connected != event.connected;
+        // A proactive startup snapshot seeds the state; Watcher Added then
+        // silently reconciles observations made during subscription.
+        // Require the initial enumeration to finish
+        // and an explicit IsConnected transition from a live Updated event.
+        const bool liveUpdate = enumerationComplete[transport] &&
+            event.change == Change::Updated;
         const bool wasConnected = current.connected;
-        current.connected = event.connected;
-        current.connectionKnown = true;
-        if (shouldNotify && g_showBluetoothEvents.load()) {
+        const ConnectionTransition transition =
+            current.ObserveConnection(event.connected, liveUpdate);
+        if (transition != ConnectionTransition::None &&
+            g_config.showBluetoothEvents.load()) {
             Wh_Log(L"Fluent OSD/Bluetooth: AEP update transport=%d old=%d new=%d",
                    event.transport, static_cast<int>(wasConnected),
                    static_cast<int>(event.connected));
             AddNoticeEvent(NoticeCategory::Bluetooth,
-                event.connected ? NoticeAction::Connected : NoticeAction::Disconnected,
+                transition == ConnectionTransition::Connected
+                    ? NoticeAction::Connected : NoticeAction::Disconnected,
                 id, current.name.empty() ? Tr(OsdText::BluetoothDevice)
                                          : current.name, current.icon);
         }
@@ -8417,13 +8913,13 @@ bool CalculatePopupPlacement(HMONITOR monitor, PopupPlacement& p) {
     // The renderer keeps the same Win11-inspired vector geometry.
     const float dpiScale = std::clamp(dpiX / 96.0f, 0.75f, 3.0f);
     const float sizeScale =
-        g_ddcSizePercent.load(std::memory_order_relaxed) / 100.0f;
+        g_config.ddcSizePercent.load(std::memory_order_relaxed) / 100.0f;
     p.scale = dpiScale * sizeScale;
-    const bool statusNotice = g_popupKind == PopupKind::LockStatus ||
-        g_popupKind == PopupKind::NativeEvent ||
-        g_popupKind == PopupKind::Notification;
-    const bool imageNotice = g_popupKind == PopupKind::Notification &&
-        g_clipboardThumbnail;
+    const bool statusNotice = g_presentation.popupKind == PopupKind::LockStatus ||
+        g_presentation.popupKind == PopupKind::NativeEvent ||
+        g_presentation.popupKind == PopupKind::Notification;
+    const bool imageNotice = g_presentation.popupKind == PopupKind::Notification &&
+        g_notice.clipboardThumbnail;
     const float logicalWidth = imageNotice ? kClipboardImageCanvasW :
         statusNotice ? kStatusNoticeWidth : MainLogicalWidth();
     const float logicalHeight = imageNotice ? kClipboardImageCanvasH :
@@ -8448,7 +8944,7 @@ bool CalculatePopupPlacement(HMONITOR monitor, PopupPlacement& p) {
     // Stable mapping retains positions chosen in v1.4.1.
     // bottom center, bottom left/right, top center, center,
     // top left/right, center left/right.
-    switch (g_position.load(std::memory_order_relaxed)) {
+    switch (g_config.position.load(std::memory_order_relaxed)) {
         case 1: x = leftX; break;                      // bottom-left
         case 2: x = rightX; break;                     // bottom-right
         case 3: y = topY; break;                       // top-center
@@ -8459,9 +8955,9 @@ bool CalculatePopupPlacement(HMONITOR monitor, PopupPlacement& p) {
         case 8: x = rightX; y = centerY; break;        // center-right
         default: break;                               // bottom-center
     }
-    x += static_cast<int>(std::lround(g_offsetX.load() * dpiScale));
-    y += static_cast<int>(std::lround(g_offsetY.load() * dpiScale));
-    const int position = g_position.load(std::memory_order_relaxed);
+    x += static_cast<int>(std::lround(g_config.offsetX.load() * dpiScale));
+    y += static_cast<int>(std::lround(g_config.offsetY.load() * dpiScale));
+    const int position = g_config.position.load(std::memory_order_relaxed);
     x = ClampPopupAxis(x, p.width,
         PositionCentersX(position) ? display : work, true);
     y = ClampPopupAxis(y, p.height,
@@ -8480,14 +8976,14 @@ BOOL CALLBACK FindMirrorCallback(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
 }
 void MovePopupToDisplay(const BrightnessEvent& ev) {
     WCHAR device[CCHDEVICENAME]{};
-    const int outputMode = g_displayOutputMode.load(std::memory_order_relaxed);
+    const int outputMode = g_config.displayOutputMode.load(std::memory_order_relaxed);
     if ((outputMode == 0 ||
-         (outputMode == 3 && g_popupKind == PopupKind::DdcBrightness)) &&
+         (outputMode == 3 && g_presentation.popupKind == PopupKind::DdcBrightness)) &&
         ev.device[0]) {
         wcscpy_s(device, ev.device);
     } else if (outputMode == 2) {
         swprintf_s(device, L"\\\\.\\DISPLAY%d",
-                   g_displayOutputNumber.load(std::memory_order_relaxed));
+                   g_config.displayOutputNumber.load(std::memory_order_relaxed));
     }
     HMONITOR monitor = FindMonitorByDeviceName(device);
     if (!monitor)
@@ -8498,7 +8994,7 @@ void MovePopupToDisplay(const BrightnessEvent& ev) {
         return;
     }
     osd_placement::Publish(place);
-    g_scale = place.scale;
+    g_panel.scale = place.scale;
     // XAML owns the visible HWND; this adapter publishes owned geometry.
 }
 
@@ -8516,38 +9012,33 @@ xaml_osd::Snapshot MakeXamlSnapshot(
         ? xaml_osd::LevelKind::DdcBrightness
         : xaml_osd::LevelKind::NativeBrightness;
     data.brightness = kind != PopupKind::NativeVolume;
-    data.receiver = g_receiveWnd;
-    data.showIcon = !data.brightness || g_showSun.load();
-    data.percent = g_nativePercent;
-    data.rawValue = g_nativePercent;
-    data.valueKnown = g_nativePercentKnown;
-    data.muted = !data.brightness && g_nativeMuted;
+    data.receiver = g_module.receiveWnd;
+    data.showIcon = !data.brightness || g_config.showSun.load();
+    data.percent = g_presentation.nativePercent;
+    data.rawValue = g_presentation.nativePercent;
+    data.valueKnown = g_presentation.nativePercentKnown;
+    data.muted = !data.brightness && g_presentation.nativeMuted;
     data.mixerChevron = kind == PopupKind::NativeVolume &&
-        g_showMixerArrow.load();
+        g_config.showMixerArrow.load();
     data.durationMs = OsdDuration(kind == PopupKind::DdcBrightness
         ? DurationKind::DdcBrightness
         : kind == PopupKind::NativeBrightness
         ? DurationKind::NativeBrightness : DurationKind::Volume);
     data.anchor = anchor;
     data.scale = scale;
-    data.vertical = g_verticalVolumeBrightness.load();
-    data.showValue = g_showValue.load();
-    data.innerPadding = g_innerPadding.load();
-    data.iconSize = g_iconSize.load();
-    data.fontSize = g_fontSize.load();
+    data.vertical = g_config.verticalVolumeBrightness.load();
+    data.showValue = g_config.showValue.load();
+    data.innerPadding = g_config.innerPadding.load();
+    data.iconSize = g_config.iconSize.load();
+    data.fontSize = g_config.fontSize.load();
     const bool light = IsLightTheme();
     data.background = OsdBackgroundRgb(light);
     data.backgroundAlpha = OsdBackgroundAlpha();
-    {
-        std::lock_guard<std::mutex> lock(g_backgroundLayersMutex);
-        data.layeredBackground =
-            g_useLayeredBackground.load(std::memory_order_acquire);
-        if (data.layeredBackground) data.backgroundLayers = g_backgroundLayers;
-    }
-    data.borderless = g_ddcBorderless.load();
-    data.cornerRadius = g_cornerRadius.load();
-    data.fadeEnabled = g_fadeEnabled.load();
-    data.fadeDurationMs = static_cast<DWORD>(g_fadeDuration.load());
+    g_config.CopyBrushLayers(data.layeredBackground, data.backgroundLayers);
+    data.borderless = g_config.ddcBorderless.load();
+    data.cornerRadius = g_config.cornerRadius.load();
+    data.fadeEnabled = g_config.fadeEnabled.load();
+    data.fadeDurationMs = static_cast<DWORD>(g_config.fadeDuration.load());
     data.text = OsdTextRgb(light);
     data.accent = OsdAccentRgb();
     data.track = OsdTrackRgb(light);
@@ -8570,7 +9061,7 @@ int XamlMirrorOffset(int position, int difference, bool horizontal) {
 }
 bool ShowXamlMirroredBatch(std::vector<xaml_osd::Snapshot> batch) {
     if (batch.empty()) return false;
-    if (g_displayOutputMode.load(std::memory_order_relaxed) == 3 &&
+    if (g_config.displayOutputMode.load(std::memory_order_relaxed) == 3 &&
         batch.front().kind != xaml_osd::LevelKind::DdcBrightness) {
         const bool attached = batch.size() == 2 &&
             ((batch.front().kind == xaml_osd::LevelKind::Volume &&
@@ -8583,7 +9074,7 @@ bool ShowXamlMirroredBatch(std::vector<xaml_osd::Snapshot> batch) {
             MONITOR_DEFAULTTONEAREST), {}};
         EnumDisplayMonitors(nullptr, nullptr, FindMirrorCallback,
             reinterpret_cast<LPARAM>(&scan));
-        const int position = g_position.load(std::memory_order_relaxed);
+        const int position = g_config.position.load(std::memory_order_relaxed);
         const double originalScale = std::max(.5, double(master.scale));
         for (HMONITOR monitor : scan.peers) {
             MONITORINFOEXW info{};
@@ -8679,19 +9170,19 @@ xaml_osd::Snapshot MakeXamlStatusSnapshot(
         xaml_osd::LevelKind category, const RECT& anchor,
         DurationKind duration, bool fluentIcon = false) {
     return osd_model::AsStatus(
-        MakeXamlSnapshot(PopupKind::NativeBrightness, anchor, g_scale),
+        MakeXamlSnapshot(PopupKind::NativeBrightness, anchor, g_panel.scale),
         category, OsdDuration(duration), fluentIcon);
 }
 
 // Category changes are controller state, never rendering side effects.
 void PrepareXamlCategory() {
-    if (g_popupKind != PopupKind::NativeVolume) {
+    if (g_presentation.popupKind != PopupKind::NativeVolume) {
         ResetXamlMixerController();
         ResetXamlMediaController();
     }
 }
 bool ShowXamlDdcTargets(const BrightnessEvent& master) {
-    const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
+    const int mode = g_config.displayOutputMode.load(std::memory_order_relaxed);
     std::vector<xaml_osd::Snapshot> batch;
     const ULONGLONG now = GetTickCount64();
     auto push = [&](const BrightnessEvent& ev,
@@ -8710,7 +9201,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
     };
 
     if (mode == 0 || mode == 3) {
-        for (const auto& target : g_ddcTargets) {
+        for (const auto& target : g_ddc.targets) {
             if (target.expiresAt <= now) continue;
             HMONITOR monitor =
                 FindMonitorByDeviceName(target.event.device);
@@ -8726,7 +9217,7 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
         // Primary/selected output remains one card with the chosen event.
         RECT anchor{};
         if (osd_placement::CurrentAnchor(anchor))
-            push(master, anchor, g_scale);
+            push(master, anchor, g_panel.scale);
     }
     if (batch.empty()) {
         Wh_Log(L"Fluent OSD/XAML: no resolvable DDC snapshots");
@@ -8742,42 +9233,40 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
 // Coalesce writes per physical display, not across all displays. Each
 // target's raw value and range survive the burst for independent painting.
 void DisplayDdcBatch() {
-    if (!g_ddcBatchPending) return;
-    g_ddcBatchPending = false;
-    std::vector<BrightnessEvent> events = std::move(g_ddcBatchEvents);
-    g_ddcBatchEvents.clear();
-    if (g_closing.load() || !g_showDdcBrightness.load() || events.empty())
+    std::vector<BrightnessEvent> events =
+        g_ddc.TakeBatchOnControllerThread();
+    if (g_module.closing.load() || !g_config.showDdcBrightness.load() || events.empty())
         return;
 
     const ULONGLONG now = GetTickCount64();
-    const int mode = g_displayOutputMode.load(std::memory_order_relaxed);
+    const int mode = g_config.displayOutputMode.load(std::memory_order_relaxed);
     const ULONGLONG expiry = now + static_cast<ULONGLONG>(
         OsdDuration(DurationKind::DdcBrightness));
     // The cache lasts only for the active OSD period, never indefinitely.
-    g_ddcTargets.erase(std::remove_if(g_ddcTargets.begin(),
-        g_ddcTargets.end(), [now](const DdcTargetState& item) {
+    g_ddc.targets.erase(std::remove_if(g_ddc.targets.begin(),
+        g_ddc.targets.end(), [now](const DdcTargetState& item) {
             return item.expiresAt <= now;
-        }), g_ddcTargets.end());
+        }), g_ddc.targets.end());
 
     BrightnessEvent master{};
     bool masterChosen = false;
     // XAML keeps the primary host hidden in DDC multi-target mode. The
     // unexpired per-display target cache, not that HWND, determines pinning.
     const bool priorTargetActive = std::any_of(
-        g_ddcTargets.begin(), g_ddcTargets.end(),
+        g_ddc.targets.begin(), g_ddc.targets.end(),
         [&](const DdcTargetState& previous) {
             return previous.expiresAt > now &&
-                previous.event.physicalIndex == g_visible.physicalIndex &&
-                _wcsicmp(previous.event.device, g_visible.device) == 0;
+                previous.event.physicalIndex == g_presentation.visible.physicalIndex &&
+                _wcsicmp(previous.event.device, g_presentation.visible.device) == 0;
         });
     bool pinnedMaster = false;
     if ((mode == 0 || mode == 3) &&
-        g_popupKind == PopupKind::DdcBrightness &&
-        priorTargetActive && g_visible.device[0]) {
+        g_presentation.popupKind == PopupKind::DdcBrightness &&
+        priorTargetActive && g_presentation.visible.device[0]) {
         auto current = std::find_if(events.begin(), events.end(),
             [&](const BrightnessEvent& event) {
-                return event.physicalIndex == g_visible.physicalIndex &&
-                       _wcsicmp(event.device, g_visible.device) == 0;
+                return event.physicalIndex == g_presentation.visible.physicalIndex &&
+                       _wcsicmp(event.device, g_presentation.visible.device) == 0;
             });
         if (current != events.end()) {
             master = *current;
@@ -8791,7 +9280,7 @@ void DisplayDdcBatch() {
         if (mode == 2) {
             WCHAR device[CCHDEVICENAME]{};
             swprintf_s(device, L"\\\\.\\DISPLAY%d",
-                g_displayOutputNumber.load(std::memory_order_relaxed));
+                g_config.displayOutputNumber.load(std::memory_order_relaxed));
             preferredMonitor = FindMonitorByDeviceName(device);
         }
         if (!preferredMonitor)
@@ -8806,9 +9295,9 @@ void DisplayDdcBatch() {
     for (const BrightnessEvent& ev : events) {
         const HMONITOR target = FindMonitorByDeviceName(ev.device);
         if (!target && (mode == 0 || mode == 3)) {
-            if (_wcsicmp(g_ddcLastUnresolved, ev.device) != 0 ||
-                !g_ddcLastUnresolved[0]) {
-                wcscpy_s(g_ddcLastUnresolved, ev.device);
+            if (_wcsicmp(g_ddc.lastUnresolved, ev.device) != 0 ||
+                !g_ddc.lastUnresolved[0]) {
+                wcscpy_s(g_ddc.lastUnresolved, ev.device);
                 Wh_Log(L"DDC event target unresolved: device='%s', "
                        L"physicalIndex=%lu, senderPID=%lu; skipping "
                        L"unknown target.", ev.device, ev.physicalIndex,
@@ -8817,23 +9306,23 @@ void DisplayDdcBatch() {
             continue;
         }
         if (target) {
-            if (_wcsicmp(g_ddcLastTarget, ev.device) != 0) {
-                wcscpy_s(g_ddcLastTarget, ev.device);
+            if (_wcsicmp(g_ddc.lastTarget, ev.device) != 0) {
+                wcscpy_s(g_ddc.lastTarget, ev.device);
                 Wh_Log(L"DDC target resolved: '%s' (physicalIndex=%lu)",
                        ev.device, ev.physicalIndex);
             }
-            g_ddcLastUnresolved[0] = L'\0';
+            g_ddc.lastUnresolved[0] = L'\0';
             const auto sameDevice = [&](const DdcTargetState& state) {
                 return state.event.physicalIndex == ev.physicalIndex &&
                        _wcsicmp(state.event.device, ev.device) == 0;
             };
-            auto it = std::find_if(g_ddcTargets.begin(),
-                                   g_ddcTargets.end(), sameDevice);
-            if (it != g_ddcTargets.end()) {
+            auto it = std::find_if(g_ddc.targets.begin(),
+                                   g_ddc.targets.end(), sameDevice);
+            if (it != g_ddc.targets.end()) {
                 it->event = ev;
                 it->expiresAt = expiry;
-            } else if (g_ddcTargets.size() < kMaxDdcTargets) {
-                g_ddcTargets.push_back({ev, expiry});
+            } else if (g_ddc.targets.size() < kMaxDdcTargets) {
+                g_ddc.targets.push_back({ev, expiry});
             }
         }
         // Source mode puts the latest event on its own monitor. For fixed
@@ -8848,9 +9337,9 @@ void DisplayDdcBatch() {
     }
     if (!masterChosen) return;
 
-    g_visible = master;
-    g_lastConfirmedDdcBrightness = master.value;
-    g_popupKind = PopupKind::DdcBrightness;
+    g_presentation.visible = master;
+    g_ddc.lastConfirmedDdc = master.value;
+    g_presentation.popupKind = PopupKind::DdcBrightness;
     MovePopupToDisplay(master);
     PrepareXamlCategory();
     (void)ShowXamlDdcTargets(master);
@@ -8988,8 +9477,9 @@ bool WriteExternalBrightnessDdc(const BrightnessWheelTask& task) {
         std::vector<PHYSICAL_MONITOR> monitors(n);
         if (get(display.monitor, n, monitors.data())) {
             HANDLE monitor = monitors[task.monitor.physicalIndex].hPhysicalMonitor;
-            UpdateRange(monitor, task.monitor.minimum, task.monitor.maximum);
-            const int vcp = g_vcpCode.load();
+            g_ddc.UpdateHandleRange(
+                monitor, task.monitor.minimum, task.monitor.maximum);
+            const int vcp = g_config.vcpCode.load();
             ok = setVcp(monitor, static_cast<BYTE>(vcp),
                         static_cast<DWORD>(task.value)) != FALSE;
             if (!ok && vcp == 16 && setBrightness)
@@ -9004,35 +9494,20 @@ bool WriteExternalBrightnessDdc(const BrightnessWheelTask& task) {
 DWORD WINAPI BrightnessWheelThreadProc(void*) {
     const HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool comReady = SUCCEEDED(init);
-    while (WaitForSingleObject(g_wheelWriteWake, INFINITE) == WAIT_OBJECT_0) {
-        if (g_wheelWriteStop.load()) break;
-        std::vector<BrightnessWheelTask> tasks;
-        AcquireSRWLockExclusive(&g_wheelWriteLock);
-        tasks.swap(g_wheelWritePending);
-        ReleaseSRWLockExclusive(&g_wheelWriteLock);
+    while (WaitForSingleObject(g_writer.wake, INFINITE) == WAIT_OBJECT_0) {
+        if (g_writer.stop.load()) break;
+        std::vector<BrightnessWheelTask> tasks = g_writer.TakePending();
         for (const auto& task : tasks) {
-            if (g_wheelWriteStop.load()) break;
+            if (g_writer.stop.load()) break;
             // Skip a snapshot superseded while another DDC command ran.
-            AcquireSRWLockShared(&g_wheelWriteLock);
-            const bool superseded = std::any_of(
-                g_wheelWritePending.begin(), g_wheelWritePending.end(),
-                [&](const BrightnessWheelTask& newer) {
-                    return newer.generation > task.generation &&
-                        newer.native == task.native &&
-                        (task.native ||
-                         (newer.monitor.physicalIndex ==
-                              task.monitor.physicalIndex &&
-                          _wcsicmp(newer.monitor.device,
-                                  task.monitor.device) == 0));
-                });
-            ReleaseSRWLockShared(&g_wheelWriteLock);
-            if (superseded) continue;
+            if (g_writer.IsSuperseded(task)) continue;
             const bool success = task.native ?
                 (comReady && WriteNativeBrightnessWmi(
                     static_cast<BYTE>(std::clamp(task.value, 0, 100))))
                 : WriteExternalBrightnessDdc(task);
-            const HWND receiver = g_receiveWnd;
-            if (receiver && !g_closing.load())
+            // This worker must not read the controller-owned HWND.
+            const HWND receiver = g_module.ReceiverForCallbacks();
+            if (receiver)
                 PostMessageW(receiver, kBrightnessWheelResultMessage,
                     static_cast<WPARAM>(task.generation),
                     static_cast<LPARAM>((success ? 1 : 0) |
@@ -9068,7 +9543,7 @@ bool AwaitReady(Operation const& operation, DWORD timeoutMs = 1800) {
         if (state == wf::AsyncStatus::Completed) return true;
         if (state == wf::AsyncStatus::Error ||
             state == wf::AsyncStatus::Canceled) return false;
-        if (g_mediaStop.load(std::memory_order_relaxed) ||
+        if (g_media.stop.load(std::memory_order_relaxed) ||
             GetTickCount64() - start >= timeoutMs) return false;
         Sleep(15);
     }
@@ -9167,7 +9642,7 @@ void ReadTimeline(Session const& session, MediaSnapshot& snapshot) {
 
 void ReadArtwork(streams::IRandomAccessStreamReference const& thumbnail,
                  std::vector<BYTE>& output) {
-    if (!thumbnail || !g_showMediaArtwork.load(std::memory_order_relaxed))
+    if (!thumbnail || !g_config.showMediaArtwork.load(std::memory_order_relaxed))
         return;
     auto open = thumbnail.OpenReadAsync();
     if (!AwaitReady(open)) return;
@@ -9223,7 +9698,7 @@ void FillSnapshot(Session const& session, MediaSnapshot const& previous,
         if (props) {
             snapshot.title = MediaText(props.Title());
             snapshot.artist = MediaText(props.Artist());
-            if (g_showMediaArtwork.load(std::memory_order_relaxed)) {
+            if (g_config.showMediaArtwork.load(std::memory_order_relaxed)) {
                 if (snapshot.sourceId == previous.sourceId &&
                     snapshot.selectionSerial == previous.selectionSerial &&
                     snapshot.title == previous.title &&
@@ -9245,21 +9720,7 @@ void FillSnapshot(Session const& session, MediaSnapshot const& previous,
 } // namespace smtc_projection
 
 void RequestMedia(int command = 0, INT64 position = 0) {
-    if (!g_mediaWake || g_mediaStop.load()) return;
-    if (command) {
-        AcquireSRWLockExclusive(&g_mediaCommandLock);
-        if (command == 4) {
-            // Dragging generates many positions; keep only the latest seek.
-            g_mediaCommands.erase(std::remove_if(g_mediaCommands.begin(),
-                g_mediaCommands.end(), [](const MediaCommand& entry) {
-                    return entry.action == 4;
-                }), g_mediaCommands.end());
-        }
-        if (g_mediaCommands.size() < 32)
-            g_mediaCommands.push_back(MediaCommand{command, position});
-        ReleaseSRWLockExclusive(&g_mediaCommandLock);
-    }
-    SetEvent(g_mediaWake);
+    g_media.Request(command, position);
 }
 
 DWORD WINAPI MediaThreadProc(void*) {
@@ -9289,8 +9750,8 @@ DWORD WINAPI MediaThreadProc(void*) {
         uint32_t selectionSerial = 0;
         std::wstring selectedSource;
         size_t selectedOrdinal = 0;
-        while (WaitForSingleObject(g_mediaWake, INFINITE) == WAIT_OBJECT_0) {
-            if (g_mediaStop.load()) break;
+        while (WaitForSingleObject(g_media.wake, INFINITE) == WAIT_OBJECT_0) {
+            if (g_media.stop.load()) break;
             try {
                 std::vector<smtc_projection::Session> sessions;
                 // GetSessions is a passive enumeration; no GATT/network polling.
@@ -9341,10 +9802,7 @@ DWORD WINAPI MediaThreadProc(void*) {
                     }
                 }
                 if (index >= sessions.size() && !sessions.empty()) index = 0;
-                std::vector<MediaCommand> commands;
-                AcquireSRWLockExclusive(&g_mediaCommandLock);
-                commands.swap(g_mediaCommands);
-                ReleaseSRWLockExclusive(&g_mediaCommandLock);
+                std::vector<MediaCommand> commands = g_media.TakeCommands();
                 smtc_projection::Session session{nullptr};
                 if (index < sessions.size()) session = sessions[index];
                 else if (current) session = current;
@@ -9383,9 +9841,7 @@ DWORD WINAPI MediaThreadProc(void*) {
                     }
                 }
                 lastSnapshot = snapshot;
-                AcquireSRWLockExclusive(&g_mediaLock);
-                g_mediaPending = std::move(snapshot);
-                ReleaseSRWLockExclusive(&g_mediaLock);
+                g_media.Publish(std::move(snapshot));
                 HWND receiver = FindWindowExW(HWND_MESSAGE, nullptr, kWindowClass, nullptr);
                 if (receiver) PostMessageW(receiver, kMediaUpdateMessage, 0, 0);
             } catch (winrt::hresult_error const& e) {
@@ -9423,13 +9879,6 @@ std::wstring ProcessTitle(DWORD pid) {
     return result;
 }
 
-void CleanupMixerIcons() {
-    for (auto& entry : g_mixerEntries) {
-        if (entry.appIcon) DestroyIcon(entry.appIcon);
-        entry.appIcon = nullptr;
-    }
-}
-
 HICON ProcessIcon(DWORD pid) {
     if (!pid) return nullptr;
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -9445,48 +9894,34 @@ HICON ProcessIcon(DWORD pid) {
     return result.hIcon; // caller owns and must destroy
 }
 
-void StopMixerOutputNotifications() {
-    if (g_mixerNotify) g_mixerNotify->Stop();
-    if (g_mixerNotify && g_mixerNotifyEnumerator) {
-        (void)g_mixerNotifyEnumerator->UnregisterEndpointNotificationCallback(
-            g_mixerNotify.Get());
-    }
-    g_mixerNotify.Reset();
-    g_mixerNotifyEnumerator.Reset();
-}
-
 void ResetXamlMediaController() {
-    if (!g_xamlMediaOpen) return;
-    g_xamlMediaOpen=false;
-    if (g_receiveWnd) KillTimer(g_receiveWnd,kMediaAnimationTimer);
-    ++g_xamlMediaGeneration;
-    if (!g_xamlMediaGeneration) ++g_xamlMediaGeneration;
+    if (!g_panel.mediaOpen) return;
+    g_panel.mediaOpen=false;
+    if (g_module.receiveWnd) KillTimer(g_module.receiveWnd,kMediaAnimationTimer);
+    ++g_panel.mediaGeneration;
+    if (!g_panel.mediaGeneration) ++g_panel.mediaGeneration;
 }
 void ResetXamlMixerController() {
-    if (!g_xamlMixerOpen) return;
-    g_xamlMixerOpen = false;
-    g_xamlMixerOutputExpanded = false;
-    StopMixerOutputNotifications();
-    CleanupMixerIcons();
-    g_mixerEntries.clear();
-    g_mixerMaster.Reset();
-    g_mixerOutputOptions.clear();
-    ++g_xamlMixerGeneration; // Discard commands from the old Mixer Island.
-    if (!g_xamlMixerGeneration) ++g_xamlMixerGeneration;
+    if (!g_panel.mixerOpen) return;
+    g_panel.mixerOpen = false;
+    g_panel.mixerOutputExpanded = false;
+    g_mixer.ClosePanelOnControllerThread();
+    ++g_panel.mixerGeneration; // Discard commands from the old Mixer Island.
+    if (!g_panel.mixerGeneration) ++g_panel.mixerGeneration;
 }
 
 void StartMixerOutputNotifications() {
-    if (g_mixerNotify || !g_receiveWnd) return;
+    if (g_mixer.notify || !g_module.receiveWnd) return;
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
         CLSCTX_INPROC_SERVER, IID_PPV_ARGS(enumerator.GetAddressOf()));
     if (FAILED(hr)) return;
-    auto* callback = new (std::nothrow) MixerOutputNotifications(g_receiveWnd);
+    auto* callback = new (std::nothrow) MixerOutputNotifications(g_module.receiveWnd);
     if (!callback) return;
     hr = enumerator->RegisterEndpointNotificationCallback(callback);
     if (SUCCEEDED(hr)) {
-        g_mixerNotify.Attach(callback); // callback's construction reference
-        g_mixerNotifyEnumerator = std::move(enumerator);
+        g_mixer.notify.Attach(callback); // callback's construction reference
+        g_mixer.notifyEnumerator = std::move(enumerator);
     } else {
         callback->Stop();
         callback->Release();
@@ -9513,14 +9948,13 @@ std::wstring AudioOutputFriendlyName(IMMDevice* device) {
 }
 
 void ReadMixerOutputDevices(IMMDeviceEnumerator* enumerator) {
-    g_mixerOutputOptions.clear();
-    g_mixerOutputId.clear();
+    g_mixer.ClearOutputDevicesOnControllerThread();
     Microsoft::WRL::ComPtr<IMMDevice> current;
     if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia,
                                                     current.GetAddressOf()))) {
         LPWSTR id = nullptr;
         if (SUCCEEDED(current->GetId(&id)) && id) {
-            g_mixerOutputId.assign(id);
+            g_mixer.outputId.assign(id);
             CoTaskMemFree(id);
         }
     }
@@ -9530,7 +9964,7 @@ void ReadMixerOutputDevices(IMMDeviceEnumerator* enumerator) {
         return;
     UINT count = 0;
     if (FAILED(collection->GetCount(&count))) return;
-    for (UINT i = 0; i < count && g_mixerOutputOptions.size() <
+    for (UINT i = 0; i < count && g_mixer.outputOptions.size() <
             static_cast<size_t>(kMaxMixerOutputDevices); ++i) {
         Microsoft::WRL::ComPtr<IMMDevice> device;
         if (FAILED(collection->Item(i, device.GetAddressOf()))) continue;
@@ -9538,10 +9972,10 @@ void ReadMixerOutputDevices(IMMDeviceEnumerator* enumerator) {
         if (FAILED(device->GetId(&id)) || !id) continue;
         AudioOutputOption output{id, AudioOutputFriendlyName(device.Get())};
         CoTaskMemFree(id);
-        if (output.id == g_mixerOutputId)
-            g_mixerOutputOptions.insert(g_mixerOutputOptions.begin(), std::move(output));
+        if (output.id == g_mixer.outputId)
+            g_mixer.outputOptions.insert(g_mixer.outputOptions.begin(), std::move(output));
         else
-            g_mixerOutputOptions.push_back(std::move(output));
+            g_mixer.outputOptions.push_back(std::move(output));
     }
 }
 
@@ -9564,19 +9998,14 @@ HRESULT SetWindowsDefaultPlaybackEndpoint(const std::wstring& id,
 }
 
 void RefreshMixer() {
-    ++g_xamlMixerGeneration;
-    if (!g_xamlMixerGeneration) ++g_xamlMixerGeneration;
-    CleanupMixerIcons();
-    g_mixerEntries.clear();
-    g_mixerMaster.Reset();
-    g_mixerMasterLevel = 0;
-    g_mixerMasterMuted = false;
+    ++g_panel.mixerGeneration;
+    if (!g_panel.mixerGeneration) ++g_panel.mixerGeneration;
+    g_mixer.PrepareRefreshOnControllerThread();
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
         CLSCTX_ALL, IID_PPV_ARGS(enumerator.GetAddressOf()));
     if (FAILED(hr) || !enumerator) {
-        g_mixerOutputOptions.clear();
-        g_mixerOutputId.clear();
+        g_mixer.ClearOutputDevicesOnControllerThread();
         return;
     }
     ReadMixerOutputDevices(enumerator.Get());
@@ -9584,12 +10013,12 @@ void RefreshMixer() {
     hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
     if (FAILED(hr) || !device) return;
     device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
-        nullptr, reinterpret_cast<void**>(g_mixerMaster.GetAddressOf()));
-    if (g_mixerMaster) {
-        g_mixerMaster->GetMasterVolumeLevelScalar(&g_mixerMasterLevel);
+        nullptr, reinterpret_cast<void**>(g_mixer.master.GetAddressOf()));
+    if (g_mixer.master) {
+        g_mixer.master->GetMasterVolumeLevelScalar(&g_mixer.masterLevel);
         BOOL muted = FALSE;
-        if (SUCCEEDED(g_mixerMaster->GetMute(&muted)))
-            g_mixerMasterMuted = muted != FALSE;
+        if (SUCCEEDED(g_mixer.master->GetMute(&muted)))
+            g_mixer.masterMuted = muted != FALSE;
     }
     IAudioSessionManager2* manager = nullptr;
     hr = device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
@@ -9638,21 +10067,21 @@ void RefreshMixer() {
         }
         if (entry.title.empty()) entry.title = L"Application";
         control->Release();
-        g_mixerEntries.emplace_back(std::move(entry));
+        g_mixer.entries.emplace_back(std::move(entry));
     }
     sessions->Release();
 }
 
 void SelectMixerOutput(int index) {
-    if (index < 0 || index >= static_cast<int>(g_mixerOutputOptions.size()))
+    if (index < 0 || index >= static_cast<int>(g_mixer.outputOptions.size()))
         return;
-    const std::wstring target = g_mixerOutputOptions[index].id;
-    g_mixerOutputSwitchFailed = false;
-    if (target != g_mixerOutputId) {
+    const std::wstring target = g_mixer.outputOptions[index].id;
+    g_mixer.outputSwitchFailed = false;
+    if (target != g_mixer.outputId) {
         const HRESULT hr = SetWindowsDefaultPlaybackEndpoint(target,
-                                                             g_mixerOutputId);
+                                                             g_mixer.outputId);
         if (FAILED(hr)) {
-            g_mixerOutputSwitchFailed = true;
+            g_mixer.outputSwitchFailed = true;
             Wh_Log(L"Mixer default output switch failed: 0x%08lX",
                    static_cast<unsigned long>(hr));
         } else {
@@ -9665,17 +10094,17 @@ void SelectMixerOutput(int index) {
 
 // Shared Core Audio operation used by both view backends.
 bool SetMixerPercent(int index, int percent) {
-    if (index < 0 || index > static_cast<int>(g_mixerEntries.size()))
+    if (index < 0 || index > static_cast<int>(g_mixer.entries.size()))
         return false;
     const float value = std::clamp(percent, 0, 100) / 100.0f;
     if (!index) {
-        if (!g_mixerMaster || FAILED(
-            g_mixerMaster->SetMasterVolumeLevelScalar(value, nullptr)))
+        if (!g_mixer.master || FAILED(
+            g_mixer.master->SetMasterVolumeLevelScalar(value, nullptr)))
             return false;
-        g_mixerMasterLevel = value;
+        g_mixer.masterLevel = value;
         return true;
     }
-    auto& entry = g_mixerEntries[index - 1];
+    auto& entry = g_mixer.entries[index - 1];
     if (!entry.volume || FAILED(entry.volume->SetMasterVolume(value, nullptr)))
         return false;
     entry.scalar = value;
@@ -9683,19 +10112,19 @@ bool SetMixerPercent(int index, int percent) {
 }
 
 void ToggleMixerMute(int index) {
-    if (index < 0 || index > static_cast<int>(g_mixerEntries.size())) return;
+    if (index < 0 || index > static_cast<int>(g_mixer.entries.size())) return;
     if (index == 0) {
-        if (!g_mixerMaster) return;
+        if (!g_mixer.master) return;
         BOOL current = FALSE;
-        if (FAILED(g_mixerMaster->GetMute(&current))) return;
+        if (FAILED(g_mixer.master->GetMute(&current))) return;
         const BOOL requested = current ? FALSE : TRUE;
-        if (SUCCEEDED(g_mixerMaster->SetMute(requested, nullptr))) {
+        if (SUCCEEDED(g_mixer.master->SetMute(requested, nullptr))) {
             BOOL actual = requested;
-            g_mixerMaster->GetMute(&actual);
-            g_mixerMasterMuted = actual != FALSE;
+            g_mixer.master->GetMute(&actual);
+            g_mixer.masterMuted = actual != FALSE;
         }
     } else {
-        auto& entry = g_mixerEntries[index - 1];
+        auto& entry = g_mixer.entries[index - 1];
         if (!entry.volume) return;
         BOOL current = FALSE;
         if (FAILED(entry.volume->GetMute(&current))) return;
@@ -9718,27 +10147,27 @@ LRESULT CALLBACK LockKeyProc(int code, WPARAM wp, LPARAM lp) {
             if (event->vkCode != static_cast<DWORD>(kLockVk[i])) continue;
             bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
             bool up = wp == WM_KEYUP || wp == WM_SYSKEYUP;
-            if (down && !g_lockPressed[i]) {
-                g_lockPressed[i] = true;
-                g_lockToggle[i] = !g_lockToggle[i];
-                if (g_showLockKeys[i].load() && g_receiveWnd)
-                    PostMessageW(g_receiveWnd, kLockToggleMessage,
+            if (down && !g_keys.pressed[i]) {
+                g_keys.pressed[i] = true;
+                g_keys.toggle[i] = !g_keys.toggle[i];
+                if (g_config.showLockKeys[i].load() && g_module.receiveWnd)
+                    PostMessageW(g_module.receiveWnd, kLockToggleMessage,
                                  static_cast<WPARAM>(i),
-                                 static_cast<LPARAM>(g_lockToggle[i]));
-            } else if (up) g_lockPressed[i] = false;
+                                 static_cast<LPARAM>(g_keys.toggle[i]));
+            } else if (up) g_keys.pressed[i] = false;
             break;
         }
     }
-    return CallNextHookEx(g_lockHook, code, wp, lp);
+    return CallNextHookEx(g_keys.hook, code, wp, lp);
 }
 
 // XAML Island controls all pointer input; no detached hit HWND is needed.
 void ShowMigratedXamlLevel(PopupKind kind) {
     const bool brightness = kind == PopupKind::NativeBrightness;
-    if(!brightness&&g_showSmtcOnVolume.load()&&
-       g_mediaCurrent.available&&!g_xamlMixerOpen&&
+    if(!brightness&&g_config.showSmtcOnVolume.load()&&
+       g_media.current.available&&!g_panel.mixerOpen&&
        ShowXamlMediaPanel()) return;
-    if(g_xamlMediaOpen) ResetXamlMediaController();
+    if(g_panel.mediaOpen) ResetXamlMediaController();
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
@@ -9746,10 +10175,10 @@ void ShowMigratedXamlLevel(PopupKind kind) {
                brightness ? L"brightness" : L"volume");
         return;
     }
-    auto snapshot = MakeXamlSnapshot(kind, target, g_scale);
+    auto snapshot = MakeXamlSnapshot(kind, target, g_panel.scale);
     if (!brightness && snapshot.mixerChevron) {
         RECT plannedMain{}, plannedPanel{};
-        if (BuildMixerPanelAnchors(plannedMain, plannedPanel, g_scale))
+        if (BuildMixerPanelAnchors(plannedMain, plannedPanel, g_panel.scale))
             snapshot.mixerDirection = osd_layout::MixerChevronDirection(
                 plannedMain, plannedPanel, snapshot.vertical, false);
     }
@@ -9782,11 +10211,11 @@ void ShowMigratedXamlLockStatus() {
     }
     auto snapshot = MakeXamlStatusSnapshot(
         xaml_osd::LevelKind::LockStatus, target, DurationKind::LockKeys);
-    snapshot.statusTitle = kLockDisplayNames[std::clamp(g_lastLock, 0, 3)];
-    snapshot.statusGlyph = kLockGlyphs[std::clamp(g_lastLock, 0, 3)];
-    snapshot.statusDetail = g_lastLockValue
+    snapshot.statusTitle = kLockDisplayNames[std::clamp(g_keys.last, 0, 3)];
+    snapshot.statusGlyph = kLockGlyphs[std::clamp(g_keys.last, 0, 3)];
+    snapshot.statusDetail = g_keys.lastValue
         ? Tr(OsdText::On) : Tr(OsdText::Off);
-    snapshot.statusActive = g_lastLockValue;
+    snapshot.statusActive = g_keys.lastValue;
     if (!ShowXamlMirrored(snapshot))
         Wh_Log(L"Fluent OSD/XAML: lock status unavailable; NO GDI+ fallback");
 }
@@ -9805,13 +10234,13 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     auto snapshot = MakeXamlStatusSnapshot(
         xaml_osd::LevelKind::NoticeStatus, target, duration, true);
     snapshot.vertical = false; // Status notices are horizontal regardless of level settings.
-    snapshot.statusTitle = g_noticeTitle;
-    snapshot.statusDetail = g_noticeBody;
-    snapshot.noticeDetails = g_noticeDetails;
+    snapshot.statusTitle = g_notice.title;
+    snapshot.statusDetail = g_notice.body;
+    snapshot.noticeDetails = g_notice.details;
     snapshot.noticeDetailsHeading = Tr(OsdText::EventDetails);
     snapshot.noticeInteractiveDurationMs = OsdDuration(DurationKind::Interactive);
-    snapshot.noticeGeneration = g_noticeGeneration;
-    switch (g_noticeIcon) {
+    snapshot.noticeGeneration = g_notice.generation;
+    switch (g_notice.icon) {
         case NoticeIcon::Bluetooth: snapshot.statusGlyph = L"\uE702"; break;
         case NoticeIcon::Usb:       snapshot.statusGlyph = L"\uE88E"; break;
         case NoticeIcon::Network:   snapshot.statusGlyph = L"\uE968"; break;
@@ -9824,21 +10253,21 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     }
     RECT detailsRect{};
     bool canPlace = false;
-    if (g_noticeDetails.size() > 1) {
+    if (g_notice.details.size() > 1) {
         MONITORINFO monitor{sizeof(monitor)};
         if (GetMonitorInfoW(MonitorFromRect(
                 &target, MONITOR_DEFAULTTONEAREST), &monitor)) {
             const int width = target.right - target.left;
             const int height = target.bottom - target.top;
             const int preferredHeight = std::max(84, static_cast<int>(std::lround(
-                (48.0 + std::min<size_t>(6, g_noticeDetails.size()) *
+                (48.0 + std::min<size_t>(6, g_notice.details.size()) *
                  std::max(26.0, snapshot.fontSize * 1.8)) *
                 std::max(0.5f, snapshot.scale))));
             const int panelHeight = std::clamp(preferredHeight, 64,
                 std::max(64, static_cast<int>(
                     monitor.rcWork.bottom - monitor.rcWork.top - 16)));
             const FlyoutDirection direction = DirectionForPopup(
-                target, monitor.rcWork, g_position.load(), false);
+                target, monitor.rcWork, g_config.position.load(), false);
             const auto offset = GetPanelAttachment(
                 false, direction, snapshot.scale,
                 width, height, width, panelHeight);
@@ -9848,16 +10277,16 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
                 target.top + offset.y, panelHeight, monitor.rcWork, false);
             detailsRect = RECT{x, y, x + width, y + panelHeight};
             snapshot.noticeDirection = osd_layout::MixerChevronDirection(
-                target, detailsRect, false, g_noticePanelOpen);
+                target, detailsRect, false, g_notice.panelOpen);
             canPlace = true;
         }
     }
-    if (g_noticePanelOpen && canPlace) {
+    if (g_notice.panelOpen && canPlace) {
         auto details = MakeXamlStatusSnapshot(
             xaml_osd::LevelKind::NoticeDetails, detailsRect,
             DurationKind::Interactive, false);
         details.vertical = false;
-        details.noticeDetails = g_noticeDetails;
+        details.noticeDetails = g_notice.details;
         details.noticeDetailsHeading = Tr(OsdText::EventDetails);
         if (!ShowXamlMirroredBatch({snapshot, details}))
             Wh_Log(L"Fluent OSD/XAML: notice-details pair unavailable");
@@ -9880,7 +10309,7 @@ void ShowMigratedXamlNativeEvent() {
         xaml_osd::LevelKind::NativeEvent, target,
         DurationKind::NativeEvents, true);
 
-    const NativeEventInfo& event = g_nativeEventCurrent;
+    const NativeEventInfo& event = g_presentation.nativeEventCurrent;
     switch (event.kind) {
         case Kind::Keyboard:
             snapshot.statusTitle = Tr(OsdText::KeyboardBacklight);
@@ -9985,14 +10414,14 @@ void ShowMigratedXamlClipboardNotice() {
     auto snapshot = MakeXamlStatusSnapshot(
         xaml_osd::LevelKind::NoticeStatus, target,
         DurationKind::Clipboard, true);
-    snapshot.statusTitle = g_noticeTitle;
-    snapshot.statusDetail = g_noticeBody;
+    snapshot.statusTitle = g_notice.title;
+    snapshot.statusDetail = g_notice.body;
     // TextBulletListSquare and KnowledgeArticle (Segoe Fluent Icons).
-    snapshot.statusGlyph = g_noticeIcon == NoticeIcon::ClipboardFile
-        ? L"\uF000" : g_noticeIcon == NoticeIcon::ClipboardText
+    snapshot.statusGlyph = g_notice.icon == NoticeIcon::ClipboardFile
+        ? L"\uF000" : g_notice.icon == NoticeIcon::ClipboardText
         ? L"\uE9A4" : L"\uE8C8";
     const bool image = CopyClipboardThumbnailPixels(
-        g_clipboardThumbnail, snapshot);
+        g_notice.clipboardThumbnail, snapshot);
     if (image)
         snapshot.kind = xaml_osd::LevelKind::ClipboardImage;
     // XAML owns pixel bytes now. Release the transient GDI thumbnail
@@ -10004,7 +10433,7 @@ void ShowMigratedXamlClipboardNotice() {
         BrightnessEvent empty{};
         MovePopupToDisplay(empty);
         if (!osd_placement::CurrentAnchor(snapshot.anchor)) return;
-        snapshot.scale = g_scale;
+        snapshot.scale = g_panel.scale;
     }
     if (!ShowXamlMirrored(snapshot))
         Wh_Log(L"Fluent OSD/XAML: clipboard notice unavailable; NO GDI+ fallback");
@@ -10061,22 +10490,22 @@ osd_model::MixerModel BuildMixerModel() {
     model.title = Tr(OsdText::VolumeMixer);
     model.outputHeading = Tr(OsdText::AudioOutput);
     model.outputError = Tr(OsdText::AudioSwitchFailed);
-    model.generation = g_xamlMixerGeneration;
-    model.outputExpanded = g_xamlMixerOutputExpanded;
-    model.outputFailed = g_mixerOutputSwitchFailed;
-    model.maxVisibleRows = std::clamp(g_mixerMaxRows.load(), 3, 16);
+    model.generation = g_panel.mixerGeneration;
+    model.outputExpanded = g_panel.mixerOutputExpanded;
+    model.outputFailed = g_mixer.outputSwitchFailed;
+    model.maxVisibleRows = std::clamp(g_config.mixerMaxRows.load(), 3, 16);
     model.selectedOutput = Tr(OsdText::NoAudioOutputs);
-    for (const auto& item : g_mixerOutputOptions) {
-        const bool selected = item.id == g_mixerOutputId;
+    for (const auto& item : g_mixer.outputOptions) {
+        const bool selected = item.id == g_mixer.outputId;
         model.outputs.push_back({item.name, selected});
         if (selected) model.selectedOutput = item.name;
     }
     model.rows.push_back({
         Tr(OsdText::MasterVolume),
         std::clamp(static_cast<int>(
-            std::lround(g_mixerMasterLevel * 100.0f)), 0, 100),
-        g_mixerMasterMuted, static_cast<bool>(g_mixerMaster)});
-    for (const auto& item : g_mixerEntries) {
+            std::lround(g_mixer.masterLevel * 100.0f)), 0, 100),
+        g_mixer.masterMuted, static_cast<bool>(g_mixer.master)});
+    for (const auto& item : g_mixer.entries) {
         if (model.rows.size() >= 129) break;
         osd_model::MixerRow row;
         row.title = item.title;
@@ -10092,35 +10521,35 @@ osd_model::MixerModel BuildMixerModel() {
 
 osd_model::MediaModel BuildXamlMediaModel() {
     osd_model::MediaModel m;
-    m.generation=g_xamlMediaGeneration;
-    m.sessionCount=g_mediaCurrent.sessionCount;
-    m.selectionSerial=g_mediaCurrent.selectionSerial;
-    m.sourceId=g_mediaCurrent.sourceId;
-    m.title=g_mediaCurrent.title.empty()?
-        Tr(OsdText::MediaPlayback):g_mediaCurrent.title;
-    m.artist=g_mediaCurrent.artist;
-    if (g_showMediaArtwork.load())
-        m.encodedArtwork.assign(g_mediaCurrent.artwork.begin(),
-                                g_mediaCurrent.artwork.end());
-    m.playing=g_mediaCurrent.playing;
-    m.canPrevious=g_mediaCurrent.canPrevious;
-    m.canToggle=g_mediaCurrent.canToggle;
-    m.canNext=g_mediaCurrent.canNext;
-    m.canShuffle=g_mediaCurrent.canShuffle;
-    m.shuffleKnown=g_mediaCurrent.shuffleKnown;
-    m.shuffleActive=g_mediaCurrent.shuffleActive;
-    m.canRepeat=g_mediaCurrent.canRepeat;
-    m.repeatMode=g_mediaCurrent.repeatMode;
-    m.hasTimeline=g_mediaCurrent.hasTimeline;
-    m.canSeek=g_mediaCurrent.canSeek;
-    m.start=g_mediaCurrent.timelineStart;
-    m.end=g_mediaCurrent.timelineEnd;
-    m.position=g_mediaCurrent.timelinePosition;
-    m.observedTick=g_mediaCurrent.timelineObservedTick;
-    m.controlSizePercent=g_mediaControlSizePercent.load();
-    m.squareButtons=g_controlButtonSquare.load();
-    m.buttonCornerRadius=g_controlButtonCornerRadius.load();
-    if(!g_showMediaControls.load()) {
+    m.generation=g_panel.mediaGeneration;
+    m.sessionCount=g_media.current.sessionCount;
+    m.selectionSerial=g_media.current.selectionSerial;
+    m.sourceId=g_media.current.sourceId;
+    m.title=g_media.current.title.empty()?
+        Tr(OsdText::MediaPlayback):g_media.current.title;
+    m.artist=g_media.current.artist;
+    if (g_config.showMediaArtwork.load())
+        m.encodedArtwork.assign(g_media.current.artwork.begin(),
+                                g_media.current.artwork.end());
+    m.playing=g_media.current.playing;
+    m.canPrevious=g_media.current.canPrevious;
+    m.canToggle=g_media.current.canToggle;
+    m.canNext=g_media.current.canNext;
+    m.canShuffle=g_media.current.canShuffle;
+    m.shuffleKnown=g_media.current.shuffleKnown;
+    m.shuffleActive=g_media.current.shuffleActive;
+    m.canRepeat=g_media.current.canRepeat;
+    m.repeatMode=g_media.current.repeatMode;
+    m.hasTimeline=g_media.current.hasTimeline;
+    m.canSeek=g_media.current.canSeek;
+    m.start=g_media.current.timelineStart;
+    m.end=g_media.current.timelineEnd;
+    m.position=g_media.current.timelinePosition;
+    m.observedTick=g_media.current.timelineObservedTick;
+    m.controlSizePercent=g_config.mediaControlSizePercent.load();
+    m.squareButtons=g_config.controlButtonSquare.load();
+    m.buttonCornerRadius=g_config.controlButtonCornerRadius.load();
+    if(!g_config.showMediaControls.load()) {
         m.canPrevious=m.canToggle=m.canNext=false;
         m.canShuffle=m.canRepeat=false;
     }
@@ -10133,15 +10562,15 @@ bool BuildAttachedPanelAnchors(
     MONITORINFO mi{sizeof(mi)};
     if (!GetMonitorInfoW(MonitorFromRect(&main,
             MONITOR_DEFAULTTONEAREST), &mi)) return false;
-    const bool vertical = g_verticalVolumeBrightness.load();
+    const bool vertical = g_config.verticalVolumeBrightness.load();
     const int mw = main.right - main.left, mh = main.bottom - main.top;
     const int pw = vertical ? static_cast<int>(std::lround(
-        (isMedia?g_verticalSmtcWidth.load():
-                 g_verticalMixerWidth.load())*scale)) : mw;
+        (isMedia?g_config.verticalSmtcWidth.load():
+                 g_config.verticalMixerWidth.load())*scale)) : mw;
     const int ph = vertical ? mh : static_cast<int>(std::lround(
-        (isMedia?g_horizontalSmtcHeight.load():
-                 g_horizontalMixerHeight.load())*scale));
-    const int position = g_position.load();
+        (isMedia?g_config.horizontalSmtcHeight.load():
+                 g_config.horizontalMixerHeight.load())*scale));
+    const int position = g_config.position.load();
     const auto direction = DirectionForPopup(main, mi.rcWork,
                                              position, vertical);
     auto attachment = GetPanelAttachment(vertical, direction, scale,
@@ -10186,21 +10615,21 @@ bool BuildMediaPanelAnchors(RECT& main,RECT& panel,float scale) {
     return BuildAttachedPanelAnchors(main,panel,scale,true);
 }
 bool ShowXamlMediaPanel(bool passiveRefresh) {
-    if(g_xamlMixerOpen||!g_showSmtcOnVolume.load()||
-       !g_mediaCurrent.available) return false;
+    if(g_panel.mixerOpen||!g_config.showSmtcOnVolume.load()||
+       !g_media.current.available) return false;
     RECT main{},panel{};
-    if(!BuildMediaPanelAnchors(main,panel,g_scale)) return false;
+    if(!BuildMediaPanelAnchors(main,panel,g_panel.scale)) return false;
     PrepareXamlCategory();
-    auto volume=MakeXamlSnapshot(PopupKind::NativeVolume,main,g_scale);
+    auto volume=MakeXamlSnapshot(PopupKind::NativeVolume,main,g_panel.scale);
     volume.durationMs=OsdDuration(DurationKind::Media);
     volume.passiveRefresh=passiveRefresh;
     if(volume.mixerChevron) {
         RECT pairedMain{},pairedPanel{};
-        if(BuildMixerPanelAnchors(pairedMain,pairedPanel,g_scale))
+        if(BuildMixerPanelAnchors(pairedMain,pairedPanel,g_panel.scale))
             volume.mixerDirection=osd_layout::MixerChevronDirection(
                 pairedMain,pairedPanel,volume.vertical,false);
     }
-    auto media=MakeXamlSnapshot(PopupKind::NativeVolume,panel,g_scale);
+    auto media=MakeXamlSnapshot(PopupKind::NativeVolume,panel,g_panel.scale);
     media.kind=osd_model::Kind::Media;
     media.mixerChevron=false;
     media.durationMs=OsdDuration(DurationKind::Media);
@@ -10211,29 +10640,29 @@ bool ShowXamlMediaPanel(bool passiveRefresh) {
         ResetXamlMediaController();
         return false;
     }
-    g_xamlMediaOpen=true;
-    if(g_receiveWnd)
-        SetTimer(g_receiveWnd,kMediaAnimationTimer,
+    g_panel.mediaOpen=true;
+    if(g_module.receiveWnd)
+        SetTimer(g_module.receiveWnd,kMediaAnimationTimer,
                  kMediaAnimationIntervalMs,nullptr);
     return true;
 }
 void ShowXamlMixerPanel() {
-    if (!g_xamlMixerOpen) return;
+    if (!g_panel.mixerOpen) return;
     RECT main{}, panel{};
-    if (!BuildMixerPanelAnchors(main, panel, g_scale)) {
+    if (!BuildMixerPanelAnchors(main, panel, g_panel.scale)) {
         Wh_Log(L"XAML Mixer: missing calculated placement");
         ResetXamlMixerController();
         return;
     }
     PrepareXamlCategory();
     auto volume = MakeXamlSnapshot(
-        PopupKind::NativeVolume, main, g_scale);
-    volume.mixerChevron = g_showMixerArrow.load();
+        PopupKind::NativeVolume, main, g_panel.scale);
+    volume.mixerChevron = g_config.showMixerArrow.load();
     volume.mixerDirection = osd_layout::MixerChevronDirection(
         main, panel, volume.vertical, true);
     volume.durationMs = OsdDuration(DurationKind::Interactive);
     auto mixer = MakeXamlSnapshot(
-        PopupKind::NativeVolume, panel, g_scale);
+        PopupKind::NativeVolume, panel, g_panel.scale);
     mixer.kind = osd_model::Kind::Mixer;
     mixer.anchor = panel;
     mixer.durationMs = OsdDuration(DurationKind::Interactive);
@@ -10248,18 +10677,13 @@ void ShowXamlMixerPanel() {
 void ShowNativeVolumePopup() {
     BrightnessEvent event{};
     MovePopupToDisplay(event);
-    if (g_showSmtcOnVolume.load() && !g_xamlMixerOpen) RequestMedia();
-    if (g_xamlMixerOpen) ShowXamlMixerPanel();
+    if (g_config.showSmtcOnVolume.load() && !g_panel.mixerOpen) RequestMedia();
+    if (g_panel.mixerOpen) ShowXamlMixerPanel();
     else ShowMigratedXamlLevel(PopupKind::NativeVolume);
 }
 
 // Imperative control boundary: returns refresh intents instead of drawing.
 // Every hardware target keeps its existing identity and async write behavior.
-struct PendingDdcWrite {
-    BrightnessEvent event{};
-    DWORD previousValue = 0, generation = 0;
-};
-std::vector<PendingDdcWrite> g_pendingDdcWrites; // UI thread only.
 struct ControlEffects {
     bool volume = false, nativeBrightness = false, ddc = false;
     bool mixer = false, notice = false;
@@ -10267,68 +10691,68 @@ struct ControlEffects {
 ControlEffects ApplyOsdCommands(
         const std::vector<osd_control::Command>& commands) {
     ControlEffects effects;
-    if (g_closing.load()) return effects;
+    if (g_module.closing.load()) return effects;
     for (const auto& cmd : commands) {
         if (cmd.target == osd_control::Target::Notice) {
             if (cmd.action == osd_control::Action::ToggleNoticeDetails &&
-                g_popupKind == PopupKind::Notification &&
-                g_noticeIcon != NoticeIcon::Clipboard &&
-                g_noticeIcon != NoticeIcon::ClipboardFile &&
-                g_noticeIcon != NoticeIcon::ClipboardText &&
-                g_noticeDetails.size() > 1 &&
-                cmd.generation == g_noticeGeneration) {
-                g_noticePanelOpen = !g_noticePanelOpen;
+                g_presentation.popupKind == PopupKind::Notification &&
+                g_notice.icon != NoticeIcon::Clipboard &&
+                g_notice.icon != NoticeIcon::ClipboardFile &&
+                g_notice.icon != NoticeIcon::ClipboardText &&
+                g_notice.details.size() > 1 &&
+                cmd.generation == g_notice.generation) {
+                g_notice.panelOpen = !g_notice.panelOpen;
                 effects.notice = true;
             }
             continue;
         }
         if(cmd.target==osd_control::Target::Media) {
-            if(!g_xamlMediaOpen||
-               cmd.generation!=g_xamlMediaGeneration) continue;
+            if(!g_panel.mediaOpen||
+               cmd.generation!=g_panel.mediaGeneration) continue;
             if(cmd.action==osd_control::Action::CloseMedia) {
                 ResetXamlMediaController();
                 continue;
             }
             if(cmd.index!=static_cast<int>(
-                    g_mediaCurrent.selectionSerial)) continue;
+                    g_media.current.selectionSerial)) continue;
             if(cmd.action==osd_control::Action::MediaAction) {
                 if(cmd.value>=1&&cmd.value<=7&&cmd.value!=4)
                     RequestMedia(cmd.value);
             } else if(cmd.action==osd_control::Action::MediaSeek&&
-                      g_mediaCurrent.canSeek&&g_mediaCurrent.hasTimeline&&
-                      g_mediaCurrent.timelineEnd>g_mediaCurrent.timelineStart) {
+                      g_media.current.canSeek&&g_media.current.hasTimeline&&
+                      g_media.current.timelineEnd>g_media.current.timelineStart) {
                 RequestMedia(4,std::clamp(cmd.mediaPosition,
-                    g_mediaCurrent.timelineStart,
-                    g_mediaCurrent.timelineEnd));
+                    g_media.current.timelineStart,
+                    g_media.current.timelineEnd));
             }
             continue;
         }
         if (cmd.target == osd_control::Target::Mixer) {
             if (cmd.action == osd_control::Action::OpenMixer) {
-                if (g_xamlMixerOpen) {
+                if (g_panel.mixerOpen) {
                     ResetXamlMixerController();
-                } else if (g_showMixerArrow.load() &&
-                           g_popupKind == PopupKind::NativeVolume) {
+                } else if (g_config.showMixerArrow.load() &&
+                           g_presentation.popupKind == PopupKind::NativeVolume) {
                     ResetXamlMediaController();
                     
-                    g_xamlMixerOutputExpanded = false;
+                    g_panel.mixerOutputExpanded = false;
                     RefreshMixer();
                     StartMixerOutputNotifications();
-                    g_xamlMixerOpen = true;
+                    g_panel.mixerOpen = true;
                 }
                 effects.mixer = true;
                 continue;
             }
             if (cmd.action == osd_control::Action::CloseMixer) {
-                if (g_xamlMixerOpen &&
-                    cmd.generation == g_xamlMixerGeneration) {
+                if (g_panel.mixerOpen &&
+                    cmd.generation == g_panel.mixerGeneration) {
                     ResetXamlMixerController();
                     effects.mixer = true;
                 }
                 continue;
             }
-            if (!g_xamlMixerOpen ||
-                cmd.generation != g_xamlMixerGeneration) continue;
+            if (!g_panel.mixerOpen ||
+                cmd.generation != g_panel.mixerGeneration) continue;
             switch (cmd.action) {
                 case osd_control::Action::MixerSetPercent:
                     (void)SetMixerPercent(cmd.index, cmd.value);
@@ -10339,21 +10763,21 @@ ControlEffects ApplyOsdCommands(
                     effects.mixer = true;
                     break;
                 case osd_control::Action::MixerToggleOutput:
-                    if (!g_xamlMixerOutputExpanded) {
+                    if (!g_panel.mixerOutputExpanded) {
                         RefreshMixer(); // Reconcile current endpoints.
-                        g_xamlMixerOutputExpanded =
-                            !g_mixerOutputOptions.empty();
+                        g_panel.mixerOutputExpanded =
+                            !g_mixer.outputOptions.empty();
                     } else {
-                        g_xamlMixerOutputExpanded = false;
+                        g_panel.mixerOutputExpanded = false;
                     }
                     effects.mixer = true;
                     break;
                 case osd_control::Action::MixerSelectOutput:
                     if (cmd.index >= 0 &&
                         cmd.index < static_cast<int>(
-                            g_mixerOutputOptions.size())) {
+                            g_mixer.outputOptions.size())) {
                         SelectMixerOutput(cmd.index);
-                        g_xamlMixerOutputExpanded = false;
+                        g_panel.mixerOutputExpanded = false;
                         effects.mixer = true;
                     }
                     break;
@@ -10362,7 +10786,7 @@ ControlEffects ApplyOsdCommands(
             continue;
         }
         if (cmd.target == osd_control::Target::Volume) {
-            if (g_popupKind != PopupKind::NativeVolume) continue;
+            if (g_presentation.popupKind != PopupKind::NativeVolume) continue;
             bool ok = false;
             if (cmd.action == osd_control::Action::ToggleMute)
                 ok = ToggleDefaultAudioMute();
@@ -10373,39 +10797,39 @@ ControlEffects ApplyOsdCommands(
             if (ok) effects.volume = true;
             continue;
         }
-        if (!g_wheelWriteWake) continue;
+        if (!g_writer.ReadyForCommands()) continue;
 
         if (cmd.target == osd_control::Target::NativeBrightness) {
-            if (g_popupKind != PopupKind::NativeBrightness ||
-                !g_nativePercentKnown) continue;
+            if (g_presentation.popupKind != PopupKind::NativeBrightness ||
+                !g_presentation.nativePercentKnown) continue;
             if (cmd.action == osd_control::Action::ToggleMute) continue;
             const int requested = cmd.action == osd_control::Action::Wheel
-                ? g_nativePercent + (cmd.value / WHEEL_DELTA) * kWheelStepPercent
+                ? g_presentation.nativePercent + (cmd.value / WHEEL_DELTA) * kWheelStepPercent
                 : cmd.value;
             const int percent = std::clamp(requested, 0, 100);
-            if (percent == g_nativePercent) continue;
+            if (percent == g_presentation.nativePercent) continue;
             BrightnessWheelTask task{};
             task.native = true;
             task.value = percent;
-            task.generation = ++g_wheelWriteGeneration;
-            if (g_lastConfirmedNativeBrightness < 0)
-                g_lastConfirmedNativeBrightness = g_nativePercent;
-            g_nativePercent = percent;
+            task.generation = ++g_writer.generation;
+            if (g_ddc.lastConfirmedNative < 0)
+                g_ddc.lastConfirmedNative = g_presentation.nativePercent;
+            g_presentation.nativePercent = percent;
             QueueBrightnessWheelTask(task);
             effects.nativeBrightness = true;
             continue;
         }
 
         if (cmd.target != osd_control::Target::DdcBrightness ||
-            g_popupKind != PopupKind::DdcBrightness ||
+            g_presentation.popupKind != PopupKind::DdcBrightness ||
             cmd.action == osd_control::Action::ToggleMute) continue;
         const auto selected = std::find_if(
-            g_ddcTargets.begin(), g_ddcTargets.end(),
+            g_ddc.targets.begin(), g_ddc.targets.end(),
             [&](const DdcTargetState& target) {
                 return target.event.physicalIndex == cmd.physicalIndex &&
                     _wcsicmp(target.event.device, cmd.device) == 0;
             });
-        if (selected == g_ddcTargets.end()) continue;
+        if (selected == g_ddc.targets.end()) continue;
         auto& event = selected->event;
         if (event.maximum <= event.minimum) continue; // Unknown range.
         // Keep the actively edited physical target in the XAML batch.
@@ -10425,23 +10849,12 @@ ControlEffects ApplyOsdCommands(
         BrightnessWheelTask task{};
         task.monitor = event;  // Exact display + physical index.
         task.value = static_cast<int>(raw);
-        task.generation = ++g_wheelWriteGeneration;
-        auto pending = std::find_if(
-            g_pendingDdcWrites.begin(), g_pendingDdcWrites.end(),
-            [&](const PendingDdcWrite& item) {
-                return item.event.physicalIndex == event.physicalIndex &&
-                    _wcsicmp(item.event.device, event.device) == 0;
-            });
-        if (pending == g_pendingDdcWrites.end()) {
-            if (g_pendingDdcWrites.size() >= kMaxDdcTargets)
-                g_pendingDdcWrites.erase(g_pendingDdcWrites.begin());
-            g_pendingDdcWrites.push_back(
-                {event, event.value, task.generation});
-        } else pending->generation = task.generation;
+        task.generation = ++g_writer.generation;
+        g_ddc.RememberPendingWriteOnControllerThread(event, task.generation);
         event.value = raw;
-        if (g_visible.physicalIndex == event.physicalIndex &&
-            _wcsicmp(g_visible.device, event.device) == 0)
-            g_visible.value = raw;
+        if (g_presentation.visible.physicalIndex == event.physicalIndex &&
+            _wcsicmp(g_presentation.visible.device, event.device) == 0)
+            g_presentation.visible.value = raw;
         QueueBrightnessWheelTask(task);
         effects.ddc = true;
     }
@@ -10474,9 +10887,9 @@ bool IsShellInputSiteReady() {
 }
 
 void TryStartXamlAfterShellInputSite(HWND receiver) {
-    if (!receiver || g_closing.load(std::memory_order_acquire) ||
-        g_shellXamlStarted || !IsShellInputSiteReady()) return;
-    g_shellXamlStarted = true;
+    if (!receiver || g_module.closing.load(std::memory_order_acquire) ||
+        g_module.shellXamlStarted || !IsShellInputSiteReady()) return;
+    g_module.shellXamlStarted = true;
     Wh_Log(L"Fluent OSD: Shell InputSite hierarchy ready; starting XAML");
     xaml_osd::Start();
 }
@@ -10496,7 +10909,7 @@ HWND WINAPI ShellCreateWindowInBandHook(
     HWND created = g_createWindowInBandOriginal(
         exStyle, className, title, style, x, y, width, height,
         parent, menu, instance, param, band);
-    if (!created || g_closing.load(std::memory_order_acquire))
+    if (!created || g_module.closing.load(std::memory_order_acquire))
         return created;
     // lpClassName may contain a 16-bit ATOM. Do not dereference an ATOM.
     if ((reinterpret_cast<ULONG_PTR>(className) &
@@ -10505,9 +10918,10 @@ HWND WINAPI ShellCreateWindowInBandHook(
         return created;
 
     // If the controller does not yet exist, its one-time snapshot after
-    // window creation covers this early event. The receiver is atomic.
-    HWND receiver = g_networkReceiver.load(std::memory_order_acquire);
-    if (receiver && !g_closing.load(std::memory_order_acquire))
+    // window creation covers this early event. The receiver is published
+    // atomically for callbacks, not read from controller-thread state.
+    const HWND receiver = g_module.ReceiverForCallbacks();
+    if (receiver)
         (void)PostMessageW(receiver, kShellInputSiteReadyMessage, 0, 0);
     return created;
 }
@@ -10531,19 +10945,19 @@ void HookShellInputSiteCreation() {
 }
 
 LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (hwnd == g_receiveWnd && msg == kShellInputSiteReadyMessage) {
+    if (hwnd == g_module.receiveWnd && msg == kShellInputSiteReadyMessage) {
         TryStartXamlAfterShellInputSite(hwnd);
         return 0;
     }
-    if (hwnd == g_receiveWnd && msg == osd_control::kMessage) {
+    if (hwnd == g_module.receiveWnd && msg == osd_control::kMessage) {
         const auto commands = osd_control::Drain();
         // Event routing owns the active-backend policy; hardware execution
         // does not read an XAML feature flag or depend on renderer types.
         {
             const auto effects = ApplyOsdCommands(commands);
             if (effects.mixer ||
-                (effects.volume && g_xamlMixerOpen)) {
-                if (g_xamlMixerOpen) ShowXamlMixerPanel();
+                (effects.volume && g_panel.mixerOpen)) {
+                if (g_panel.mixerOpen) ShowXamlMixerPanel();
                 else ShowMigratedXamlLevel(PopupKind::NativeVolume);
             } else if (effects.volume) {
                 ShowMigratedXamlLevel(PopupKind::NativeVolume);
@@ -10551,133 +10965,128 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (effects.nativeBrightness)
                 ShowMigratedXamlLevel(PopupKind::NativeBrightness);
             if (effects.ddc)
-                (void)ShowXamlDdcTargets(g_visible);
+                (void)ShowXamlDdcTargets(g_presentation.visible);
             if (effects.notice)
-                ShowMigratedXamlDeviceNotice(g_noticeDuration);
+                ShowMigratedXamlDeviceNotice(g_notice.duration);
         }
         return 0;
     }
-    if (hwnd == g_receiveWnd && msg == WM_TIMER && wp == kEventBatchTimer) {
+    if (hwnd == g_module.receiveWnd && msg == WM_TIMER && wp == kEventBatchTimer) {
         FlushNoticeBatch();
         return 0;
     }
-    if (hwnd == g_receiveWnd && msg == WM_TIMER && wp == kDdcBatchTimer) {
+    if (hwnd == g_module.receiveWnd && msg == WM_TIMER && wp == kDdcBatchTimer) {
         KillTimer(hwnd, kDdcBatchTimer);
         DisplayDdcBatch();
         return 0;
     }
-    if (hwnd == g_receiveWnd && msg == WM_TIMER &&
+    if (hwnd == g_module.receiveWnd && msg == WM_TIMER &&
         wp == kMediaAnimationTimer) {
-        if (!g_xamlMediaOpen || !xaml_osd::IsPrimaryVisible()) {
+        if (!g_panel.mediaOpen || !xaml_osd::IsPrimaryVisible()) {
             KillTimer(hwnd, kMediaAnimationTimer);
             return 0;
         }
         const uint64_t now = GetTickCount64();
-        if (now - g_mediaLastRefreshTick >= kMediaRefreshIntervalMs) {
-            g_mediaLastRefreshTick = now;
+        if (now - g_media.lastRefreshTick >= kMediaRefreshIntervalMs) {
+            g_media.lastRefreshTick = now;
             RequestMedia();
         }
         return 0;
     }
-    if (hwnd == g_receiveWnd && msg == WM_CLIPBOARDUPDATE) {
+    if (hwnd == g_module.receiveWnd && msg == WM_CLIPBOARDUPDATE) {
         ProcessClipboard();
         return 0;
     }
-    if (hwnd == g_receiveWnd && msg == WM_DEVICECHANGE) {
+    if (hwnd == g_module.receiveWnd && msg == WM_DEVICECHANGE) {
         if (HandleDeviceChange(wp, lp)) return TRUE;
     }
-    if (hwnd == g_receiveWnd && msg == kBluetoothQueueMessage) {
+    if (hwnd == g_module.receiveWnd && msg == kBluetoothQueueMessage) {
         bt_monitor::Drain();
         return 0;
     }
-    if (hwnd == g_receiveWnd && msg == kBluetoothConfigMessage) {
-        if (g_showBluetoothEvents.load()) bt_monitor::Start();
+    if (hwnd == g_module.receiveWnd && msg == kBluetoothConfigMessage) {
+        if (g_config.showBluetoothEvents.load()) bt_monitor::Start();
         else bt_monitor::Stop();
         return 0;
     }
-    if (hwnd == g_receiveWnd && msg == kNetworkNoticeMessage) {
-        if (!g_showNetworkEvents.load()) return 0;
-        if (!g_networkRefreshPending) {
-            ResetNetworkRefreshState();
-            g_networkRefreshPending = true;
+    if (hwnd == g_module.receiveWnd && msg == kNetworkNoticeMessage) {
+        if (!g_config.showNetworkEvents.load()) return 0;
+        if (!g_network.refreshPending) {
+            g_network.ResetRefresh();
+            g_network.refreshPending = true;
         }
         if (wp == 1) {
-            g_networkHintPending = true;
-            g_networkHintLevel = static_cast<int>(lp);
+            g_network.hintPending = true;
+            g_network.hintLevel = static_cast<int>(lp);
         }
-        g_networkRefreshSecondPass = false;
+        g_network.refreshSecondPass = false;
         if (!SetTimer(hwnd, kNetworkRefreshTimer, kNetworkDebounceMs, nullptr)) {
             Wh_Log(L"Fluent OSD/network: debounce timer unavailable (%lu)",
                    GetLastError());
-            g_networkSawInterfaceTransition |= CaptureNetworkEvents();
+            g_network.sawInterfaceTransition |= CaptureNetworkEvents();
             FinishNetworkRefresh();
         }
         return 0;
     }
-    if (hwnd == g_receiveWnd && msg == WM_TIMER &&
+    if (hwnd == g_module.receiveWnd && msg == WM_TIMER &&
         wp == kNetworkRefreshTimer) {
         KillTimer(hwnd, kNetworkRefreshTimer);
-        if (!g_showNetworkEvents.load()) {
-            ResetNetworkRefreshState();
+        if (!g_config.showNetworkEvents.load()) {
+            g_network.ResetRefresh();
             return 0;
         }
-        g_networkSawInterfaceTransition |= CaptureNetworkEvents();
-        if (!g_networkRefreshSecondPass) {
-            g_networkRefreshSecondPass = true;
+        g_network.sawInterfaceTransition |= CaptureNetworkEvents();
+        if (!g_network.refreshSecondPass) {
+            g_network.refreshSecondPass = true;
             if (SetTimer(hwnd, kNetworkRefreshTimer, kNetworkSettleMs, nullptr))
                 return 0;
         }
         FinishNetworkRefresh();
         return 0;
     }
-    if (hwnd == g_receiveWnd && msg == kNetworkConfigMessage) {
-        const bool enabled = g_showNetworkEvents.load();
-        if (enabled && !g_networkUiSettingEnabled) {
+    if (hwnd == g_module.receiveWnd && msg == kNetworkConfigMessage) {
+        const bool enabled = g_config.showNetworkEvents.load();
+        if (enabled && !g_network.uiSettingEnabled) {
             CaptureNetworkBaseline();
             RefreshNetworkHintBaseline();
         }
         if (!enabled) {
             KillTimer(hwnd, kNetworkRefreshTimer);
-            ResetNetworkRefreshState();
+            g_network.ResetRefresh();
         }
-        g_networkUiSettingEnabled = enabled;
+        g_network.uiSettingEnabled = enabled;
         return 0;
     }
-    if (msg == kNativeExtraMessage && hwnd == g_receiveWnd) {
-        NativeEventInfo received;
-        AcquireSRWLockExclusive(&g_nativeEventLock);
-        received = std::move(g_nativeEventPending);
-        g_nativeEventPending = NativeEventInfo{};
-        g_nativeEventPosted = false;
-        ReleaseSRWLockExclusive(&g_nativeEventLock);
+    if (msg == kNativeExtraMessage && hwnd == g_module.receiveWnd) {
+        NativeEventInfo received = g_nativeMailbox.Take();
         if (!ShowCustomNative(received.kind)) return 0;
         
-        g_nativeEventCurrent = std::move(received);
-        g_popupKind = PopupKind::NativeEvent;
+        g_presentation.nativeEventCurrent = std::move(received);
+        g_presentation.popupKind = PopupKind::NativeEvent;
         BrightnessEvent ev{};
         MovePopupToDisplay(ev);
         ShowMigratedXamlNativeEvent();
         return 0;
     }
-    if (msg == kNativeOsdMessage && hwnd == g_receiveWnd) {
+    if (msg == kNativeOsdMessage && hwnd == g_module.receiveWnd) {
         const Kind kind = static_cast<Kind>(wp);
         if (kind != Kind::Volume && kind != Kind::Brightness)
             return 0;
         if (!ShowCustomNative(kind)) return 0;
-        g_popupKind = kind == Kind::Volume ?
+        g_presentation.popupKind = kind == Kind::Volume ?
             PopupKind::NativeVolume : PopupKind::NativeBrightness;
-        g_nativePercent = static_cast<int>(lp);
+        g_presentation.nativePercent = static_cast<int>(lp);
         if (kind == Kind::Brightness)
-            g_lastConfirmedNativeBrightness = g_nativePercent;
-        g_nativePercentKnown = g_nativePercent >= 0 && g_nativePercent <= 100;
-        g_nativeMuted = false;
+            g_ddc.lastConfirmedNative = g_presentation.nativePercent;
+        g_presentation.nativePercentKnown = g_presentation.nativePercent >= 0 && g_presentation.nativePercent <= 100;
+        g_presentation.nativeMuted = false;
         if (kind == Kind::Volume) {
             int actual = 0;
             bool mute = false;
             if (ReadDefaultAudioVolume(actual, mute)) {
-                g_nativePercent = actual;
-                g_nativePercentKnown = true;
-                g_nativeMuted = mute;
+                g_presentation.nativePercent = actual;
+                g_presentation.nativePercentKnown = true;
+                g_presentation.nativeMuted = mute;
             }
             ShowNativeVolumePopup();
         } else {
@@ -10687,22 +11096,19 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    if (msg == kAudioRefreshMessage && hwnd == g_receiveWnd) {
-        if (g_mixerNotify) g_mixerNotify->ClearPending();
-        if (g_xamlMixerOpen && !g_closing.load()) {
+    if (msg == kAudioRefreshMessage && hwnd == g_module.receiveWnd) {
+        if (g_mixer.notify) g_mixer.notify->ClearPending();
+        if (g_panel.mixerOpen && !g_module.closing.load()) {
             RefreshMixer();
             ShowXamlMixerPanel();
         }
         return 0;
     }
-    if (msg == kMediaUpdateMessage && hwnd == g_receiveWnd) {
-        AcquireSRWLockShared(&g_mediaLock);
-        g_mediaCurrent = g_mediaPending;
-        ReleaseSRWLockShared(&g_mediaLock);
-        g_mediaLastRefreshTick = GetTickCount64();
-        if (g_popupKind == PopupKind::NativeVolume &&
-            !g_xamlMixerOpen && xaml_osd::IsPrimaryVisible()) {
-            if(g_mediaCurrent.available&&g_showSmtcOnVolume.load())
+    if (msg == kMediaUpdateMessage && hwnd == g_module.receiveWnd) {
+        g_media.ConsumeOnControllerThread();
+        if (g_presentation.popupKind == PopupKind::NativeVolume &&
+            !g_panel.mixerOpen && xaml_osd::IsPrimaryVisible()) {
+            if(g_media.current.available&&g_config.showSmtcOnVolume.load())
                 (void)ShowXamlMediaPanel(true);
             else {
                 ResetXamlMediaController();
@@ -10711,70 +11117,63 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    if (msg == kLockToggleMessage && hwnd == g_receiveWnd) {
+    if (msg == kLockToggleMessage && hwnd == g_module.receiveWnd) {
         int index = static_cast<int>(wp);
-        if (index < 0 || index >= 4 || !g_showLockKeys[index].load()) return 0;
+        if (index < 0 || index >= 4 || !g_config.showLockKeys[index].load()) return 0;
         
-        g_lastLock = index;
-        g_lastLockValue = lp != 0;
-        g_popupKind = PopupKind::LockStatus;
+        g_keys.last = index;
+        g_keys.lastValue = lp != 0;
+        g_presentation.popupKind = PopupKind::LockStatus;
         BrightnessEvent ev{};
         MovePopupToDisplay(ev);
         ShowMigratedXamlLockStatus();
         return 0;
     }
-    if (msg == kBrightnessWheelResultMessage && hwnd == g_receiveWnd) {
+    if (msg == kBrightnessWheelResultMessage && hwnd == g_module.receiveWnd) {
         const DWORD generation = static_cast<DWORD>(wp);
         const bool success = (lp & 1) != 0;
         const bool native = (lp & 2) != 0;
         if (!native) {
-            const auto pending = std::find_if(
-                g_pendingDdcWrites.begin(),
-                g_pendingDdcWrites.end(),
-                [generation](const PendingDdcWrite& item) {
-                    return item.generation == generation;
-                });
-            if (pending == g_pendingDdcWrites.end())
+            DdcRuntimeState::PendingWrite write{};
+            if (!g_ddc.TakePendingWriteOnControllerThread(generation, write))
                 return 0; // Superseded DDC write: never roll back its target.
-            const PendingDdcWrite write = *pending;
-            g_pendingDdcWrites.erase(pending);
             const auto target = std::find_if(
-                g_ddcTargets.begin(), g_ddcTargets.end(),
+                g_ddc.targets.begin(), g_ddc.targets.end(),
                 [&](const DdcTargetState& item) {
                     return item.event.physicalIndex ==
                             write.event.physicalIndex &&
                         _wcsicmp(item.event.device,
                                 write.event.device) == 0;
                 });
-            const bool master = g_visible.physicalIndex ==
+            const bool master = g_presentation.visible.physicalIndex ==
                     write.event.physicalIndex &&
-                _wcsicmp(g_visible.device, write.event.device) == 0;
+                _wcsicmp(g_presentation.visible.device, write.event.device) == 0;
             if (!success) {
-                if (target != g_ddcTargets.end())
+                if (target != g_ddc.targets.end())
                     target->event.value = write.previousValue;
-                if (master) g_visible.value = write.previousValue;
+                if (master) g_presentation.visible.value = write.previousValue;
                 Wh_Log(L"Fluent OSD/XAML: DDC write failed for '%s' index %lu",
                     write.event.device, write.event.physicalIndex);
-                if (g_popupKind == PopupKind::DdcBrightness)
-                    (void)ShowXamlDdcTargets(g_visible);
-            } else if (master && target != g_ddcTargets.end()) {
-                g_lastConfirmedDdcBrightness = target->event.value;
+                if (g_presentation.popupKind == PopupKind::DdcBrightness)
+                    (void)ShowXamlDdcTargets(g_presentation.visible);
+            } else if (master && target != g_ddc.targets.end()) {
+                g_ddc.lastConfirmedDdc = target->event.value;
             }
             return 0;
         }
-        if (generation != g_wheelWriteGeneration) return 0;
+        if (generation != g_writer.generation) return 0;
         if (native) {
-            if (success) g_lastConfirmedNativeBrightness = g_nativePercent;
-            else if (g_lastConfirmedNativeBrightness >= 0) {
-                g_nativePercent = g_lastConfirmedNativeBrightness;
-                if (g_popupKind == PopupKind::NativeBrightness)
+            if (success) g_ddc.lastConfirmedNative = g_presentation.nativePercent;
+            else if (g_ddc.lastConfirmedNative >= 0) {
+                g_presentation.nativePercent = g_ddc.lastConfirmedNative;
+                if (g_presentation.popupKind == PopupKind::NativeBrightness)
                     ShowMigratedXamlLevel(PopupKind::NativeBrightness);
                 Wh_Log(L"Native brightness wheel write failed; restored value");
             }
         }
         return 0;
     }
-    if (msg == WM_COPYDATA && hwnd == g_receiveWnd) {
+    if (msg == WM_COPYDATA && hwnd == g_module.receiveWnd) {
         auto* cds = reinterpret_cast<const COPYDATASTRUCT*>(lp);
         if (!cds || cds->dwData != kCopyDataTag ||
             cds->cbData != sizeof(BrightnessEvent) || !cds->lpData)
@@ -10786,7 +11185,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (WCHAR ch : ev.device) {
             if (!ch) { terminator = true; break; }
         }
-        if (!terminator || g_closing.load()) return FALSE;
+        if (!terminator || g_module.closing.load()) return FALSE;
         // DDC/CI VCP values are 16-bit. Reject malformed cross-process
         // notices before their values can influence slider geometry.
         if (ev.physicalIndex >= 32 ||
@@ -10797,28 +11196,11 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                   ev.value < ev.minimum || ev.value > ev.maximum)))
             return FALSE;
         // producerPid is descriptive metadata, not sender authentication.
-        if (!g_showDdcBrightness.load()) return TRUE;
-        const bool firstInBatch = !g_ddcBatchPending;
-        // Keep one latest write per GDI target and physical index. Updates
-        // for display 1 must never overwrite display 2's brightness value.
-        auto sameTarget = [&](const BrightnessEvent& existing) {
-            return existing.physicalIndex == ev.physicalIndex &&
-                   _wcsicmp(existing.device, ev.device) == 0;
-        };
-        auto same = std::find_if(g_ddcBatchEvents.begin(),
-                                 g_ddcBatchEvents.end(), sameTarget);
-        if (same != g_ddcBatchEvents.end()) {
-            // Move a refreshed target to the end so the order reflects
-            // real writes: DISPLAY1 -> DISPLAY2 -> DISPLAY1 ends on DISPLAY1.
-            g_ddcBatchEvents.erase(same);
-            g_ddcBatchEvents.push_back(ev);
-        } else if (g_ddcBatchEvents.size() < kMaxDdcTargets) {
-            g_ddcBatchEvents.push_back(ev);
-        }
-        if (g_ddcBatchEvents.empty()) return TRUE;
-        g_ddcBatchPending = true;
+        if (!g_config.showDdcBrightness.load()) return TRUE;
+        // Coalesce by GDI display + physical index, retaining last-write order.
+        const bool firstInBatch = g_ddc.AccumulateOnControllerThread(ev);
         if (firstInBatch &&
-            !SetTimer(g_receiveWnd, kDdcBatchTimer, kDdcBatchDelayMs, nullptr))
+            !SetTimer(g_module.receiveWnd, kDdcBatchTimer, kDdcBatchDelayMs, nullptr))
             DisplayDdcBatch(); // Timer allocation failure must not lose updates.
         return TRUE;
     }
@@ -10843,68 +11225,60 @@ DWORD WINAPI UiThreadProc(void*) {
     if (!RegisterClassExW(&wc)) {
         Wh_Log(L"OSD message receiver registration failed (%lu)",
                GetLastError());
-        if (g_uiReady) SetEvent(g_uiReady);
+        if (g_module.uiReady) SetEvent(g_module.uiReady);
         ReleaseWindowsAccentProvider();
         if (initialized) CoUninitialize();
         return 0;
     }
-    g_receiveWnd = CreateWindowExW(0, kWindowClass, L"", 0,
+    g_module.receiveWnd = CreateWindowExW(0, kWindowClass, L"", 0,
         0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
-    if (g_receiveWnd) {
-        g_networkReceiver.store(g_receiveWnd);
-        g_clipboardListener =
-            AddClipboardFormatListener(g_receiveWnd) != FALSE;
+    if (g_module.receiveWnd) {
+        g_module.PublishReceiver(g_module.receiveWnd);
+        g_module.clipboardListener =
+            AddClipboardFormatListener(g_module.receiveWnd) != FALSE;
         InitDeviceEvents();
         InitNetworkEvents();
     } else {
         Wh_Log(L"OSD message receiver creation failed (%lu)", GetLastError());
     }
     for (int i = 0; i < 4; ++i)
-        g_lockToggle[i] = (GetKeyState(kLockVk[i]) & 1) != 0;
+        g_keys.toggle[i] = (GetKeyState(kLockVk[i]) & 1) != 0;
     HMODULE module = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         reinterpret_cast<PCWSTR>(reinterpret_cast<void*>(LockKeyProc)),
         &module);
-    g_lockHook = SetWindowsHookExW(WH_KEYBOARD_LL, LockKeyProc, module, 0);
-    if (!g_lockHook)
+    g_keys.hook = SetWindowsHookExW(WH_KEYBOARD_LL, LockKeyProc, module, 0);
+    if (!g_keys.hook)
         Wh_Log(L"Lock-key keyboard hook unavailable (%lu)", GetLastError());
     // Single check handles late injection; creation hook handles new InputSites.
-    if (g_receiveWnd) TryStartXamlAfterShellInputSite(g_receiveWnd);
-    if (g_uiReady) SetEvent(g_uiReady);
+    if (g_module.receiveWnd) TryStartXamlAfterShellInputSite(g_module.receiveWnd);
+    if (g_module.uiReady) SetEvent(g_module.uiReady);
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    g_closing.store(true);
-    g_networkReceiver.store(nullptr);
-    if (g_lockHook) { UnhookWindowsHookEx(g_lockHook); g_lockHook = nullptr; }
-    if (g_clipboardListener && g_receiveWnd)
-        RemoveClipboardFormatListener(g_receiveWnd);
-    g_clipboardListener = false;
-    if (g_receiveWnd) {
-        KillTimer(g_receiveWnd, kEventBatchTimer);
-        KillTimer(g_receiveWnd, kDdcBatchTimer);
-        KillTimer(g_receiveWnd, kMediaAnimationTimer);
-        KillTimer(g_receiveWnd, kNetworkRefreshTimer);
+    g_module.BeginShutdown();
+    if (g_keys.hook) { UnhookWindowsHookEx(g_keys.hook); g_keys.hook = nullptr; }
+    if (g_module.clipboardListener && g_module.receiveWnd)
+        RemoveClipboardFormatListener(g_module.receiveWnd);
+    g_module.clipboardListener = false;
+    if (g_module.receiveWnd) {
+        KillTimer(g_module.receiveWnd, kEventBatchTimer);
+        KillTimer(g_module.receiveWnd, kDdcBatchTimer);
+        KillTimer(g_module.receiveWnd, kMediaAnimationTimer);
+        KillTimer(g_module.receiveWnd, kNetworkRefreshTimer);
     }
-    g_ddcBatchPending = false;
-    g_ddcBatchEvents.clear();
-    g_ddcTargets.clear();
-    g_noticeBatch = NoticeBatch{};
-    g_usbNames.clear();
-    ResetNetworkRefreshState();
-    g_networkInterfaces.clear();
+    g_ddc.ClearPendingOnControllerThread();
+    g_notice.ResetBatch();
+    g_notice.usbNames.clear();
+    g_network.ResetRefresh();
+    g_network.interfaces.clear();
     StopDeviceEvents();
     ClearClipboardThumbnail();
-    StopMixerOutputNotifications();
-    CleanupMixerIcons();
-    g_mixerEntries.clear();
-    g_mixerMaster.Reset();
-    g_mixerOutputOptions.clear();
-    g_mixerOutputId.clear();
-    if (g_receiveWnd) DestroyWindow(g_receiveWnd);
-    g_receiveWnd = nullptr;
+    g_mixer.ReleaseStorageOnControllerThread();
+    if (g_module.receiveWnd) DestroyWindow(g_module.receiveWnd);
+    g_module.receiveWnd = nullptr;
     UnregisterClassW(kWindowClass, wc.hInstance);
     ReleaseWindowsAccentProvider();
     if (initialized) CoUninitialize();
@@ -10921,55 +11295,53 @@ BOOL Wh_ModInit() {
     if (!GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe))) return FALSE;
     PCWSTR name = wcsrchr(exe, L'\\');
     name = name ? name + 1 : exe;
-    g_isExplorer = _wcsicmp(name, L"explorer.exe") == 0;
+    g_module.isExplorer = _wcsicmp(name, L"explorer.exe") == 0;
     const bool isTwinkle = _wcsicmp(name, L"Twinkle Tray.exe") == 0;
-    if (!g_isExplorer && !isTwinkle) return FALSE;
+    if (!g_module.isExplorer && !isTwinkle) return FALSE;
     LoadSettings();
-    if (g_isExplorer) {
+    if (g_module.isExplorer) {
         HookNativeOsd();
         HookShellInputSiteCreation();
     }
     HookDdc();
-    Wh_Log(L"Fluent OSD v1.1.1 initialized (%s)", name);
+    Wh_Log(L"Fluent OSD v%s initialized (%s)", WH_MOD_VERSION, name);
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
-    if (!g_isExplorer) return;
-    g_uiReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_uiReady) {
+    if (!g_module.isExplorer) return;
+    g_module.uiReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_module.uiReady) {
         Wh_Log(L"Cannot create UI ready event: %lu", GetLastError());
         return;
     }
-    g_uiThread = CreateThread(nullptr, 0, UiThreadProc, nullptr, 0,
-                              &g_uiThreadId);
-    if (!g_uiThread) {
+    g_module.uiThread = CreateThread(nullptr, 0, UiThreadProc, nullptr, 0,
+                              &g_module.uiThreadId);
+    if (!g_module.uiThread) {
         Wh_Log(L"Cannot start OSD UI thread: %lu", GetLastError());
-        CloseHandle(g_uiReady);
-        g_uiReady = nullptr;
+        CloseHandle(g_module.uiReady);
+        g_module.uiReady = nullptr;
         return;
     }
-    if (WaitForSingleObject(g_uiReady, 1500) != WAIT_OBJECT_0)
+    if (WaitForSingleObject(g_module.uiReady, 1500) != WAIT_OBJECT_0)
         Wh_Log(L"OSD UI initialization did not signal readiness");
-    g_wheelWriteStop.store(false);
-    g_wheelWriteWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (g_wheelWriteWake) {
-        g_wheelWriteThread = CreateThread(nullptr, 0,
+    g_writer.stop.store(false);
+    const HANDLE writerWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_writer.PublishWake(writerWake);
+    if (writerWake) {
+        g_writer.thread = CreateThread(nullptr, 0,
             BrightnessWheelThreadProc, nullptr, 0, nullptr);
-        if (!g_wheelWriteThread) {
-            CloseHandle(g_wheelWriteWake);
-            g_wheelWriteWake = nullptr;
-        }
+        if (!g_writer.thread)
+            g_writer.CloseWakeAfterWorkerStops();
     }
-    g_mediaStop.store(false);
-    g_mediaWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (g_mediaWake) {
-        g_mediaThread = CreateThread(nullptr, 0, MediaThreadProc, nullptr,
+    g_media.stop.store(false);
+    const HANDLE mediaWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_media.PublishWake(mediaWake);
+    if (mediaWake) {
+        g_media.thread = CreateThread(nullptr, 0, MediaThreadProc, nullptr,
                                     0, nullptr);
-        if (!g_mediaThread) {
-            CloseHandle(g_mediaWake);
-            g_mediaWake = nullptr;
-        }
+        if (!g_media.thread)
+            g_media.CloseWakeAfterWorkerStops();
     }
     // XAML starts from the input event or one-time controller snapshot,
     // never directly during Windhawk's AfterInit callback.
@@ -10979,66 +11351,68 @@ void Wh_ModSettingsChanged() {
     LoadSettings();
     // Settings may be called on Windhawk's worker thread. Never bypass the
     // shell-readiness gate when reloading settings during cold startup.
-    HWND target = g_networkReceiver.load(std::memory_order_acquire);
-    if (g_isExplorer && target && !g_closing.load())
+    const HWND target = g_module.ReceiverForCallbacks();
+    if (g_module.isExplorer && target)
         (void)PostMessageW(target, kShellInputSiteReadyMessage, 0, 0);
-    if (g_isExplorer && target && !g_closing.load())
+    if (g_module.isExplorer && target)
         (void)PostMessageW(target, kBluetoothConfigMessage, 0, 0);
-    if (g_isExplorer && target && !g_closing.load())
+    if (g_module.isExplorer && target)
         (void)PostMessageW(target, kNetworkConfigMessage, 0, 0);
     // Refresh the next OSD using the newly selected theme. Settings never
     // force an unexpected brightness write or background monitor read.
 }
 
 void Wh_ModBeforeUninit() {
-    // Prevent callbacks from posting into a receiver that is going away.
-    g_closing.store(true);
-    g_networkReceiver.store(nullptr);
+    // Withdraw the published HWND before joining workers and the controller.
+    g_module.BeginShutdown();
     // WinRT/XAML is STA-owned and must exit before the module unloads.
     xaml_osd::Stop();
     // Stop all worker threads before the UI windows or DLL can be unloaded.
-    g_wheelWriteStop.store(true);
-    if (g_wheelWriteWake) SetEvent(g_wheelWriteWake);
-    if (g_wheelWriteThread) {
-        WaitForSingleObject(g_wheelWriteThread, INFINITE);
-        CloseHandle(g_wheelWriteThread);
-        g_wheelWriteThread = nullptr;
+    g_writer.SignalStop();
+    if (g_writer.thread) {
+        WaitForSingleObject(g_writer.thread, INFINITE);
+        CloseHandle(g_writer.thread);
+        g_writer.thread = nullptr;
     }
-    if (g_wheelWriteWake) {
-        CloseHandle(g_wheelWriteWake);
-        g_wheelWriteWake = nullptr;
-    }
-    g_mediaStop.store(true);
-    if (g_mediaWake) SetEvent(g_mediaWake);
-    if (g_mediaThread) {
+    g_writer.CloseWakeAfterWorkerStops();
+    g_media.SignalStop();
+    if (g_media.thread) {
         // Await completion to guarantee there is no executing code in the
         // Windhawk DLL after unload. The WinRT worker is independent of Explorer.
-        WaitForSingleObject(g_mediaThread, INFINITE);
-        CloseHandle(g_mediaThread);
-        g_mediaThread = nullptr;
+        WaitForSingleObject(g_media.thread, INFINITE);
+        CloseHandle(g_media.thread);
+        g_media.thread = nullptr;
     }
-    if (g_mediaWake) { CloseHandle(g_mediaWake); g_mediaWake = nullptr; }
-    if (g_uiThread) {
+    g_media.CloseWakeAfterWorkerStops();
+    if (g_module.uiThread) {
         // Waiting with a 2.5-second timeout and then unloading could leave
         // this DLL executing on a live UI thread. Join before the unload.
-        PostThreadMessageW(g_uiThreadId, WM_QUIT, 0, 0);
-        WaitForSingleObject(g_uiThread, INFINITE);
-        CloseHandle(g_uiThread);
-        g_uiThread = nullptr;
+        PostThreadMessageW(g_module.uiThreadId, WM_QUIT, 0, 0);
+        WaitForSingleObject(g_module.uiThread, INFINITE);
+        CloseHandle(g_module.uiThread);
+        g_module.uiThread = nullptr;
     }
-    if (g_uiReady) {
-        CloseHandle(g_uiReady);
-        g_uiReady = nullptr;
+    if (g_module.uiReady) {
+        CloseHandle(g_module.uiReady);
+        g_module.uiReady = nullptr;
     }
 }
 
 void Wh_ModUninit() {
-    if (g_confirmatorDll) {
-        FreeLibrary(g_confirmatorDll);
-        g_confirmatorDll = nullptr;
+    // Windhawk removes hooks between BeforeUninit and Uninit. Worker
+    // and receiver threads have also joined, so these no_destroy buffers
+    // can now release their allocations without racing hook callbacks.
+    g_nativeMailbox.ReleaseAfterHooksRemoved();
+    g_ddc.ReleaseAfterHooksRemoved();
+    g_writer.ReleaseStorageAfterWorkerStops();
+    g_media.ReleaseStorageAfterThreadsStop();
+    // Mixer COM objects and containers are released by the UI owner thread.
+    if (g_module.confirmatorDll) {
+        FreeLibrary(g_module.confirmatorDll);
+        g_module.confirmatorDll = nullptr;
     }
-    if (g_ddcDll) {
-        FreeLibrary(g_ddcDll);
-        g_ddcDll = nullptr;
+    if (g_module.ddcDll) {
+        FreeLibrary(g_module.ddcDll);
+        g_module.ddcDll = nullptr;
     }
 }
