@@ -1329,9 +1329,9 @@ Command BuildMedia(const osd_model::Snapshot& source, Action action,
     cmd.index = static_cast<int>(source.media.selectionSerial);
     return cmd;
 }
-void Submit(const Command& cmd, HWND receiver) {
-    if (!receiver || cmd.target == Target::None) return;
-    (void)GetControlState().mailbox.Enqueue(cmd, receiver);
+bool Submit(const Command& cmd, HWND receiver) {
+    if (!receiver || cmd.target == Target::None) return false;
+    return GetControlState().mailbox.Enqueue(cmd, receiver);
 }
 std::vector<Command> Drain() {
     return GetControlState().mailbox.Take();
@@ -1792,6 +1792,8 @@ constexpr UINT_PTR kHideTimer = 683;
 constexpr UINT_PTR kFadeTimer = 684;
 constexpr UINT_PTR kStatusLineTimer = 685;
 constexpr UINT_PTR kMediaProgressTimer = 686;
+// UI feedback is immediate; authoritative SMTC snapshots reconcile within this window.
+constexpr ULONGLONG kMediaOptimisticHoldMs = 2200;
 constexpr double kOffLineRatio = .35;
 constexpr DWORD kStatusLineAnimationMs = 220;
 constexpr int kWidth = 354, kHeight = 49; // Default horizontal card pixels.
@@ -1958,8 +1960,11 @@ struct MixerRowVisual {
 // STA-only visual references are grouped by feature. Every sub-state releases
 // WinRT controls before DesktopWindowXamlSource and the apartment are closed.
 struct MediaViewState {
+    struct PendingFeedback { ULONGLONG until = 0; int value = 0; };
     controls::Canvas mediaSurface{nullptr};
     controls::Slider mediaSlider{nullptr};
+    controls::Button playPauseButton{nullptr}, shuffleButton{nullptr}, repeatButton{nullptr};
+    PendingFeedback playFeedback, shuffleFeedback, repeatFeedback;
     controls::TextBlock mediaElapsed{nullptr};
     controls::Image mediaCover{nullptr};
     imaging::WriteableBitmap mediaBitmap{nullptr};
@@ -1968,7 +1973,16 @@ struct MediaViewState {
     int64_t mediaPreview = 0;
     uint64_t mediaPreviewHold = 0;
 
+    void ResetFeedback() noexcept {
+        playFeedback = {};
+        shuffleFeedback = {};
+        repeatFeedback = {};
+    }
     void ReleaseBeforeIslandClose() {
+        ResetFeedback();
+        playPauseButton = nullptr;
+        shuffleButton = nullptr;
+        repeatButton = nullptr;
         mediaSlider = nullptr;
         mediaElapsed = nullptr;
         mediaCover = nullptr;
@@ -3604,10 +3618,11 @@ void SendMixerInput(State& state, InputAction action, int index,
 }
 
 void ArmInteractionTimer(State&, bool);
-void SendMediaCommand(State& state, InputAction action,
+bool SendMediaCommand(State& state, InputAction action,
                       int value = 0, int64_t pos = 0) {
-    if (state.viewOnly || GetXamlState().lifecycle.IsStopping() || !state.current.receiver) return;
-    osd_control::Submit(osd_control::BuildMedia(
+    if (state.viewOnly || GetXamlState().lifecycle.IsStopping() || !state.current.receiver)
+        return false;
+    return osd_control::Submit(osd_control::BuildMedia(
         state.current, action, value, pos), state.current.receiver);
 }
 // XAML delegates retain these callbacks at runtime. Windhawk Editor's
@@ -3663,6 +3678,7 @@ void HideSurface(State& state) {
     state.current.media.encodedArtwork.clear();
     state.mediaView.mediaDragging=false;
     state.mediaView.mediaPreviewHold=0;
+    state.mediaView.ResetFeedback();
     if (state.canvas) state.canvas.ReleasePointerCaptures();
     // CaptureLost may invoke the shared interaction callback and restart
     // the inactivity timer. Cancel once more before hiding the HWND.
@@ -4487,8 +4503,99 @@ void AdvanceMediaTimeline(State& state) {
     state.mediaView.mediaElapsed.Text(osd_model::MediaTime(pos-m.start));
     state.mediaView.mediaPopulating=false;
 }
-void DrawMediaSnapshot(State& state,const Snapshot& snap) {
+// Predict only local button appearance. Hardware actions still go through the
+// existing typed controller/SMTC pipeline and are never issued from the STA.
+void ShowImmediateMediaFeedback(State& state, int action) {
+    if (state.current.kind != LevelKind::Media) return;
+    auto& m = state.current.media;
+    auto& view = state.mediaView;
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG until = now + kMediaOptimisticHoldMs;
+    switch (action) {
+        case 2: // Play/pause.
+            if (!m.canToggle || !view.playPauseButton) return;
+            if (m.hasTimeline && m.end > m.start) {
+                m.position = osd_model::MediaPosition(m, now);
+                m.observedTick = now;
+            }
+            m.playing = !m.playing;
+            view.playFeedback = {until, m.playing ? 1 : 0};
+            view.playPauseButton.Content(winrt::box_value(winrt::hstring(
+                m.playing ? osd_glyph::kMediaPause : osd_glyph::kMediaPlay)));
+            if (state.host) {
+                if (m.playing && m.hasTimeline) {
+                    SetTimer(state.host, kMediaProgressTimer, 100, nullptr);
+                } else {
+                    KillTimer(state.host, kMediaProgressTimer);
+                }
+            }
+            break;
+        case 5: // Shuffle.
+            if (!m.canShuffle || !m.shuffleKnown || !view.shuffleButton) return;
+            m.shuffleActive = !m.shuffleActive;
+            view.shuffleFeedback = {until, m.shuffleActive ? 1 : 0};
+            view.shuffleButton.Background(Brush(
+                m.shuffleActive ? state.current.accent : state.current.track,
+                m.shuffleActive ? 110 : 175));
+            break;
+        case 6: // Repeat: None -> List -> Track -> None.
+            if (!m.canRepeat || m.repeatMode < 0 || !view.repeatButton) return;
+            m.repeatMode = m.repeatMode == 0 ? 2 : m.repeatMode == 2 ? 1 : 0;
+            view.repeatFeedback = {until, m.repeatMode};
+            view.repeatButton.Content(winrt::box_value(winrt::hstring(
+                m.repeatMode == 1 ? osd_glyph::kMediaRepeatOne :
+                                    osd_glyph::kMediaRepeatAll)));
+            view.repeatButton.Background(Brush(
+                m.repeatMode > 0 ? state.current.accent : state.current.track,
+                m.repeatMode > 0 ? 110 : 175));
+            break;
+        default: break;
+    }
+}
+
+void DrawMediaSnapshot(State& state,const Snapshot& incoming) {
     if (!state.host||!state.card||!state.canvas||!state.mediaView.mediaSurface) return;
+    // Reconcile on existing SMTC snapshots, without subscriptions or polling.
+    // Copy the snapshot only while there is outstanding visual feedback.
+    Snapshot adjusted;
+    const Snapshot* selected = &incoming;
+    auto& view = state.mediaView;
+    if (state.current.kind == LevelKind::Media &&
+        state.current.media.sourceId == incoming.media.sourceId &&
+        state.current.media.selectionSerial == incoming.media.selectionSerial &&
+        state.current.media.generation == incoming.media.generation) {
+        if (view.playFeedback.until || view.shuffleFeedback.until ||
+            view.repeatFeedback.until) {
+            adjusted = incoming;
+            const ULONGLONG now = GetTickCount64();
+            auto retain = [now](MediaViewState::PendingFeedback& pending,
+                                int observed) {
+                if (!pending.until) return false;
+                if (now >= pending.until || pending.value == observed) {
+                    pending.until = 0;
+                    return false;
+                }
+                return true;
+            };
+            auto& m = adjusted.media;
+            if (!m.canToggle) view.playFeedback = {};
+            else if (retain(view.playFeedback, m.playing ? 1 : 0)) {
+                m.playing = view.playFeedback.value != 0;
+                m.position = state.current.media.position;
+                m.observedTick = state.current.media.observedTick;
+            }
+            if (!m.canShuffle || !m.shuffleKnown) view.shuffleFeedback = {};
+            else if (retain(view.shuffleFeedback, m.shuffleActive ? 1 : 0))
+                m.shuffleActive = view.shuffleFeedback.value != 0;
+            if (!m.canRepeat || m.repeatMode < 0) view.repeatFeedback = {};
+            else if (retain(view.repeatFeedback, m.repeatMode))
+                m.repeatMode = view.repeatFeedback.value;
+            selected = &adjusted;
+        }
+    } else {
+        view.ResetFeedback(); // A changed player must never inherit old UI state.
+    }
+    const Snapshot& snap = *selected;
     const auto& m=snap.media;
     if (state.current.kind==LevelKind::Media&&state.mediaView.mediaDragging&&
         state.current.media.sourceId==m.sourceId&&
@@ -4570,6 +4677,9 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
     state.mediaView.mediaSlider=nullptr;
     state.mediaView.mediaElapsed=nullptr;
     state.mediaView.mediaCover=nullptr;
+    state.mediaView.playPauseButton=nullptr;
+    state.mediaView.shuffleButton=nullptr;
+    state.mediaView.repeatButton=nullptr;
     state.mediaView.mediaSurface.Children().Clear();
     if (state.mediaView.mediaArtworkCache!=m.encodedArtwork) {
         state.mediaView.mediaArtworkCache=m.encodedArtwork;
@@ -4701,9 +4811,13 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         b.Background(Brush(active?snap.accent:snap.track,active?110:175));
         b.Foreground(Brush(snap.text));b.IsEnabled(enabled);
         b.Click([&state,code](auto const&,auto const&) {
-            SendMediaCommand(state,InputAction::MediaAction,code);
+            if (SendMediaCommand(state,InputAction::MediaAction,code))
+                ShowImmediateMediaFeedback(state, code);
             ArmInteractionTimer(state,true);
         });
+        if (code == 2) state.mediaView.playPauseButton = b;
+        else if (code == 5) state.mediaView.shuffleButton = b;
+        else if (code == 6) state.mediaView.repeatButton = b;
         place(b,x-size/2,y-size/2);
     };
     const double sz=g.controlRadius*2;
@@ -6666,6 +6780,7 @@ struct MediaSnapshot {
 struct MediaCommand {
     int action = 0;  // 1-3=transport; 4=seek; 5-6=shuffle/repeat; 7=next SMTC session
     INT64 position = 0; // SMTC 100-ns ticks for action 4
+    uint32_t expectedSelectionSerial = 0; // Identity bound to the displayed card.
 };
 struct MediaRuntimeState {
     // Snapshot publication is worker -> controller; UI owns current.
@@ -6696,7 +6811,7 @@ struct MediaRuntimeState {
         wake = handle;
         ReleaseSRWLockExclusive(&commandLock);
     }
-    void Request(int action, INT64 position) {
+    void Request(int action, INT64 position, uint32_t expectedSelectionSerial = 0) {
         AcquireSRWLockExclusive(&commandLock);
         if (wake && !stop.load()) {
             // Repeated seeking keeps its latest value; transport stays FIFO.
@@ -6705,7 +6820,7 @@ struct MediaRuntimeState {
                     [](const MediaCommand& entry) { return entry.action == 4; }),
                     commands.end());
             if (action && commands.size() < 32)
-                commands.push_back(MediaCommand{action, position});
+                commands.push_back(MediaCommand{action, position, expectedSelectionSerial});
             SetEvent(wake);
         }
         ReleaseSRWLockExclusive(&commandLock);
@@ -8373,16 +8488,22 @@ void ProcessClipboard() {
             if (handle && cb >= sizeof(wchar_t)) {
                 const wchar_t* text = static_cast<const wchar_t*>(GlobalLock(handle));
                 if (text) {
-                    const size_t bound = std::min<size_t>(cb / sizeof(wchar_t),
-                            static_cast<size_t>(GetSettingsState()->clipboardChars.load()) + 1);
+                    const size_t capacity = cb / sizeof(wchar_t);
+                    const size_t limit = static_cast<size_t>(
+                        GetSettingsState()->clipboardChars.load());
+                    size_t i = 0;
                     body.clear();
-                    for (size_t i = 0; i < bound && text[i]; ++i) {
-                        const wchar_t ch = text[i];
+                    while (i < capacity && i < limit && text[i]) {
+                        // Never split a valid UTF-16 surrogate pair at the limit.
+                        if (text[i] >= 0xD800 && text[i] <= 0xDBFF &&
+                            i + 1 < capacity && i + 1 >= limit &&
+                            text[i + 1] >= 0xDC00 && text[i + 1] <= 0xDFFF)
+                            break;
+                        const wchar_t ch = text[i++];
                         body.push_back(ch < 0x20 || ch == 0x7f ? L' ' : ch);
                     }
-                    if (cb / sizeof(wchar_t) > body.size() &&
-                        body.size() >= static_cast<size_t>(GetSettingsState()->clipboardChars.load()))
-                        body += L"…";
+                    // GlobalSize is allocation size, not the text length.
+                    if (i == capacity || text[i] != L'\0') body += L"…";
                     GlobalUnlock(handle);
                 }
             }
@@ -10427,8 +10548,9 @@ void FillSnapshot(Session const& session, MediaSnapshot const& previous,
 }
 } // namespace smtc_projection
 
-void RequestMedia(int command = 0, INT64 position = 0) {
-    GetAudioState().media.Request(command, position);
+void RequestMedia(int command = 0, INT64 position = 0,
+                  uint32_t expectedSelectionSerial = 0) {
+    GetAudioState().media.Request(command, position, expectedSelectionSerial);
 }
 
 DWORD WINAPI MediaThreadProc(void*) {
@@ -10456,6 +10578,7 @@ DWORD WINAPI MediaThreadProc(void*) {
         // global current-session preference or pass WinRT objects to the UI.
         bool manuallySelected = false;
         uint32_t selectionSerial = 0;
+        smtc_projection::Session displayedSession{nullptr};
         std::wstring selectedSource;
         size_t selectedOrdinal = 0;
         while (WaitForSingleObject(GetAudioState().media.wake, INFINITE) == WAIT_OBJECT_0) {
@@ -10497,7 +10620,6 @@ DWORD WINAPI MediaThreadProc(void*) {
                     if (index == sessions.size()) {
                         manuallySelected = false; // Session disappeared.
                         selectedSource.clear();
-                        ++selectionSerial;
                     }
                 }
                 if (!manuallySelected && current) {
@@ -10514,6 +10636,15 @@ DWORD WINAPI MediaThreadProc(void*) {
                 smtc_projection::Session session{nullptr};
                 if (index < sessions.size()) session = sessions[index];
                 else if (current) session = current;
+                // A media card binds commands to a specific worker-selected WinRT
+                // session, not merely its AUMID (shared by browser tabs).
+                auto bindSession = [&](smtc_projection::Session const& next) {
+                    if (winrt::get_abi(displayedSession) != winrt::get_abi(next)) {
+                        displayedSession = next;
+                        if (!++selectionSerial) ++selectionSerial;
+                    }
+                };
+                bindSession(session);
                 // Preserve FIFO semantics when cycling and transport commands
                 // arrive in the same wake cycle.
                 for (auto const& command : commands) {
@@ -10524,11 +10655,14 @@ DWORD WINAPI MediaThreadProc(void*) {
                             manuallySelected = true;
                             selectedOrdinal = index;
                             selectedSource = sourceOf(session);
-                            ++selectionSerial;
+                            bindSession(session);
                         }
                         continue;
                     }
-                    if (!session) continue;
+                    // Reject queued controls if Windows switched the current
+                    // session after the card was rendered; cycling remains FIFO.
+                    if (!session || command.expectedSelectionSerial != selectionSerial)
+                        continue;
                     try {
                         smtc_projection::RequestMediaAction(session, command);
                     } catch (winrt::hresult_error const& e) {
@@ -11480,13 +11614,14 @@ ControlEffects ApplyOsdCommands(
                     GetAudioState().media.current.selectionSerial)) continue;
             if (cmd.action==osd_control::Action::MediaAction) {
                 if (cmd.value>=1&&cmd.value<=7&&cmd.value!=4)
-                    RequestMedia(cmd.value);
+                    RequestMedia(cmd.value, 0, static_cast<uint32_t>(cmd.index));
             } else if (cmd.action==osd_control::Action::MediaSeek&&
                       GetAudioState().media.current.canSeek&&GetAudioState().media.current.hasTimeline&&
                       GetAudioState().media.current.timelineEnd>GetAudioState().media.current.timelineStart) {
                 RequestMedia(4,std::clamp(cmd.mediaPosition,
                     GetAudioState().media.current.timelineStart,
-                    GetAudioState().media.current.timelineEnd));
+                    GetAudioState().media.current.timelineEnd),
+                    static_cast<uint32_t>(cmd.index));
             }
             continue;
         }
