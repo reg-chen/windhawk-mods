@@ -47,7 +47,7 @@ Actual Windows 11 captures, cropped to consistent dimensions.
 
 | Horizontal volume + mixer | Vertical volume + mixer |
 | :---: | :---: |
-| ![Horizontal volume + mixer](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/horizontal_mixer.png?v=1.1.4) | ![Vertical volume + mixer](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/vertical_mixer.png?v=1.1.4) |
+| ![Horizontal volume + mixer](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/horizontal_mixer.png?v=1.1.4-8ab79ed) | ![Vertical volume + mixer](https://raw.githubusercontent.com/reg-chen/windhawk-mods-assets/main/fluent-osd/screenshots/volume/vertical_mixer.png?v=1.1.4-8ab79ed) |
 
 ### Brightness
 
