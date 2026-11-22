@@ -3,7 +3,7 @@
 // @name            Fluent OSD
 // @description     Native XAML on-screen displays for volume, brightness, media, mixer and Windows system events.
 // @description:zh-TW 以原生 XAML 顯示音量、亮度、媒體、混音器及 Windows 系統事件提示。
-// @version         1.1.4
+// @version         1.1.5
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -898,6 +898,44 @@ inline constexpr winrt::guid
 
 namespace {
 
+// Segoe Fluent Icons: monochrome glyphs, colored only by XAML Foreground.
+// Keep PUA code points in one place instead of scattering them through views.
+namespace osd_glyph {
+constexpr PCWSTR kChevronLeft = L"\uE76B";
+constexpr PCWSTR kChevronRight = L"\uE76C";
+constexpr PCWSTR kChevronUp = L"\uE70E";
+constexpr PCWSTR kChevronDown = L"\uE70D";
+constexpr PCWSTR kMute = L"\uE74F";
+constexpr PCWSTR kVolume = L"\uE767";
+constexpr PCWSTR kBrightness = L"\uE706";
+constexpr PCWSTR kMediaPrevious = L"\uE892";
+constexpr PCWSTR kMediaPause = L"\uE769";
+constexpr PCWSTR kMediaPlay = L"\uE768";
+constexpr PCWSTR kMediaNext = L"\uE893";
+constexpr PCWSTR kMediaShuffle = L"\uE8B1";
+constexpr PCWSTR kMediaRepeatOne = L"\uE8ED";
+constexpr PCWSTR kMediaRepeatAll = L"\uE8EE";
+constexpr PCWSTR kClose = L"\uE8BB";
+constexpr PCWSTR kBluetooth = L"\uE702";
+constexpr PCWSTR kUsb = L"\uE88E";
+constexpr PCWSTR kNetwork = L"\uE968";
+constexpr PCWSTR kWifi = L"\uE701";
+constexpr PCWSTR kKeyboardStandard = L"\uE92E";
+constexpr PCWSTR kMouse = L"\uE962";
+constexpr PCWSTR kHeadset = L"\uE95B";
+constexpr PCWSTR kHeadphone = L"\uE7F6";
+constexpr PCWSTR kSpeakers = L"\uE7F5";
+constexpr PCWSTR kKeyboardClassic = L"\uE765";
+constexpr PCWSTR kAirplane = L"\uE709";
+constexpr PCWSTR kCamera = L"\uE722";
+constexpr PCWSTR kMicrophone = L"\uE720";
+constexpr PCWSTR kTaskView = L"\uE7C4";
+constexpr PCWSTR kPage = L"\uE7C3";
+constexpr PCWSTR kClipboardFile = L"\uF000";
+constexpr PCWSTR kClipboardText = L"\uE9A4";
+constexpr PCWSTR kClipboard = L"\uE8C8";
+} // namespace osd_glyph
+
 // Presentation-independent input arithmetic. Both the legacy GDI+
 // controls and migrated XAML controls use these same normalized units.
 namespace osd_input {
@@ -976,10 +1014,12 @@ struct MixerRow {
     int percent = 0;
     bool muted = false, enabled = true;
     std::vector<uint8_t> iconPixels; // Optional 20x20 BGRA; owned bytes.
+    std::wstring sessionId; // Unique Core Audio session instance or master endpoint.
 };
 struct MixerOutput {
     std::wstring title;
     bool selected = false;
+    std::wstring id; // Device identity, not just its friendly display name.
 };
 struct MixerModel {
     std::wstring title, outputHeading, selectedOutput, outputError;
@@ -1116,32 +1156,121 @@ struct Command {
     int value = 0;
     int index = -1; // 0=master, positive=audio session, or output index.
     int64_t mediaPosition = 0; // 100 ns; no WinRT or playback object.
+    uint64_t mixerSessionTag = 0; // POD fingerprint; full ID stays in Mixer snapshots.
     uint32_t generation = 0;
     WCHAR device[CCHDEVICENAME]{};
     DWORD physicalIndex = 0, minimum = 0, maximum = 0;
 };
 constexpr UINT kMessage = WM_APP + 690;
-// XAML's producer and the controller's consumer share only owned POD commands.
-// The mailbox owns its SRW lock and preserves the existing FIFO/cap semantics.
+// XAML produces value commands, but only the controller executes hardware
+// operations. The posted flag and pending queue are protected by one lock.
 struct CommandMailbox {
     SRWLOCK lock = SRWLOCK_INIT;
     std::vector<Command> pending;
+    bool posted = false;
+    static constexpr size_t kCapacity = 64;
 
-    void Enqueue(const Command& command) {
-        AcquireSRWLockExclusive(&lock);
-        if (pending.size() >= 64) pending.erase(pending.begin());
-        pending.push_back(command);
-        ReleaseSRWLockExclusive(&lock);
+    static bool IsReplaceable(const Command& command) {
+        switch (command.action) {
+            case Action::SetPercent:
+                return command.target == Target::Volume ||
+                       command.target == Target::NativeBrightness ||
+                       command.target == Target::DdcBrightness;
+            case Action::MixerSetPercent:
+                return command.target == Target::Mixer;
+            case Action::MediaSeek:
+                return command.target == Target::Media;
+            default:
+                return false; // Wheel, toggles, and selections are ordered actions.
+        }
     }
+
+    static bool CanReplace(const Command& previous, const Command& next) {
+        if (!IsReplaceable(previous) || !IsReplaceable(next) ||
+            previous.target != next.target || previous.action != next.action ||
+            previous.generation != next.generation)
+            return false;
+        if (next.target == Target::Mixer)
+            return previous.index == next.index &&
+                   previous.mixerSessionTag == next.mixerSessionTag;
+        if (next.target == Target::Media)
+            return previous.index == next.index;
+        if (next.target == Target::DdcBrightness)
+            return previous.physicalIndex == next.physicalIndex &&
+                   previous.minimum == next.minimum &&
+                   previous.maximum == next.maximum &&
+                   wcscmp(previous.device, next.device) == 0;
+        return true;
+    }
+
+    bool Enqueue(const Command& command, HWND receiver) {
+        if (!receiver) return false;
+        bool accepted = false;
+        bool full = false;
+        DWORD postError = NO_ERROR;
+        AcquireSRWLockExclusive(&lock);
+        // Only adjacent updates may coalesce: intervening actions are barriers.
+        const bool replace = !pending.empty() &&
+                             CanReplace(pending.back(), command);
+        auto disposable = pending.end();
+        if (!replace && pending.size() >= kCapacity)
+            disposable = std::find_if(pending.begin(), pending.end(),
+                                     IsReplaceable);
+        if (!replace && pending.size() >= kCapacity &&
+            disposable == pending.end()) {
+            full = true;
+        } else if (!posted && !PostMessageW(receiver, kMessage, 0, 0)) {
+            // Posting is done under the same lock, *before* mutation.
+            // A failed post therefore cannot strand or later replay a command.
+            postError = GetLastError();
+        } else {
+            if (replace) {
+                pending.back() = command;
+            } else {
+                // At capacity, sacrifice an idempotent value update rather
+                // than a mute/toggle/selection command.
+                if (disposable != pending.end()) pending.erase(disposable);
+                pending.push_back(command);
+            }
+            posted = true;
+            accepted = true;
+        }
+        ReleaseSRWLockExclusive(&lock);
+        if (full)
+            Wh_Log(L"OSD command queue full; rejected action %u",
+                   static_cast<unsigned>(command.action));
+        if (postError != NO_ERROR)
+            Wh_Log(L"OSD command post failed (%lu)", postError);
+        return accepted;
+    }
+
     std::vector<Command> Take() {
         std::vector<Command> result;
         AcquireSRWLockExclusive(&lock);
         result.swap(pending);
+        posted = false;
         ReleaseSRWLockExclusive(&lock);
         return result;
     }
+    void ReleaseAfterHooksRemoved() {
+        std::vector<Command> oldPending;
+        AcquireSRWLockExclusive(&lock);
+        pending.swap(oldPending);
+        posted = false;
+        ReleaseSRWLockExclusive(&lock);
+        // Destruct storage after dropping the mailbox lock.
+    }
 };
-CommandMailbox g_commands;
+struct ControlModuleState final {
+    CommandMailbox mailbox;
+    void ReleaseAfterHooksRemoved() { mailbox.ReleaseAfterHooksRemoved(); }
+};
+// Process shutdown skips normal mod unload: never destruct this mailbox
+// from DLL_PROCESS_DETACH while another thread could still own its lock.
+ControlModuleState& GetControlState() {
+    [[clang::no_destroy]] static ControlModuleState instance;
+    return instance;
+}
 
 Target ForCategory(osd_model::Kind kind) {
     switch (kind) {
@@ -1168,11 +1297,27 @@ Command Build(const osd_model::Snapshot& source, Action action, int value) {
     cmd.maximum = source.maximum;
     return cmd;
 }
+// POD command transport holds a non-cryptographic identity fingerprint,
+ // while the UI snapshot and Core Audio owner retain complete session IDs.
+// Full strings must never be placed in Command (trivially_copyable contract).
+uint64_t MixerIdentityTag(const std::wstring& id) {
+    if (id.empty()) return 0;
+    uint64_t tag = 14695981039346656037ULL; // FNV-1a 64-bit offset
+    for (wchar_t ch : id) {
+        tag ^= static_cast<uint16_t>(ch);
+        tag *= 1099511628211ULL;
+    }
+    return tag ? tag : 1;
+}
 Command BuildMixer(const osd_model::Snapshot& source,
                    Action action, int row, int value = 0) {
     Command cmd = Build(source, action, value);
     cmd.target = Target::Mixer;
     cmd.index = row;
+    if ((action == Action::MixerSetPercent ||
+         action == Action::MixerToggleMute) &&
+        row >= 0 && static_cast<size_t>(row) < source.mixer.rows.size())
+        cmd.mixerSessionTag = MixerIdentityTag(source.mixer.rows[row].sessionId);
     return cmd;
 }
 Command BuildMedia(const osd_model::Snapshot& source, Action action,
@@ -1186,12 +1331,10 @@ Command BuildMedia(const osd_model::Snapshot& source, Action action,
 }
 void Submit(const Command& cmd, HWND receiver) {
     if (!receiver || cmd.target == Target::None) return;
-    g_commands.Enqueue(cmd);
-    if (!PostMessageW(receiver, kMessage, 0, 0))
-        Wh_Log(L"OSD command post failed (%lu)", GetLastError());
+    (void)GetControlState().mailbox.Enqueue(cmd, receiver);
 }
 std::vector<Command> Drain() {
-    return g_commands.Take();
+    return GetControlState().mailbox.Take();
 }
 } // namespace osd_control
 
@@ -1247,12 +1390,12 @@ osd_model::ChevronDirection MixerChevronDirection(
 }
 const wchar_t* MixerChevronGlyph(osd_model::ChevronDirection direction) {
     switch (direction) {
-        case osd_model::ChevronDirection::Left:  return L"\uE76B";
-        case osd_model::ChevronDirection::Right: return L"\uE76C";
-        case osd_model::ChevronDirection::Up:    return L"\uE70E";
-        case osd_model::ChevronDirection::Down:  return L"\uE70D";
+        case osd_model::ChevronDirection::Left:  return osd_glyph::kChevronLeft;
+        case osd_model::ChevronDirection::Right: return osd_glyph::kChevronRight;
+        case osd_model::ChevronDirection::Up:    return osd_glyph::kChevronUp;
+        case osd_model::ChevronDirection::Down:  return osd_glyph::kChevronDown;
     }
-    return L"\uE70D";
+    return osd_glyph::kChevronDown;
 }
 struct MixerButton {
     bool visible = false;
@@ -1643,6 +1786,8 @@ constexpr GUID kTransparencyIID = {
 constexpr wchar_t kClass[] = L"Windhawk.FluentOSD.XamlMigration.Host";
 constexpr UINT kShowMessage = WM_APP + 680;
 constexpr UINT kHideMessage = WM_APP + 681;
+constexpr UINT kRendererFailedMessage = WM_APP + 687;
+constexpr UINT kRendererReadyMessage = WM_APP + 688;
 constexpr UINT_PTR kHideTimer = 683;
 constexpr UINT_PTR kFadeTimer = 684;
 constexpr UINT_PTR kStatusLineTimer = 685;
@@ -1662,19 +1807,30 @@ class XamlLifecycleState {
     std::atomic<DWORD> threadId_{0};
     std::atomic<bool> stopping_{false};
     std::atomic<bool> failed_{false};
+    std::atomic<HWND> controller_{nullptr}; // Win32 message-only receiver.
     std::mutex startLock_;
     HANDLE thread_ = nullptr;
 
 public:
     bool IsStopping() const noexcept { return stopping_.load(); }
     bool IsFailed() const noexcept { return failed_.load(); }
-    void MarkFailed() noexcept { failed_.store(true); }
+    void MarkFailed() noexcept {
+        if (!failed_.exchange(true, std::memory_order_acq_rel) &&
+            !stopping_.load(std::memory_order_acquire)) {
+            const HWND receiver = controller_.load(std::memory_order_acquire);
+            if (receiver)
+                (void)PostMessageW(receiver, kRendererFailedMessage, 0, 0);
+        }
+    }
     void MarkFailedAndWithdrawReady() noexcept {
         MarkFailed();
         WithdrawReady();
     }
     void PublishReady(HWND hwnd) noexcept {
         ready_.store(hwnd, std::memory_order_release);
+        const HWND receiver = controller_.load(std::memory_order_acquire);
+        if (receiver && !stopping_.load(std::memory_order_acquire))
+            (void)PostMessageW(receiver, kRendererReadyMessage, 0, 0);
     }
     void WithdrawReady() noexcept {
         ready_.store(nullptr, std::memory_order_release);
@@ -1685,15 +1841,34 @@ public:
     void PublishThreadId(DWORD id) noexcept {
         threadId_.store(id, std::memory_order_release);
     }
-    void Start() {
+    // First launch and explicit user retry share this single startup path.
+    // Only the Win32 controller calls Restart; never join the current STA.
+    bool Restart(HWND receiver) {
         std::lock_guard<std::mutex> guard(startLock_);
-        if (thread_ || IsStopping() || IsFailed()) return;
+        if (!receiver || IsStopping() || (thread_ && !IsFailed()))
+            return false;
+        if (thread_) {
+            const DWORD priorId = threadId_.load(std::memory_order_acquire);
+            if (priorId == GetCurrentThreadId()) return false;
+            if (priorId)
+                (void)PostThreadMessageW(priorId, WM_QUIT, 0, 0);
+            (void)WaitForSingleObject(thread_, INFINITE);
+            CloseHandle(thread_);
+            thread_ = nullptr;
+        }
+        WithdrawReady();
+        threadId_.store(0, std::memory_order_release);
+        controller_.store(receiver, std::memory_order_release);
+        failed_.store(false, std::memory_order_release);
         thread_ = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
         if (!thread_) {
+            const DWORD error = GetLastError();
             MarkFailed();
-            Wh_Log(L"Fluent OSD/XAML: STA creation failed (%lu)", GetLastError());
+            Wh_Log(L"Fluent OSD/XAML: STA creation failed (%lu)", error);
         }
+        return thread_ != nullptr;
     }
+    void Start(HWND receiver) { (void)Restart(receiver); }
     void Stop() {
         std::lock_guard<std::mutex> guard(startLock_);
         stopping_.store(true);
@@ -1707,22 +1882,42 @@ public:
             CloseHandle(thread_);
             thread_ = nullptr;
         }
+        controller_.store(nullptr, std::memory_order_release);
     }
 };
-XamlLifecycleState g_lifecycle;
+// XAML lifecycle and owned snapshot transport share one STA-side owner.
+
 
 using LevelKind = osd_model::Kind;
 using Snapshot = osd_model::Snapshot;
 using InputAction = osd_control::Action;
-// The controller publishes complete, owned snapshot batches to the XAML STA.
-// As before, a newer batch replaces a not-yet-consumed one.
+// The controller publishes owned snapshots to the XAML STA. DDC batches
+// merge by physical target; other categories keep full-snapshot replacement.
 struct SnapshotMailbox {
     SRWLOCK lock = SRWLOCK_INIT;
     std::vector<Snapshot> pending;
 
     void Publish(const std::vector<Snapshot>& snapshots) {
         AcquireSRWLockExclusive(&lock);
-        pending = snapshots;
+        // DDC batches are deltas. Merge consecutive deliveries so an event
+        // for B cannot be lost when A arrives before the STA drains B.
+        if (!pending.empty() && !snapshots.empty() &&
+            pending.front().kind == LevelKind::DdcBrightness &&
+            snapshots.front().kind == LevelKind::DdcBrightness) {
+            for (const auto& snap : snapshots) {
+                auto existing = std::find_if(pending.begin(), pending.end(),
+                    [&](const Snapshot& old) { return old.key == snap.key; });
+                if (existing != pending.end()) {
+                    *existing = snap;
+                } else {
+                    // Match the controller's bounded 16-target DDC cache.
+                    if (pending.size() == 16) pending.erase(pending.begin());
+                    pending.push_back(snap);
+                }
+            }
+        } else {
+            pending = snapshots;
+        }
         ReleaseSRWLockExclusive(&lock);
     }
     std::vector<Snapshot> Take() {
@@ -1732,10 +1927,129 @@ struct SnapshotMailbox {
         ReleaseSRWLockExclusive(&lock);
         return batch;
     }
+    void ReleaseAfterThreadsStop() {
+        std::vector<Snapshot> oldPending;
+        AcquireSRWLockExclusive(&lock);
+        pending.swap(oldPending);
+        ReleaseSRWLockExclusive(&lock);
+        // Destruct snapshots outside the lock and after both UI owners join.
+    }
 };
-SnapshotMailbox g_snapshots;
+struct XamlModuleState final {
+    XamlLifecycleState lifecycle;
+    SnapshotMailbox snapshots;
+    void ReleaseAfterThreadsStop() { snapshots.ReleaseAfterThreadsStop(); }
+};
+// STA-only view objects belong to ThreadProc; this cross-thread owner must
+// not run a global destructor when Explorer exits without Wh_ModUninit.
+XamlModuleState& GetXamlState() {
+    [[clang::no_destroy]] static XamlModuleState instance;
+    return instance;
+}
+
+// Cached view references live and die on the XAML STA, not in Core Audio.
+struct MixerRowVisual {
+    controls::Button mute{nullptr};
+    controls::Slider slider{nullptr};
+    controls::TextBlock percentLabel{nullptr};
+    controls::Image icon{nullptr};
+    bool muted = false, enabled = true;
+};
+// STA-only visual references are grouped by feature. Every sub-state releases
+// WinRT controls before DesktopWindowXamlSource and the apartment are closed.
+struct MediaViewState {
+    controls::Canvas mediaSurface{nullptr};
+    controls::Slider mediaSlider{nullptr};
+    controls::TextBlock mediaElapsed{nullptr};
+    controls::Image mediaCover{nullptr};
+    imaging::WriteableBitmap mediaBitmap{nullptr};
+    std::vector<uint8_t> mediaArtworkCache;
+    bool mediaPopulating = false, mediaDragging = false;
+    int64_t mediaPreview = 0;
+    uint64_t mediaPreviewHold = 0;
+
+    void ReleaseBeforeIslandClose() {
+        mediaSlider = nullptr;
+        mediaElapsed = nullptr;
+        mediaCover = nullptr;
+        mediaBitmap = nullptr;
+        mediaArtworkCache.clear();
+        mediaSurface = nullptr;
+    }
+};
+
+struct MixerViewState {
+    controls::Button mixerChevron{nullptr};
+    controls::Border mixerSurface{nullptr};
+    controls::StackPanel mixerColumn{nullptr}, mixerRows{nullptr},
+                         mixerOutputs{nullptr};
+    controls::ScrollViewer mixerRowsScroll{nullptr},
+                           mixerOutputsScroll{nullptr};
+    std::vector<MixerRowVisual> mixerRowVisuals;
+    bool mixerPopulating = false;
+    int mixerWheelRow = -1, mixerWheelRemainder = 0;
+
+    void ReleaseBeforeIslandClose() {
+        mixerRowVisuals.clear();
+        mixerOutputsScroll = nullptr;
+        mixerRowsScroll = nullptr;
+        mixerOutputs = nullptr;
+        mixerRows = nullptr;
+        mixerColumn = nullptr;
+        mixerSurface = nullptr;
+        mixerChevron = nullptr;
+    }
+};
+
+struct ClipboardViewState {
+    controls::Border clipboardFrame{nullptr};
+    controls::Image clipboardImage{nullptr};
+    controls::TextBlock clipboardCaption{nullptr};
+
+    void ReleaseBeforeIslandClose() {
+        clipboardCaption = nullptr;
+        clipboardImage = nullptr;
+        clipboardFrame = nullptr;
+    }
+};
+
+struct StatusViewState {
+    controls::Border statusTile{nullptr};
+    controls::TextBlock statusGlyph{nullptr}, statusTitle{nullptr},
+                        statusDetail{nullptr};
+    shapes::Rectangle statusUnderline{nullptr};
+    controls::Button noticeChevron{nullptr};
+    controls::TextBlock noticeHeading{nullptr};
+    controls::ScrollViewer noticeScroll{nullptr};
+    controls::StackPanel noticeRows{nullptr};
+    bool noticeExpanded = false;
+    double noticeHeaderH = 0;
+    DWORD noticeNormalDurationMs = 3000;
+    // Preserve the interpolated underline position across status changes.
+    bool statusLineAnimating = false;
+    ULONGLONG statusLineStart = 0;
+    double statusLineFrom = 1.0, statusLineTo = 1.0;
+    double statusLineRatio = 1.0, statusLineTextW = 0.0;
+    double statusLineCenterX = 0.0;
+
+    void ReleaseBeforeIslandClose() {
+        noticeScroll = nullptr;
+        noticeRows = nullptr;
+        noticeHeading = nullptr;
+        noticeChevron = nullptr;
+        statusUnderline = nullptr;
+        statusDetail = nullptr;
+        statusTitle = nullptr;
+        statusGlyph = nullptr;
+        statusTile = nullptr;
+    }
+};
 
 struct State {
+    MediaViewState mediaView;
+    MixerViewState mixerView;
+    ClipboardViewState clipboardView;
+    StatusViewState statusView;
     HWND host = nullptr, island = nullptr;
     bool dragging = false, iconPressed = false, pointerActive = false;
     uint32_t activePointerId = 0;
@@ -1761,47 +2075,9 @@ struct State {
     shapes::Rectangle track{nullptr};
     shapes::Rectangle fill{nullptr};
     media::RectangleGeometry fillClip{nullptr};
-    // Shared status-card visual tree for Caps/Num/Scroll/Insert.
-    controls::Border statusTile{nullptr};
-    controls::TextBlock statusGlyph{nullptr}, statusTitle{nullptr},
-                        statusDetail{nullptr};
-    shapes::Rectangle statusUnderline{nullptr};
-    controls::Button noticeChevron{nullptr};
-    controls::TextBlock noticeHeading{nullptr};
-    controls::ScrollViewer noticeScroll{nullptr};
-    controls::StackPanel noticeRows{nullptr};
-    controls::Border clipboardFrame{nullptr};
-    controls::Image clipboardImage{nullptr};
-    controls::TextBlock clipboardCaption{nullptr};
-    controls::Button mixerChevron{nullptr};
-    controls::Border mixerSurface{nullptr};
-    controls::StackPanel mixerColumn{nullptr}, mixerRows{nullptr},
-                         mixerOutputs{nullptr};
-    controls::ScrollViewer mixerRowsScroll{nullptr},
-                           mixerOutputsScroll{nullptr};
-    controls::Canvas mediaSurface{nullptr};
-    controls::Slider mediaSlider{nullptr};
-    controls::TextBlock mediaElapsed{nullptr};
-    controls::Image mediaCover{nullptr};
-    imaging::WriteableBitmap mediaBitmap{nullptr};
-    std::vector<uint8_t> mediaArtworkCache;
-    bool mediaPopulating = false, mediaDragging = false;
-    int64_t mediaPreview = 0;
-    uint64_t mediaPreviewHold = 0;
-    bool mixerPopulating = false, attachedPeerOpen = false;
-    int mixerWheelRow = -1, mixerWheelRemainder = 0;
+    bool attachedPeerOpen = false;
     State* pairedPanel = nullptr;  // STA-only, owned by root.peers.
     State* pairedVolume = nullptr; // STA-only, root owns this State.
-    bool noticeExpanded = false;
-    double noticeHeaderH = 0;
-    DWORD noticeNormalDurationMs = 3000;
-    // Width is a ratio of the current text column; its center stays fixed.
-    // The previous interpolated ratio is retained for interruption/reversal.
-    bool statusLineAnimating = false;
-    ULONGLONG statusLineStart = 0;
-    double statusLineFrom = 1.0, statusLineTo = 1.0;
-    double statusLineRatio = 1.0, statusLineTextW = 0.0;
-    double statusLineCenterX = 0.0;
 
     // Intrinsic size of *all possible* speaker and volume-value states.
     // These change only with the corresponding font size; neither text
@@ -2002,12 +2278,29 @@ HRESULT DetachSource(wge::IGraphicsEffectSource const& source,
 
 // ---------------------------------------------------------------- noise ----
 
-wss::IRandomAccessStream CreateNoiseStream(float density) {
-    thread_local float t_cached_density = std::numeric_limits<float>::quiet_NaN();
-    thread_local wss::InMemoryRandomAccessStream t_cached{nullptr};
+// The noise brush is rendered on the XAML STA. Keep cache ownership on that
+// thread, but never rely on a TLS destructor after apartment teardown.
+struct NoiseCache {
+    float density = std::numeric_limits<float>::quiet_NaN();
+    wss::InMemoryRandomAccessStream stream{nullptr};
+};
 
-    if (t_cached && density == t_cached_density) {
-        return t_cached.CloneStream();
+NoiseCache& GetThreadNoiseCache() noexcept {
+    [[clang::no_destroy]] thread_local NoiseCache cache;
+    return cache;
+}
+
+void ReleaseThreadNoiseCache() noexcept {
+    auto& cache = GetThreadNoiseCache();
+    cache.stream = nullptr;
+    cache.density = std::numeric_limits<float>::quiet_NaN();
+}
+
+wss::IRandomAccessStream CreateNoiseStream(float density) {
+    auto& cache = GetThreadNoiseCache();
+
+    if (cache.stream && density == cache.density) {
+        return cache.stream.CloneStream();
     }
 
     // 256x256 keeps tiled noise seams inconspicuous on OSD surfaces.
@@ -2082,9 +2375,9 @@ wss::IRandomAccessStream CreateNoiseStream(float density) {
     writer.DetachStream();
     stream.Seek(0);
 
-    t_cached = stream;
-    t_cached_density = density;
-    return t_cached.CloneStream();
+    cache.stream = stream;
+    cache.density = density;
+    return cache.stream.CloneStream();
 }
 
 // ------------------------------------------------------- GaussianBlur ------
@@ -3291,20 +3584,20 @@ void DrawClipboardImageSnapshot(State&, const Snapshot&);
 imaging::WriteableBitmap BitmapFromPixels(
     uint32_t, uint32_t, const std::vector<uint8_t>&, uint32_t maxSide = 320);
 void DrawMixerSnapshot(State&, const Snapshot&);
-void ToggleNoticeDetails(State&);
+[[maybe_unused]] void ToggleNoticeDetails(State&);
 bool PointerInsideHost(const State&);
 
 // All audio/WMI/DDC writes stay on the original Explorer OSD UI thread.
 // The STA handles pointer geometry and sends only bounded POD commands.
 void SendInput(State& state, InputAction action, int value) {
-    if (state.viewOnly || g_lifecycle.IsStopping() || !state.current.receiver) return;
+    if (state.viewOnly || GetXamlState().lifecycle.IsStopping() || !state.current.receiver) return;
     osd_control::Submit(
         osd_control::Build(state.current, action, value),
         state.current.receiver);
 }
 void SendMixerInput(State& state, InputAction action, int index,
                     int value = 0) {
-    if (state.viewOnly || g_lifecycle.IsStopping() || !state.current.receiver) return;
+    if (state.viewOnly || GetXamlState().lifecycle.IsStopping() || !state.current.receiver) return;
     osd_control::Submit(
         osd_control::BuildMixer(state.current, action, index, value),
         state.current.receiver);
@@ -3313,22 +3606,24 @@ void SendMixerInput(State& state, InputAction action, int index,
 void ArmInteractionTimer(State&, bool);
 void SendMediaCommand(State& state, InputAction action,
                       int value = 0, int64_t pos = 0) {
-    if (state.viewOnly || g_lifecycle.IsStopping() || !state.current.receiver) return;
+    if (state.viewOnly || GetXamlState().lifecycle.IsStopping() || !state.current.receiver) return;
     osd_control::Submit(osd_control::BuildMedia(
         state.current, action, value, pos), state.current.receiver);
 }
-void CompleteMediaSeek(State& state) {
-    if (!state.mediaDragging || state.current.kind != LevelKind::Media ||
-        !state.mediaSlider) return;
-    state.mediaDragging = false;
+// XAML delegates retain these callbacks at runtime. Windhawk Editor's
+// standalone Clang pass can report the delegate targets as unneeded.
+[[maybe_unused]] void CompleteMediaSeek(State& state) {
+    if (!state.mediaView.mediaDragging || state.current.kind != LevelKind::Media ||
+        !state.mediaView.mediaSlider) return;
+    state.mediaView.mediaDragging = false;
     const auto& m = state.current.media;
     if (!m.canSeek || !m.hasTimeline || m.end <= m.start) return;
-    const double ratio=std::clamp(state.mediaSlider.Value(),0.0,100.0)/100.0;
+    const double ratio=std::clamp(state.mediaView.mediaSlider.Value(),0.0,100.0)/100.0;
     const int64_t dest=std::clamp(m.start+
         static_cast<int64_t>(std::llround(double(m.end-m.start)*ratio)),
         m.start,m.end);
-    state.mediaPreview=dest;
-    state.mediaPreviewHold=GetTickCount64()+1800;
+    state.mediaView.mediaPreview=dest;
+    state.mediaView.mediaPreviewHold=GetTickCount64()+1800;
     SendMediaCommand(state,InputAction::MediaSeek,0,dest);
     ArmInteractionTimer(state,true);
 }
@@ -3352,22 +3647,22 @@ void HideSurface(State& state) {
         KillTimer(state.host, kStatusLineTimer);
         KillTimer(state.host, kMediaProgressTimer);
     }
-    state.statusLineAnimating = false;
-    state.noticeExpanded = false;
+    state.statusView.statusLineAnimating = false;
+    state.statusView.noticeExpanded = false;
     // Drop the STA image source on dismissal without letting an optional
     // COM failure unwind through Explorer's HWND/teardown callback.
-    if (state.clipboardImage) {
-        try { state.clipboardImage.Source(nullptr); }
+    if (state.clipboardView.clipboardImage) {
+        try { state.clipboardView.clipboardImage.Source(nullptr); }
         catch (...) { /* The Island may already be closing. */ }
     }
     // Reclaim the bounded clipboard payload without shrink_to_fit allocation.
     std::vector<uint8_t>{}.swap(state.current.clipboardPixels);
-    if (state.mediaCover) state.mediaCover.Source(nullptr);
-    state.mediaBitmap=nullptr;
-    state.mediaArtworkCache.clear();
+    if (state.mediaView.mediaCover) state.mediaView.mediaCover.Source(nullptr);
+    state.mediaView.mediaBitmap=nullptr;
+    state.mediaView.mediaArtworkCache.clear();
     state.current.media.encodedArtwork.clear();
-    state.mediaDragging=false;
-    state.mediaPreviewHold=0;
+    state.mediaView.mediaDragging=false;
+    state.mediaView.mediaPreviewHold=0;
     if (state.canvas) state.canvas.ReleasePointerCaptures();
     // CaptureLost may invoke the shared interaction callback and restart
     // the inactivity timer. Cancel once more before hiding the HWND.
@@ -3380,9 +3675,9 @@ void HideSurface(State& state) {
             if (peer.second->viewOnly) HideSurface(*peer.second);
     // Mirror the native panel's lifetime in its UI-thread controller.
     // The action is idempotent and generation-checked at the receiver.
-    if (state.current.kind == LevelKind::Mixer && !g_lifecycle.IsStopping())
+    if (state.current.kind == LevelKind::Mixer && !GetXamlState().lifecycle.IsStopping())
         SendMixerInput(state, InputAction::CloseMixer, -1);
-    if (state.current.kind == LevelKind::Media && !g_lifecycle.IsStopping())
+    if (state.current.kind == LevelKind::Media && !GetXamlState().lifecycle.IsStopping())
         SendMediaCommand(state, InputAction::CloseMedia);
     if ((state.current.kind == LevelKind::Media ||
          state.current.kind == LevelKind::Mixer ||
@@ -3467,7 +3762,7 @@ void DragTrack(State& state, double x, double y) {
     ArmInteractionTimer(state, true);
 }
 
-void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
+[[maybe_unused]] void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.canvas || !state.host ||
         (state.current.kind == LevelKind::LockStatus ||
          state.current.kind == LevelKind::NativeEvent ||
@@ -3499,7 +3794,7 @@ void PointerPressed(State& state, const xinput::PointerRoutedEventArgs& args) {
     args.Handled(true);
 }
 
-void PointerMoved(State& state, const xinput::PointerRoutedEventArgs& args) {
+[[maybe_unused]] void PointerMoved(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.pointerActive || !state.dragging || !state.canvas ||
         args.Pointer().PointerId() != state.activePointerId) return;
     const auto pos = args.GetCurrentPoint(state.canvas).Position();
@@ -3507,7 +3802,7 @@ void PointerMoved(State& state, const xinput::PointerRoutedEventArgs& args) {
     args.Handled(true);
 }
 
-void PointerReleased(State& state, const xinput::PointerRoutedEventArgs& args) {
+[[maybe_unused]] void PointerReleased(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.pointerActive || !state.canvas ||
         args.Pointer().PointerId() != state.activePointerId) return;
     const auto pos = args.GetCurrentPoint(state.canvas).Position();
@@ -3522,13 +3817,13 @@ void PointerReleased(State& state, const xinput::PointerRoutedEventArgs& args) {
     args.Handled(true);
 }
 
-void PointerCancelled(State& state) {
+[[maybe_unused]] void PointerCancelled(State& state) {
     state.pointerActive = state.dragging = state.iconPressed = false;
     ArmInteractionTimer(state, state.current.kind == LevelKind::Mixer &&
                                PointerInsideHost(state));
 }
 
-void PointerWheel(State& state, const xinput::PointerRoutedEventArgs& args) {
+[[maybe_unused]] void PointerWheel(State& state, const xinput::PointerRoutedEventArgs& args) {
     if (!state.current.valueKnown ||
         state.current.kind == LevelKind::LockStatus ||
         state.current.kind == LevelKind::NoticeStatus ||
@@ -3569,7 +3864,7 @@ void UpdateTextSlots(State& state, int iconFontSize, int valueFontSize) {
         // Both volume/mute glyphs affect intrinsic TextBlock dimensions.
         // Fixed slot across speaker, mute and the verified brightness glyph.
         constexpr const wchar_t* kSpeakerGlyphs[] = {
-            L"\uE74F", L"\uE767", L"\uE706"};
+            osd_glyph::kMute, osd_glyph::kVolume, osd_glyph::kBrightness};
         for (const auto glyph : kSpeakerGlyphs) {
             state.icon.Text(glyph);
             state.icon.Measure(unconstrained);
@@ -3663,30 +3958,30 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
 // of pixel positions. The underline stays centered through custom size/DPI
 // changes, and a second key event reverses from its current visible width.
 void PaintStatusUnderline(State& state) {
-    if (!state.statusUnderline) return;
-    const double width = state.statusLineTextW * state.statusLineRatio;
-    state.statusUnderline.Width(width);
-    controls::Canvas::SetLeft(state.statusUnderline,
-        state.statusLineCenterX - width / 2.0);
+    if (!state.statusView.statusUnderline) return;
+    const double width = state.statusView.statusLineTextW * state.statusView.statusLineRatio;
+    state.statusView.statusUnderline.Width(width);
+    controls::Canvas::SetLeft(state.statusView.statusUnderline,
+        state.statusView.statusLineCenterX - width / 2.0);
     // Interpolate visual emphasis with the same eased width transition.
     const double activeBlend = std::clamp(
-        (state.statusLineRatio - kOffLineRatio) /
+        (state.statusView.statusLineRatio - kOffLineRatio) /
             (1.0 - kOffLineRatio), 0.0, 1.0);
-    state.statusUnderline.Opacity(.57 + .43 * activeBlend);
+    state.statusView.statusUnderline.Opacity(.57 + .43 * activeBlend);
 }
 
 void AdvanceStatusUnderline(State& state, ULONGLONG now) {
-    if (!state.statusLineAnimating) return;
+    if (!state.statusView.statusLineAnimating) return;
     const double fraction = std::clamp(
-        static_cast<double>(now - state.statusLineStart) /
+        static_cast<double>(now - state.statusView.statusLineStart) /
             kStatusLineAnimationMs, 0.0, 1.0);
     // Cubic ease-in/out: gentle start and stop, symmetrical on reversal.
     const double ease = fraction * fraction * (3.0 - 2.0 * fraction);
-    state.statusLineRatio = state.statusLineFrom +
-        (state.statusLineTo - state.statusLineFrom) * ease;
+    state.statusView.statusLineRatio = state.statusView.statusLineFrom +
+        (state.statusView.statusLineTo - state.statusView.statusLineFrom) * ease;
     PaintStatusUnderline(state);
     if (fraction >= 1.0) {
-        state.statusLineAnimating = false;
+        state.statusView.statusLineAnimating = false;
         if (state.host) KillTimer(state.host, kStatusLineTimer);
     }
 }
@@ -3702,32 +3997,32 @@ void TransitionStatusUnderline(State& state, bool sameVisibleStatus,
     if (!sameVisibleStatus) {
         // A fresh card also animates, even when the prior popup expired.
         // The alternate state provides a visible expansion/contraction.
-        state.statusLineRatio = active ? kOffLineRatio : 1.0;
-        state.statusLineAnimating = false;
+        state.statusView.statusLineRatio = active ? kOffLineRatio : 1.0;
+        state.statusView.statusLineAnimating = false;
         if (state.host) KillTimer(state.host, kStatusLineTimer);
-    } else if (sameTarget && !state.statusLineAnimating) {
-        state.statusLineRatio = target;
+    } else if (sameTarget && !state.statusView.statusLineAnimating) {
+        state.statusView.statusLineRatio = target;
     }
-    state.statusLineTextW = textW;
-    state.statusLineCenterX = textX + textW / 2.0;
+    state.statusView.statusLineTextW = textW;
+    state.statusView.statusLineCenterX = textX + textW / 2.0;
     PaintStatusUnderline(state);
 
     // Identical repeat events do not restart an in-flight animation.
-    if (sameTarget && state.statusLineAnimating) return;
-    if (std::abs(state.statusLineRatio - target) < 0.0001) {
-        state.statusLineRatio = target;
-        state.statusLineAnimating = false;
+    if (sameTarget && state.statusView.statusLineAnimating) return;
+    if (std::abs(state.statusView.statusLineRatio - target) < 0.0001) {
+        state.statusView.statusLineRatio = target;
+        state.statusView.statusLineAnimating = false;
         PaintStatusUnderline(state);
         if (state.host) KillTimer(state.host, kStatusLineTimer);
         return;
     }
-    state.statusLineFrom = state.statusLineRatio;
-    state.statusLineTo = target;
-    state.statusLineStart = now;
-    state.statusLineAnimating = true;
+    state.statusView.statusLineFrom = state.statusView.statusLineRatio;
+    state.statusView.statusLineTo = target;
+    state.statusView.statusLineStart = now;
+    state.statusView.statusLineAnimating = true;
     if (!SetTimer(state.host, kStatusLineTimer, 16, nullptr)) {
-        state.statusLineAnimating = false;
-        state.statusLineRatio = target;
+        state.statusView.statusLineAnimating = false;
+        state.statusView.statusLineRatio = target;
         PaintStatusUnderline(state);
     }
 }
@@ -3737,32 +4032,32 @@ void UpdateNoticeDetails(State& state, const Snapshot& value,
                          double bodyW, double headerH, double pad,
                          double, double& totalBodyH) {
     const bool canExpand = osd_model::CanExpand(value);
-    state.noticeHeaderH = headerH;
-    state.noticeChevron.Visibility(canExpand
+    state.statusView.noticeHeaderH = headerH;
+    state.statusView.noticeChevron.Visibility(canExpand
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
     // Same XAML Button/glyph contract as the volume Mixer.
-    state.noticeChevron.Content(winrt::box_value(winrt::hstring(
+    state.statusView.noticeChevron.Content(winrt::box_value(winrt::hstring(
         osd_layout::MixerChevronGlyph(value.noticeDirection))));
-    state.noticeChevron.Foreground(Brush(value.accent));
+    state.statusView.noticeChevron.Foreground(Brush(value.accent));
     const double size = std::clamp(headerH * .32, 20.0, 28.0);
-    state.noticeChevron.Width(size);
-    state.noticeChevron.Height(size);
-    controls::Canvas::SetLeft(state.noticeChevron,
+    state.statusView.noticeChevron.Width(size);
+    state.statusView.noticeChevron.Height(size);
+    controls::Canvas::SetLeft(state.statusView.noticeChevron,
         std::max(0.0, bodyW - pad - size));
-    controls::Canvas::SetTop(state.noticeChevron,
+    controls::Canvas::SetTop(state.statusView.noticeChevron,
         std::max(0.0, (headerH - size) * .5));
-    state.noticeHeading.Visibility(wx::Visibility::Collapsed);
-    state.noticeScroll.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeHeading.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeScroll.Visibility(wx::Visibility::Collapsed);
     // Details occupy a sibling peer window; main card never changes size.
     totalBodyH = headerH;
 }
-void ToggleNoticeDetails(State& state) {
+[[maybe_unused]] void ToggleNoticeDetails(State& state) {
     if (!state.viewOnly && osd_model::CanExpand(state.current))
         SendInput(state, InputAction::ToggleNoticeDetails, 0);
 }
 void DrawNoticeDetailsPanel(State& state, const Snapshot& value) {
     if (!state.host || !state.card || !state.canvas ||
-        !state.noticeHeading || !state.noticeScroll || !state.noticeRows)
+        !state.statusView.noticeHeading || !state.statusView.noticeScroll || !state.statusView.noticeRows)
         return;
     state.current = value;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
@@ -3786,31 +4081,31 @@ void DrawNoticeDetailsPanel(State& state, const Snapshot& value) {
     state.value.Visibility(wx::Visibility::Collapsed);
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
-    state.statusTile.Visibility(wx::Visibility::Collapsed);
-    state.statusTitle.Visibility(wx::Visibility::Collapsed);
-    state.statusDetail.Visibility(wx::Visibility::Collapsed);
-    state.statusUnderline.Visibility(wx::Visibility::Collapsed);
-    state.noticeChevron.Visibility(wx::Visibility::Collapsed);
-    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
-    state.mixerSurface.Visibility(wx::Visibility::Collapsed);
-    state.mediaSurface.Visibility(wx::Visibility::Collapsed);
-    state.clipboardFrame.Visibility(wx::Visibility::Collapsed);
-    state.clipboardCaption.Visibility(wx::Visibility::Collapsed);
-    state.noticeHeading.Visibility(wx::Visibility::Visible);
-    state.noticeScroll.Visibility(wx::Visibility::Visible);
+    state.statusView.statusTile.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusTitle.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusDetail.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusUnderline.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerView.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerView.mixerSurface.Visibility(wx::Visibility::Collapsed);
+    state.mediaView.mediaSurface.Visibility(wx::Visibility::Collapsed);
+    state.clipboardView.clipboardFrame.Visibility(wx::Visibility::Collapsed);
+    state.clipboardView.clipboardCaption.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeHeading.Visibility(wx::Visibility::Visible);
+    state.statusView.noticeScroll.Visibility(wx::Visibility::Visible);
     const double headingH = std::max(20.0, value.fontSize * 1.5);
     const double rowH = std::max(26.0, value.fontSize * 1.8);
-    state.noticeHeading.Text(winrt::hstring(value.noticeDetailsHeading));
-    state.noticeHeading.FontSize(std::clamp(value.fontSize, 11, 22));
-    state.noticeHeading.Foreground(Brush(value.text));
-    state.noticeHeading.Width(std::max(1.0, w - 2.0 * pad));
-    controls::Canvas::SetLeft(state.noticeHeading, pad);
-    controls::Canvas::SetTop(state.noticeHeading, pad);
-    state.noticeScroll.Width(std::max(1.0, w - 2.0 * pad));
-    state.noticeScroll.Height(std::max(1.0, h - headingH - 2.5 * pad));
-    controls::Canvas::SetLeft(state.noticeScroll, pad);
-    controls::Canvas::SetTop(state.noticeScroll, pad * 1.5 + headingH);
-    state.noticeRows.Children().Clear();
+    state.statusView.noticeHeading.Text(winrt::hstring(value.noticeDetailsHeading));
+    state.statusView.noticeHeading.FontSize(std::clamp(value.fontSize, 11, 22));
+    state.statusView.noticeHeading.Foreground(Brush(value.text));
+    state.statusView.noticeHeading.Width(std::max(1.0, w - 2.0 * pad));
+    controls::Canvas::SetLeft(state.statusView.noticeHeading, pad);
+    controls::Canvas::SetTop(state.statusView.noticeHeading, pad);
+    state.statusView.noticeScroll.Width(std::max(1.0, w - 2.0 * pad));
+    state.statusView.noticeScroll.Height(std::max(1.0, h - headingH - 2.5 * pad));
+    controls::Canvas::SetLeft(state.statusView.noticeScroll, pad);
+    controls::Canvas::SetTop(state.statusView.noticeScroll, pad * 1.5 + headingH);
+    state.statusView.noticeRows.Children().Clear();
     for (const auto& name : value.noticeDetails) {
         controls::TextBlock row;
         row.Text(winrt::hstring(name));
@@ -3819,17 +4114,17 @@ void DrawNoticeDetailsPanel(State& state, const Snapshot& value) {
         row.FontSize(std::clamp(value.fontSize - 2, 10, 18));
         row.Foreground(Brush(value.text));
         row.TextTrimming(wx::TextTrimming::CharacterEllipsis);
-        state.noticeRows.Children().Append(row);
+        state.statusView.noticeRows.Children().Append(row);
     }
     ShowPositionedSurface(state, value, frame.insetX, frame.insetY, w, h);
 }
 
 void DrawStatusSnapshot(State& state, const Snapshot& value) {
     if (!state.host || !state.card || !state.canvas ||
-        !state.statusTile || !state.statusTitle || !state.statusGlyph ||
-        !state.statusDetail || !state.statusUnderline ||
-        !state.noticeScroll || !state.noticeRows ||
-        !state.noticeHeading || !state.noticeChevron) return;
+        !state.statusView.statusTile || !state.statusView.statusTitle || !state.statusView.statusGlyph ||
+        !state.statusView.statusDetail || !state.statusView.statusUnderline ||
+        !state.statusView.noticeScroll || !state.statusView.noticeRows ||
+        !state.statusView.noticeHeading || !state.statusView.noticeChevron) return;
     if (state.pointerActive && state.canvas)
         state.canvas.ReleasePointerCaptures();
     // Sample previous value before overwriting the key and toggle state.
@@ -3840,8 +4135,8 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     const bool sameNotice =
         osd_model::SameNotice(state.current, value, visible);
     if (!sameNotice) {
-        state.noticeExpanded = false;
-        state.noticeNormalDurationMs = value.durationMs;
+        state.statusView.noticeExpanded = false;
+        state.statusView.noticeNormalDurationMs = value.durationMs;
     }
     state.wheelRemainder = 0;
     state.dragging = state.iconPressed = state.pointerActive = false;
@@ -3869,68 +4164,68 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
 
-    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
-    state.mixerSurface.Visibility(wx::Visibility::Collapsed);
-    state.statusTile.Visibility(wx::Visibility::Visible);
-    state.statusGlyph.Visibility(wx::Visibility::Visible);
-    state.statusTitle.Visibility(wx::Visibility::Visible);
-    state.statusDetail.Visibility(wx::Visibility::Visible);
+    state.mixerView.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerView.mixerSurface.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusTile.Visibility(wx::Visibility::Visible);
+    state.statusView.statusGlyph.Visibility(wx::Visibility::Visible);
+    state.statusView.statusTitle.Visibility(wx::Visibility::Visible);
+    state.statusView.statusDetail.Visibility(wx::Visibility::Visible);
     const bool lock = value.kind == LevelKind::LockStatus;
-    state.statusUnderline.Visibility(lock
+    state.statusView.statusUnderline.Visibility(lock
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
     if (!lock) {
-        if (state.statusLineAnimating && state.host)
+        if (state.statusView.statusLineAnimating && state.host)
             KillTimer(state.host, kStatusLineTimer);
-        state.statusLineAnimating = false;
+        state.statusView.statusLineAnimating = false;
     }
 
-    state.statusTile.Width(tileSize);
-    state.statusTile.Height(tileSize);
-    state.statusGlyph.Width(tileSize);
+    state.statusView.statusTile.Width(tileSize);
+    state.statusView.statusTile.Height(tileSize);
+    state.statusView.statusGlyph.Width(tileSize);
     const double tileRadius = std::min(tileSize * .19, radius);
-    state.statusTile.CornerRadius(wx::CornerRadius{
+    state.statusView.statusTile.CornerRadius(wx::CornerRadius{
         tileRadius, tileRadius, tileRadius, tileRadius});
-    state.statusTile.Background(Brush(value.track, 120));
-    controls::Canvas::SetLeft(state.statusTile, tileX);
-    controls::Canvas::SetTop(state.statusTile, tileY);
+    state.statusView.statusTile.Background(Brush(value.track, 120));
+    controls::Canvas::SetLeft(state.statusView.statusTile, tileX);
+    controls::Canvas::SetTop(state.statusView.statusTile, tileY);
 
-    state.statusGlyph.FontFamily(media::FontFamily{
+    state.statusView.statusGlyph.FontFamily(media::FontFamily{
         value.statusFontIcon ? L"Segoe Fluent Icons" : L"Segoe UI"});
-    state.statusGlyph.Text(winrt::hstring(value.statusGlyph));
-    state.statusGlyph.FontSize(value.statusFontIcon
+    state.statusView.statusGlyph.Text(winrt::hstring(value.statusGlyph));
+    state.statusView.statusGlyph.FontSize(value.statusFontIcon
         ? std::clamp(tileSize * .53, 15.0, 32.0)
         : static_cast<double>(value.statusGlyph.size() > 1
             ? std::clamp(value.fontSize, 12, 24)
             : std::clamp(value.iconSize + 7, 16, 32)));
-    state.statusGlyph.Foreground(Brush(
+    state.statusView.statusGlyph.Foreground(Brush(
         value.statusFontIcon || value.statusActive ? value.accent : value.text,
         value.statusFontIcon || value.statusActive ? 255 : 195));
-    state.statusTitle.Text(winrt::hstring(value.statusTitle));
-    state.statusDetail.Text(winrt::hstring(value.statusDetail));
+    state.statusView.statusTitle.Text(winrt::hstring(value.statusTitle));
+    state.statusView.statusDetail.Text(winrt::hstring(value.statusDetail));
     const int titleFont = layout.titleFont, detailFont = layout.detailFont;
-    state.statusTitle.FontSize(titleFont);
-    state.statusDetail.FontSize(detailFont);
-    state.statusTitle.Foreground(Brush(value.text));
-    state.statusDetail.Foreground(Brush(value.text, 195));
-    state.statusTitle.Width(textW);
-    state.statusDetail.Width(textW);
-    state.statusTitle.TextTrimming(wx::TextTrimming::CharacterEllipsis);
-    state.statusDetail.TextTrimming(wx::TextTrimming::CharacterEllipsis);
+    state.statusView.statusTitle.FontSize(titleFont);
+    state.statusView.statusDetail.FontSize(detailFont);
+    state.statusView.statusTitle.Foreground(Brush(value.text));
+    state.statusView.statusDetail.Foreground(Brush(value.text, 195));
+    state.statusView.statusTitle.Width(textW);
+    state.statusView.statusDetail.Width(textW);
+    state.statusView.statusTitle.TextTrimming(wx::TextTrimming::CharacterEllipsis);
+    state.statusView.statusDetail.TextTrimming(wx::TextTrimming::CharacterEllipsis);
     const double lineGap = layout.lineGap;
     const double lineHeight = layout.underlineH;
     const double underlineTop = layout.underlineTop;
     const double top = layout.textTop;
-    controls::Canvas::SetLeft(state.statusTitle, textX);
-    controls::Canvas::SetTop(state.statusTitle, top);
-    controls::Canvas::SetLeft(state.statusDetail, textX);
-    controls::Canvas::SetTop(state.statusDetail, top + titleFont * 1.43 + lineGap);
+    controls::Canvas::SetLeft(state.statusView.statusTitle, textX);
+    controls::Canvas::SetTop(state.statusView.statusTitle, top);
+    controls::Canvas::SetLeft(state.statusView.statusDetail, textX);
+    controls::Canvas::SetTop(state.statusView.statusDetail, top + titleFont * 1.43 + lineGap);
     // ON expands to the full text column; OFF contracts to 35%.
     // Animate both while keeping the underline centered below the text.
-    state.statusUnderline.Height(lineHeight);
-    state.statusUnderline.RadiusX(lineHeight / 2.0);
-    state.statusUnderline.RadiusY(lineHeight / 2.0);
-    state.statusUnderline.Fill(Brush(value.accent));
-    controls::Canvas::SetTop(state.statusUnderline, underlineTop);
+    state.statusView.statusUnderline.Height(lineHeight);
+    state.statusView.statusUnderline.RadiusX(lineHeight / 2.0);
+    state.statusView.statusUnderline.RadiusY(lineHeight / 2.0);
+    state.statusView.statusUnderline.Fill(Brush(value.accent));
+    controls::Canvas::SetTop(state.statusView.statusUnderline, underlineTop);
     if (lock)
         TransitionStatusUnderline(state, sameVisibleStatus,
                                   value.statusActive, textX, textW);
@@ -3941,7 +4236,7 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
     state.current = value;
     if (value.kind == LevelKind::NoticeStatus)
         state.current.durationMs = osd_model::NoticeDuration(
-            value, state.noticeExpanded, state.noticeNormalDurationMs);
+            value, state.statusView.noticeExpanded, state.statusView.noticeNormalDurationMs);
     ShowPositionedSurface(state, state.current, insetX, insetY,
                           bodyW, totalBodyH);
 }
@@ -3949,8 +4244,8 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
 
 void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
     if (!state.host || !state.card || !state.canvas ||
-        !state.clipboardFrame || !state.clipboardImage ||
-        !state.clipboardCaption) return;
+        !state.clipboardView.clipboardFrame || !state.clipboardView.clipboardImage ||
+        !state.clipboardView.clipboardCaption) return;
     state.scale = std::clamp(static_cast<double>(data.scale), 0.5, 6.0);
     const auto layout = osd_layout::ClipboardGeometry(data);
     const double insetX = layout.frame.insetX, insetY = layout.frame.insetY;
@@ -3971,40 +4266,40 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
     state.value.Visibility(wx::Visibility::Collapsed);
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
-    state.statusTile.Visibility(wx::Visibility::Collapsed);
-    state.statusTitle.Visibility(wx::Visibility::Collapsed);
-    state.statusDetail.Visibility(wx::Visibility::Collapsed);
-    state.statusUnderline.Visibility(wx::Visibility::Collapsed);
-    state.noticeChevron.Visibility(wx::Visibility::Collapsed);
-    state.noticeHeading.Visibility(wx::Visibility::Collapsed);
-    state.noticeScroll.Visibility(wx::Visibility::Collapsed);
-    if (state.statusLineAnimating) KillTimer(state.host, kStatusLineTimer);
-    state.statusLineAnimating = false;
-    state.noticeExpanded = false;
+    state.statusView.statusTile.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusTitle.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusDetail.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusUnderline.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeHeading.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeScroll.Visibility(wx::Visibility::Collapsed);
+    if (state.statusView.statusLineAnimating) KillTimer(state.host, kStatusLineTimer);
+    state.statusView.statusLineAnimating = false;
+    state.statusView.noticeExpanded = false;
 
     // Do not retain an old image when a new snapshot is malformed.
-    state.clipboardImage.Source(nullptr);
-    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
-    state.mixerSurface.Visibility(wx::Visibility::Collapsed);
-    state.clipboardFrame.Visibility(wx::Visibility::Visible);
-    state.clipboardCaption.Visibility(wx::Visibility::Visible);
-    state.clipboardFrame.Background(Brush(data.track, 72));
+    state.clipboardView.clipboardImage.Source(nullptr);
+    state.mixerView.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerView.mixerSurface.Visibility(wx::Visibility::Collapsed);
+    state.clipboardView.clipboardFrame.Visibility(wx::Visibility::Visible);
+    state.clipboardView.clipboardCaption.Visibility(wx::Visibility::Visible);
+    state.clipboardView.clipboardFrame.Background(Brush(data.track, 72));
     const double previewRadius = std::min(radius, frameH * .14);
-    state.clipboardFrame.CornerRadius(wx::CornerRadius{
+    state.clipboardView.clipboardFrame.CornerRadius(wx::CornerRadius{
         previewRadius, previewRadius, previewRadius, previewRadius});
-    state.clipboardFrame.Width(frameW);
-    state.clipboardFrame.Height(frameH);
-    controls::Canvas::SetLeft(state.clipboardFrame, inset);
-    controls::Canvas::SetTop(state.clipboardFrame, inset);
-    state.clipboardImage.Width(frameW);
-    state.clipboardImage.Height(frameH);
-    state.clipboardCaption.Text(winrt::hstring(data.statusTitle));
-    state.clipboardCaption.Width(frameW);
-    state.clipboardCaption.FontSize(captionFont);
-    state.clipboardCaption.Foreground(Brush(data.text));
-    state.clipboardCaption.TextTrimming(wx::TextTrimming::CharacterEllipsis);
-    controls::Canvas::SetLeft(state.clipboardCaption, inset);
-    controls::Canvas::SetTop(state.clipboardCaption,
+    state.clipboardView.clipboardFrame.Width(frameW);
+    state.clipboardView.clipboardFrame.Height(frameH);
+    controls::Canvas::SetLeft(state.clipboardView.clipboardFrame, inset);
+    controls::Canvas::SetTop(state.clipboardView.clipboardFrame, inset);
+    state.clipboardView.clipboardImage.Width(frameW);
+    state.clipboardView.clipboardImage.Height(frameH);
+    state.clipboardView.clipboardCaption.Text(winrt::hstring(data.statusTitle));
+    state.clipboardView.clipboardCaption.Width(frameW);
+    state.clipboardView.clipboardCaption.FontSize(captionFont);
+    state.clipboardView.clipboardCaption.Foreground(Brush(data.text));
+    state.clipboardView.clipboardCaption.TextTrimming(wx::TextTrimming::CharacterEllipsis);
+    controls::Canvas::SetLeft(state.clipboardView.clipboardCaption, inset);
+    controls::Canvas::SetTop(state.clipboardView.clipboardCaption,
         inset * 2.0 + frameH);
 
     // Construct WriteableBitmap only on the Island's STA. The original
@@ -4012,7 +4307,7 @@ void DrawClipboardImageSnapshot(State& state, const Snapshot& data) {
     if (auto bitmap = BitmapFromPixels(
             data.clipboardWidth, data.clipboardHeight,
             data.clipboardPixels))
-        state.clipboardImage.Source(bitmap);
+        state.clipboardView.clipboardImage.Source(bitmap);
     state.current = data;
     ShowPositionedSurface(state, data, insetX, insetY, bodyW, bodyH);
 }
@@ -4180,22 +4475,22 @@ imaging::WriteableBitmap LoadLocalBackgroundImage(const std::wstring& path) {
 }
 void AdvanceMediaTimeline(State& state) {
     if (state.current.kind!=LevelKind::Media||
-        !state.mediaSlider||!state.mediaElapsed||state.mediaDragging) return;
+        !state.mediaView.mediaSlider||!state.mediaView.mediaElapsed||state.mediaView.mediaDragging) return;
     const auto& m=state.current.media;
     if (!m.hasTimeline||m.end<=m.start) return;
     const uint64_t now=GetTickCount64();
-    if (now<state.mediaPreviewHold) return;
+    if (now<state.mediaView.mediaPreviewHold) return;
     const int64_t pos=osd_model::MediaPosition(m,now);
-    state.mediaPopulating=true;
-    state.mediaSlider.Value(std::clamp(
+    state.mediaView.mediaPopulating=true;
+    state.mediaView.mediaSlider.Value(std::clamp(
         100.0*double(pos-m.start)/double(m.end-m.start),0.0,100.0));
-    state.mediaElapsed.Text(osd_model::MediaTime(pos-m.start));
-    state.mediaPopulating=false;
+    state.mediaView.mediaElapsed.Text(osd_model::MediaTime(pos-m.start));
+    state.mediaView.mediaPopulating=false;
 }
 void DrawMediaSnapshot(State& state,const Snapshot& snap) {
-    if (!state.host||!state.card||!state.canvas||!state.mediaSurface) return;
+    if (!state.host||!state.card||!state.canvas||!state.mediaView.mediaSurface) return;
     const auto& m=snap.media;
-    if (state.current.kind==LevelKind::Media&&state.mediaDragging&&
+    if (state.current.kind==LevelKind::Media&&state.mediaView.mediaDragging&&
         state.current.media.sourceId==m.sourceId&&
         state.current.media.selectionSerial==m.selectionSerial)
         return; // Seeking owns capture; do not reconstruct the controls.
@@ -4233,15 +4528,15 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         state.current.anchor.right==snap.anchor.right&&
         state.current.anchor.bottom==snap.anchor.bottom&&
         state.current.scale==snap.scale;
-    if (state.mediaPreviewHold&&
+    if (state.mediaView.mediaPreviewHold&&
         (prev.sourceId!=m.sourceId||
          prev.selectionSerial!=m.selectionSerial||
-         std::llabs(m.position-state.mediaPreview)<15000000LL))
-        state.mediaPreviewHold=0;
+         std::llabs(m.position-state.mediaView.mediaPreview)<15000000LL))
+        state.mediaView.mediaPreviewHold=0;
     state.current=snap;
     if (same) { AdvanceMediaTimeline(state); return; }
-    state.mediaDragging=false;
-    state.mediaPopulating=true;
+    state.mediaView.mediaDragging=false;
+    state.mediaView.mediaPopulating=true;
     state.dragging=state.iconPressed=state.pointerActive=false;
     const auto g=osd_layout::MediaLayout(snap);
     const double w=g.frame.width,h=g.frame.height;
@@ -4259,43 +4554,43 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
     state.value.Visibility(wx::Visibility::Collapsed);
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
-    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
-    state.mixerSurface.Visibility(wx::Visibility::Collapsed);
-    state.statusTile.Visibility(wx::Visibility::Collapsed);
-    state.statusTitle.Visibility(wx::Visibility::Collapsed);
-    state.statusDetail.Visibility(wx::Visibility::Collapsed);
-    state.statusUnderline.Visibility(wx::Visibility::Collapsed);
-    state.noticeChevron.Visibility(wx::Visibility::Collapsed);
-    state.noticeHeading.Visibility(wx::Visibility::Collapsed);
-    state.noticeScroll.Visibility(wx::Visibility::Collapsed);
-    state.clipboardFrame.Visibility(wx::Visibility::Collapsed);
-    state.clipboardCaption.Visibility(wx::Visibility::Collapsed);
-    state.mediaSurface.Visibility(wx::Visibility::Visible);
-    state.mediaSurface.Width(w);state.mediaSurface.Height(h);
-    state.mediaSlider=nullptr;
-    state.mediaElapsed=nullptr;
-    state.mediaCover=nullptr;
-    state.mediaSurface.Children().Clear();
-    if (state.mediaArtworkCache!=m.encodedArtwork) {
-        state.mediaArtworkCache=m.encodedArtwork;
-        state.mediaBitmap=media_artwork::Decode(m.encodedArtwork);
+    state.mixerView.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerView.mixerSurface.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusTile.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusTitle.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusDetail.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusUnderline.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeHeading.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeScroll.Visibility(wx::Visibility::Collapsed);
+    state.clipboardView.clipboardFrame.Visibility(wx::Visibility::Collapsed);
+    state.clipboardView.clipboardCaption.Visibility(wx::Visibility::Collapsed);
+    state.mediaView.mediaSurface.Visibility(wx::Visibility::Visible);
+    state.mediaView.mediaSurface.Width(w);state.mediaView.mediaSurface.Height(h);
+    state.mediaView.mediaSlider=nullptr;
+    state.mediaView.mediaElapsed=nullptr;
+    state.mediaView.mediaCover=nullptr;
+    state.mediaView.mediaSurface.Children().Clear();
+    if (state.mediaView.mediaArtworkCache!=m.encodedArtwork) {
+        state.mediaView.mediaArtworkCache=m.encodedArtwork;
+        state.mediaView.mediaBitmap=media_artwork::Decode(m.encodedArtwork);
     }
     auto place=[&](wx::FrameworkElement const& e,double x,double y) {
         controls::Canvas::SetLeft(e,x);
         controls::Canvas::SetTop(e,y);
-        state.mediaSurface.Children().Append(e);
+        state.mediaView.mediaSurface.Children().Append(e);
     };
     controls::Border cover;
     cover.Width(g.artSize);cover.Height(g.artSize);
     cover.CornerRadius(wx::CornerRadius{
         g.artCorner,g.artCorner,g.artCorner,g.artCorner});
     cover.Background(Brush(snap.track,180));
-    if (state.mediaBitmap) {
+    if (state.mediaView.mediaBitmap) {
         controls::Image img;
         img.Width(g.artSize);img.Height(g.artSize);
         img.Stretch(media::Stretch::UniformToFill);
-        img.Source(state.mediaBitmap);
-        cover.Child(img);state.mediaCover=img;
+        img.Source(state.mediaView.mediaBitmap);
+        cover.Child(img);state.mediaView.mediaCover=img;
     } else {
         controls::TextBlock fallback;
         fallback.Text(L"\u266B");
@@ -4332,7 +4627,7 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
             corner, corner, corner, corner});
         cycle.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
         cycle.FontSize(g.cycleFont);
-        cycle.Content(winrt::box_value(winrt::hstring(L"\uE76C")));
+        cycle.Content(winrt::box_value(winrt::hstring(osd_glyph::kChevronRight)));
         cycle.Background(Brush(0x181b22,205));
         cycle.Foreground(Brush(0xffffff));
         cycle.Click([&state](auto const&,auto const&) {
@@ -4351,33 +4646,33 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         const int64_t pos=osd_model::MediaPosition(m,GetTickCount64());
         slider.Value(std::clamp(100.0*double(pos-m.start)/
             double(m.end-m.start),0.0,100.0));
-        state.mediaElapsed=text(osd_model::MediaTime(pos-m.start),
+        state.mediaView.mediaElapsed=text(osd_model::MediaTime(pos-m.start),
             g.textX,g.timeY,g.textW*.5,g.timeHeight,
             g.timeFont,190);
         auto total=text(osd_model::MediaTime(m.end-m.start),
             g.textX+g.textW*.5,g.timeY,g.textW*.5,g.timeHeight,
             g.timeFont,190);
         total.TextAlignment(wx::TextAlignment::Right);
-        state.mediaSlider=slider;
+        state.mediaView.mediaSlider=slider;
         slider.ValueChanged([&state](auto const&,auto const& a) {
-            if (state.mediaPopulating||
+            if (state.mediaView.mediaPopulating||
                 state.current.kind!=LevelKind::Media||
                 !state.current.media.canSeek) return;
             const auto& m=state.current.media;
             const int64_t p=m.start+static_cast<int64_t>(std::llround(
                 double(m.end-m.start)*
                 (std::clamp(a.NewValue(),0.0,100.0)/100.0)));
-            if (state.mediaElapsed)
-                state.mediaElapsed.Text(osd_model::MediaTime(p-m.start));
-            if (!state.mediaDragging)
+            if (state.mediaView.mediaElapsed)
+                state.mediaView.mediaElapsed.Text(osd_model::MediaTime(p-m.start));
+            if (!state.mediaView.mediaDragging)
                 SendMediaCommand(state,InputAction::MediaSeek,0,p);
             ArmInteractionTimer(state,true);
         });
         slider.AddHandler(wx::UIElement::PointerPressedEvent(),
             winrt::box_value(xinput::PointerEventHandler(
                 [&state](auto const&,auto const&) {
-                    if(state.current.kind==LevelKind::Media)
-                        state.mediaDragging=true;
+                    if (state.current.kind==LevelKind::Media)
+                        state.mediaView.mediaDragging=true;
                 })),true);
         slider.AddHandler(wx::UIElement::PointerReleasedEvent(),
             winrt::box_value(xinput::PointerEventHandler(
@@ -4412,36 +4707,137 @@ void DrawMediaSnapshot(State& state,const Snapshot& snap) {
         place(b,x-size/2,y-size/2);
     };
     const double sz=g.controlRadius*2;
-    if(m.canPrevious||m.canToggle||m.canNext) {
-        action(1,L"\uE892",g.controlX[0],g.controlsY,
+    if (m.canPrevious||m.canToggle||m.canNext) {
+        action(1,osd_glyph::kMediaPrevious,g.controlX[0],g.controlsY,
                sz,m.canPrevious,false);
-        action(2,m.playing?L"\uE769":L"\uE768",
+        action(2,m.playing?osd_glyph::kMediaPause:osd_glyph::kMediaPlay,
                g.controlX[1],g.controlsY,sz,m.canToggle,false);
-        action(3,L"\uE893",g.controlX[2],g.controlsY,
+        action(3,osd_glyph::kMediaNext,g.controlX[2],g.controlsY,
                sz,m.canNext,false);
     }
-    if(m.canShuffle&&m.shuffleKnown)
-        action(5,L"\uE8B1",g.extraX,g.extraY[0],
+    if (m.canShuffle&&m.shuffleKnown)
+        action(5,osd_glyph::kMediaShuffle,g.extraX,g.extraY[0],
                g.controlRadius,true,m.shuffleActive);
-    if(m.canRepeat&&m.repeatMode>=0)
-        action(6,m.repeatMode==1?L"\uE8ED":L"\uE8EE",
+    if (m.canRepeat&&m.repeatMode>=0)
+        action(6,m.repeatMode==1?osd_glyph::kMediaRepeatOne:osd_glyph::kMediaRepeatAll,
                g.extraX,g.extraY[1],g.controlRadius,true,m.repeatMode>0);
-    state.mediaPopulating=false;
+    state.mediaView.mediaPopulating=false;
     ShowPositionedSurface(state,snap,g.frame.insetX,g.frame.insetY,w,h);
     if (m.hasTimeline&&m.playing)
         SetTimer(state.host,kMediaProgressTimer,100,nullptr);
     else KillTimer(state.host,kMediaProgressTimer);
 }
+// Reused XAML events must still target their original session. An unknown
+// session ID is valid only within the generation where its row was created.
+bool MixerRowBindingValid(const State& state, int index,
+                          const std::wstring& identity,
+                          uint32_t boundGeneration) {
+    if (state.current.kind != LevelKind::Mixer || index < 0 ||
+        static_cast<size_t>(index) >= state.current.mixer.rows.size())
+        return false;
+    if (identity.empty())
+        return state.current.mixer.generation == boundGeneration;
+    return state.current.mixer.rows[index].sessionId == identity;
+}
+
+// A generation bump is NOT a reason to rebuild when the sessions at each
+// index are still identical. Order, output IDs, appearance and layout must
+// match, otherwise fall back to the original full-tree reconstruction.
+bool CanReuseMixerRows(const State& state, const Snapshot& next) {
+    if (state.current.kind != LevelKind::Mixer) return false;
+    const auto& prev = state.current;
+    const auto& a = prev.mixer;
+    const auto& b = next.mixer;
+    if (a.rows.size() != b.rows.size() ||
+        a.outputs.size() != b.outputs.size() ||
+        state.mixerView.mixerRowVisuals.size() != b.rows.size() ||
+        !state.mixerView.mixerColumn || !state.mixerView.mixerRows ||
+        state.mixerView.mixerColumn.Children().Size() == 0)
+        return false;
+    if (a.title != b.title || a.outputHeading != b.outputHeading ||
+        a.selectedOutput != b.selectedOutput ||
+        a.outputError != b.outputError ||
+        a.outputExpanded != b.outputExpanded ||
+        a.outputFailed != b.outputFailed ||
+        a.maxVisibleRows != b.maxVisibleRows)
+        return false;
+    if (prev.anchor.left != next.anchor.left ||
+        prev.anchor.top != next.anchor.top ||
+        prev.anchor.right != next.anchor.right ||
+        prev.anchor.bottom != next.anchor.bottom ||
+        prev.scale != next.scale || prev.vertical != next.vertical ||
+        prev.innerPadding != next.innerPadding ||
+        prev.fontSize != next.fontSize ||
+        prev.cornerRadius != next.cornerRadius ||
+        prev.borderless != next.borderless ||
+        prev.background != next.background ||
+        prev.backgroundAlpha != next.backgroundAlpha ||
+        prev.text != next.text || prev.track != next.track ||
+        prev.accent != next.accent ||
+        prev.layeredBackground != next.layeredBackground ||
+        prev.backgroundMarkup != next.backgroundMarkup ||
+        !osd_model::SameBrushLayers(prev.backgroundLayers,
+                                    next.backgroundLayers))
+        return false;
+    for (size_t i = 0; i < b.outputs.size(); ++i)
+        if (a.outputs[i].title != b.outputs[i].title ||
+            a.outputs[i].selected != b.outputs[i].selected ||
+            a.outputs[i].id != b.outputs[i].id)
+            return false;
+    for (size_t i = 0; i < b.rows.size(); ++i) {
+        const auto& oldRow = a.rows[i];
+        const auto& newRow = b.rows[i];
+        const auto& visual = state.mixerView.mixerRowVisuals[i];
+        if (!visual.mute || !visual.slider || !visual.percentLabel ||
+            newRow.sessionId.empty() ||
+            oldRow.sessionId != newRow.sessionId ||
+            oldRow.title != newRow.title ||
+            oldRow.iconPixels != newRow.iconPixels)
+            return false;
+    }
+    return true;
+}
+
+// XAML redraws the changed properties. Preserve the control tree, wheel
+// state, event registrations, ScrollViewer and Slider pointer capture.
+void UpdateMixerRowVisuals(State& state, const Snapshot& next) {
+    for (size_t i = 0; i < next.mixer.rows.size(); ++i) {
+        auto& visual = state.mixerView.mixerRowVisuals[i];
+        const auto& row = next.mixer.rows[i];
+        if (visual.muted != row.muted) {
+            if (visual.icon) {
+                visual.icon.Opacity(row.muted ? .35 : 1.0);
+            } else {
+                visual.mute.Content(winrt::box_value(winrt::hstring(
+                    row.muted ? osd_glyph::kMute : osd_glyph::kVolume)));
+            }
+            visual.muted = row.muted;
+        }
+        if (visual.enabled != row.enabled) {
+            visual.mute.IsEnabled(row.enabled);
+            visual.slider.IsEnabled(row.enabled);
+            visual.enabled = row.enabled;
+        }
+        const int percent = std::clamp(row.percent, 0, 100);
+        if (std::abs(visual.slider.Value() - static_cast<double>(percent)) > .49)
+            visual.slider.Value(percent);
+        const winrt::hstring percentText(std::to_wstring(percent) + L"%");
+        if (visual.percentLabel.Text() != percentText)
+            visual.percentLabel.Text(percentText);
+    }
+}
+
 void DrawMixerSnapshot(State& state, const Snapshot& data) {
     if (!state.host || !state.canvas || !state.card ||
-        !state.mixerSurface || !state.mixerColumn ||
-        !state.mixerRows || !state.mixerRowsScroll ||
-        !state.mixerOutputs || !state.mixerOutputsScroll) return;
-    state.mixerPopulating = true;
+        !state.mixerView.mixerSurface || !state.mixerView.mixerColumn ||
+        !state.mixerView.mixerRows || !state.mixerView.mixerRowsScroll ||
+        !state.mixerView.mixerOutputs || !state.mixerView.mixerOutputsScroll) return;
+    const bool reuseRows = CanReuseMixerRows(state, data);
+    state.mixerView.mixerPopulating = true;
     if (state.current.kind != LevelKind::Mixer ||
         state.current.mixer.generation != data.mixer.generation) {
-        state.mixerWheelRow = -1;
-        state.mixerWheelRemainder = 0;
+        state.mixerView.mixerWheelRow = -1;
+        state.mixerView.mixerWheelRemainder = 0;
     }
     state.current = data;
     const auto frame = osd_layout::LevelFrame(data);
@@ -4465,30 +4861,37 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     state.value.Visibility(wx::Visibility::Collapsed);
     state.track.Visibility(wx::Visibility::Collapsed);
     state.fill.Visibility(wx::Visibility::Collapsed);
-    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
-    state.statusTile.Visibility(wx::Visibility::Collapsed);
-    state.statusTitle.Visibility(wx::Visibility::Collapsed);
-    state.statusDetail.Visibility(wx::Visibility::Collapsed);
-    state.statusUnderline.Visibility(wx::Visibility::Collapsed);
-    state.noticeChevron.Visibility(wx::Visibility::Collapsed);
-    state.noticeHeading.Visibility(wx::Visibility::Collapsed);
-    state.noticeScroll.Visibility(wx::Visibility::Collapsed);
-    state.clipboardFrame.Visibility(wx::Visibility::Collapsed);
-    state.clipboardCaption.Visibility(wx::Visibility::Collapsed);
-    state.clipboardImage.Source(nullptr);
-    if (state.statusLineAnimating) KillTimer(state.host, kStatusLineTimer);
-    state.statusLineAnimating = false;
-    state.noticeExpanded = false;
+    state.mixerView.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusTile.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusTitle.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusDetail.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusUnderline.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeHeading.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeScroll.Visibility(wx::Visibility::Collapsed);
+    state.clipboardView.clipboardFrame.Visibility(wx::Visibility::Collapsed);
+    state.clipboardView.clipboardCaption.Visibility(wx::Visibility::Collapsed);
+    state.clipboardView.clipboardImage.Source(nullptr);
+    if (state.statusView.statusLineAnimating) KillTimer(state.host, kStatusLineTimer);
+    state.statusView.statusLineAnimating = false;
+    state.statusView.noticeExpanded = false;
 
-    state.mixerSurface.Visibility(wx::Visibility::Visible);
-    state.mixerSurface.Background(Brush(data.background, 0));
-    state.mixerSurface.Width(w);
-    state.mixerSurface.Height(h);
-    controls::Canvas::SetLeft(state.mixerSurface, 0.0);
-    controls::Canvas::SetTop(state.mixerSurface, 0.0);
-    state.mixerColumn.Width(contentW);
-    state.mixerColumn.Margin(wx::Thickness{pad, pad * .4, pad, pad * .4});
-    state.mixerColumn.Children().Clear();
+    state.mixerView.mixerSurface.Visibility(wx::Visibility::Visible);
+    state.mixerView.mixerSurface.Background(Brush(data.background, 0));
+    state.mixerView.mixerSurface.Width(w);
+    state.mixerView.mixerSurface.Height(h);
+    controls::Canvas::SetLeft(state.mixerView.mixerSurface, 0.0);
+    controls::Canvas::SetTop(state.mixerView.mixerSurface, 0.0);
+    state.mixerView.mixerColumn.Width(contentW);
+    state.mixerView.mixerColumn.Margin(wx::Thickness{pad, pad * .4, pad, pad * .4});
+    if (reuseRows) {
+        UpdateMixerRowVisuals(state, data);
+        state.mixerView.mixerPopulating = false;
+        ShowPositionedSurface(state, data, frame.insetX, frame.insetY, w, h);
+        return;
+    }
+    state.mixerView.mixerRowVisuals.clear();
+    state.mixerView.mixerColumn.Children().Clear();
 
     auto makeButton = [&](const std::wstring& title, double width,
                           double height) {
@@ -4524,12 +4927,12 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     title.VerticalAlignment(wx::VerticalAlignment::Center);
     title.TextTrimming(wx::TextTrimming::CharacterEllipsis);
     header.Children().Append(title);
-    auto close = makeIconButton(L"\uE8BB", 34.0);
+    auto close = makeIconButton(osd_glyph::kClose, 34.0);
     close.Click([&state](auto const&, auto const&) {
         SendMixerInput(state, InputAction::CloseMixer, -1);
     });
     header.Children().Append(close);
-    state.mixerColumn.Children().Append(header);
+    state.mixerView.mixerColumn.Children().Append(header);
 
     const auto& model = data.mixer;
     auto output = makeButton(
@@ -4541,7 +4944,7 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     output.Click([&state](auto const&, auto const&) {
         SendMixerInput(state, InputAction::MixerToggleOutput, -1);
     });
-    state.mixerColumn.Children().Append(output);
+    state.mixerView.mixerColumn.Children().Append(output);
 
     const double availableMenuH = std::max(32.0,
         h - 2.0 * pad - 36.0 - 32.0);
@@ -4550,10 +4953,10 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
             static_cast<double>(std::min<size_t>(
                 model.outputs.size(), 4)) * 32.0, availableMenuH)
         : 0.0;
-    state.mixerOutputsScroll.Visibility(model.outputExpanded
+    state.mixerView.mixerOutputsScroll.Visibility(model.outputExpanded
         ? wx::Visibility::Visible : wx::Visibility::Collapsed);
     if (model.outputExpanded) {
-        state.mixerOutputs.Children().Clear();
+        state.mixerView.mixerOutputs.Children().Clear();
         for (size_t i = 0; i < model.outputs.size(); ++i) {
             const auto& item = model.outputs[i];
             auto option = makeButton(
@@ -4563,11 +4966,11 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
             option.Click([&state, index](auto const&, auto const&) {
                 SendMixerInput(state, InputAction::MixerSelectOutput, index);
             });
-            state.mixerOutputs.Children().Append(option);
+            state.mixerView.mixerOutputs.Children().Append(option);
         }
-        state.mixerOutputsScroll.Width(contentW);
-        state.mixerOutputsScroll.Height(std::max(30.0, outputRowsH));
-        state.mixerColumn.Children().Append(state.mixerOutputsScroll);
+        state.mixerView.mixerOutputsScroll.Width(contentW);
+        state.mixerView.mixerOutputsScroll.Height(std::max(30.0, outputRowsH));
+        state.mixerView.mixerColumn.Children().Append(state.mixerView.mixerOutputsScroll);
     }
 
     // The host size is a setting; the scrollbar uses the remaining space.
@@ -4577,9 +4980,10 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         h - 2.0 * pad - 36.0 - 32.0 - outputRowsH);
     const double maxH = std::max(rowH, model.maxVisibleRows * rowH);
     const double viewportH = std::min(availableH, maxH);
-    state.mixerRowsScroll.Width(contentW);
-    state.mixerRowsScroll.Height(viewportH);
-    state.mixerRows.Children().Clear();
+    state.mixerView.mixerRowsScroll.Width(contentW);
+    state.mixerView.mixerRowsScroll.Height(viewportH);
+    state.mixerView.mixerRows.Children().Clear();
+    state.mixerView.mixerRowVisuals.reserve(model.rows.size());
     const double muteW = 34.0, percentW = 43.0;
     // Give the app name less of each row; preserve a dedicated gap between
     // the right-aligned percent label and the ScrollViewer's vertical bar.
@@ -4590,11 +4994,16 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
     for (size_t i = 0; i < model.rows.size(); ++i) {
         const auto& item = model.rows[i];
         const int index = static_cast<int>(i);
+        const std::wstring rowIdentity = item.sessionId;
+        const uint32_t boundGeneration = model.generation;
+        MixerRowVisual visual;
+        visual.muted = item.muted;
+        visual.enabled = item.enabled;
         controls::StackPanel row;
         row.Orientation(controls::Orientation::Horizontal);
         row.Height(rowH);
         auto mute = makeIconButton(
-            item.muted ? L"\uE74F" : L"\uE767", muteW);
+            item.muted ? osd_glyph::kMute : osd_glyph::kVolume, muteW);
         if (item.iconPixels.size() == 20u * 20u * 4u) {
             auto bitmap = BitmapFromPixels(20, 20, item.iconPixels);
             if (bitmap) {
@@ -4605,10 +5014,14 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
                 picture.Opacity(item.muted ? .35 : 1.0);
                 picture.Source(bitmap);
                 mute.Content(picture);
+                visual.icon = picture;
             }
         }
         mute.IsEnabled(item.enabled);
-        mute.Click([&state, index](auto const&, auto const&) {
+        mute.Click([&state, index, rowIdentity, boundGeneration](
+                auto const&, auto const&) {
+            if (!MixerRowBindingValid(state, index, rowIdentity, boundGeneration))
+                return;
             SendMixerInput(state, InputAction::MixerToggleMute, index);
         });
         row.Children().Append(mute);
@@ -4639,9 +5052,11 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         label.Foreground(Brush(data.text));
         // Update feedback without rebuilding the panel during pointer drag.
         slider.ValueChanged(
-            [&state, index, label](auto const&, auto const& args) {
-                if (state.mixerPopulating ||
-                    state.current.kind != LevelKind::Mixer) return;
+            [&state, index, label, rowIdentity, boundGeneration](
+                    auto const&, auto const& args) {
+                if (state.mixerView.mixerPopulating ||
+                    !MixerRowBindingValid(state, index, rowIdentity,
+                                          boundGeneration)) return;
                 const int percent = static_cast<int>(std::lround(
                     std::clamp(args.NewValue(), 0.0, 100.0)));
                 label.Text(winrt::hstring(std::to_wstring(percent) + L"%"));
@@ -4655,26 +5070,26 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
         slider.AddHandler(
             wx::UIElement::PointerWheelChangedEvent(),
             winrt::box_value(xinput::PointerEventHandler(
-                [&state, index](
+                [&state, index, rowIdentity, boundGeneration](
                         winrt::Windows::Foundation::IInspectable const& sender,
                         xinput::PointerRoutedEventArgs const& args) {
                     // Resolve the owning control from this event's sender:
                     // capturing slider in its own handler leaks the visual
                     // tree by forming a strong reference cycle.
                     auto slider = sender.try_as<controls::Slider>();
-                    if (!slider || state.mixerPopulating ||
-                        state.current.kind != LevelKind::Mixer ||
-                        index >= static_cast<int>(state.current.mixer.rows.size()) ||
+                    if (!slider || state.mixerView.mixerPopulating ||
+                        !MixerRowBindingValid(state, index, rowIdentity,
+                                              boundGeneration) ||
                         !slider.IsEnabled()) return;
                     const int delta = args.GetCurrentPoint(slider)
                         .Properties().MouseWheelDelta();
                     if (!delta) return;
-                    if (state.mixerWheelRow != index) {
-                        state.mixerWheelRow = index;
-                        state.mixerWheelRemainder = 0;
+                    if (state.mixerView.mixerWheelRow != index) {
+                        state.mixerView.mixerWheelRow = index;
+                        state.mixerView.mixerWheelRemainder = 0;
                     }
                     const int steps = osd_input::ConsumeWheelSteps(
-                        delta, state.mixerWheelRemainder);
+                        delta, state.mixerView.mixerWheelRemainder);
                     if (steps) {
                         const int current = static_cast<int>(std::lround(
                             std::clamp(slider.Value(), 0.0, 100.0)));
@@ -4691,15 +5106,19 @@ void DrawMixerSnapshot(State& state, const Snapshot& data) {
             true);
         row.Children().Append(slider);
         row.Children().Append(label);
-        state.mixerRows.Children().Append(row);
+        visual.mute = mute;
+        visual.slider = slider;
+        visual.percentLabel = label;
+        state.mixerView.mixerRowVisuals.push_back(std::move(visual));
+        state.mixerView.mixerRows.Children().Append(row);
     }
-    state.mixerRowsScroll.Visibility(model.outputExpanded
+    state.mixerView.mixerRowsScroll.Visibility(model.outputExpanded
         ? wx::Visibility::Collapsed : wx::Visibility::Visible);
     // Output selection occupies the available panel viewport. Do not
     // allow its list to overlap active sliders or escape the card.
     if (!model.outputExpanded)
-        state.mixerColumn.Children().Append(state.mixerRowsScroll);
-    state.mixerPopulating = false;
+        state.mixerView.mixerColumn.Children().Append(state.mixerView.mixerRowsScroll);
+    state.mixerView.mixerPopulating = false;
     ShowPositionedSurface(state, data, frame.insetX, frame.insetY, w, h);
 }
 void DrawSnapshot(State& state, const Snapshot& value) {
@@ -4718,45 +5137,45 @@ void DrawSnapshot(State& state, const Snapshot& value) {
         DrawNoticeDetailsPanel(state, value);
         return;
     }
-    if (state.mixerChevron)
-        state.mixerChevron.Visibility(wx::Visibility::Collapsed);
-    if (state.mixerSurface)
-        state.mixerSurface.Visibility(wx::Visibility::Collapsed);
-    if (state.mediaSurface)
-        state.mediaSurface.Visibility(wx::Visibility::Collapsed);
+    if (state.mixerView.mixerChevron)
+        state.mixerView.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    if (state.mixerView.mixerSurface)
+        state.mixerView.mixerSurface.Visibility(wx::Visibility::Collapsed);
+    if (state.mediaView.mediaSurface)
+        state.mediaView.mediaSurface.Visibility(wx::Visibility::Collapsed);
     if (view == osd_model::View::ClipboardImage) {
         DrawClipboardImageSnapshot(state, value);
         return;
     }
-    if (state.clipboardImage) state.clipboardImage.Source(nullptr);
-    if (state.clipboardFrame)
-        state.clipboardFrame.Visibility(wx::Visibility::Collapsed);
-    if (state.clipboardCaption)
-        state.clipboardCaption.Visibility(wx::Visibility::Collapsed);
+    if (state.clipboardView.clipboardImage) state.clipboardView.clipboardImage.Source(nullptr);
+    if (state.clipboardView.clipboardFrame)
+        state.clipboardView.clipboardFrame.Visibility(wx::Visibility::Collapsed);
+    if (state.clipboardView.clipboardCaption)
+        state.clipboardView.clipboardCaption.Visibility(wx::Visibility::Collapsed);
     if (view == osd_model::View::Status) {
         DrawStatusSnapshot(state, value);
         return;
     }
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
-        !state.fillClip || !state.levelSlider || !state.statusTile) return;
+        !state.fillClip || !state.levelSlider || !state.statusView.statusTile) return;
     if (state.current.kind != value.kind) state.wheelRemainder = 0;
     state.current = value;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
     state.canvas.IsHitTestVisible(true);
-    if (state.statusLineAnimating && state.host)
+    if (state.statusView.statusLineAnimating && state.host)
         KillTimer(state.host, kStatusLineTimer);
-    state.statusLineAnimating = false;
-    state.noticeExpanded = false;
-    state.noticeChevron.Visibility(wx::Visibility::Collapsed);
-    state.mixerChevron.Visibility(wx::Visibility::Collapsed);
-    state.mixerSurface.Visibility(wx::Visibility::Collapsed);
-    state.noticeHeading.Visibility(wx::Visibility::Collapsed);
-    state.noticeScroll.Visibility(wx::Visibility::Collapsed);
-    state.statusTile.Visibility(wx::Visibility::Collapsed);
-    state.statusTitle.Visibility(wx::Visibility::Collapsed);
-    state.statusDetail.Visibility(wx::Visibility::Collapsed);
-    state.statusUnderline.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusLineAnimating = false;
+    state.statusView.noticeExpanded = false;
+    state.statusView.noticeChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerView.mixerChevron.Visibility(wx::Visibility::Collapsed);
+    state.mixerView.mixerSurface.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeHeading.Visibility(wx::Visibility::Collapsed);
+    state.statusView.noticeScroll.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusTile.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusTitle.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusDetail.Visibility(wx::Visibility::Collapsed);
+    state.statusView.statusUnderline.Visibility(wx::Visibility::Collapsed);
     state.track.Visibility(wx::Visibility::Visible);
     state.fill.Visibility(wx::Visibility::Visible);
 
@@ -4811,8 +5230,8 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     state.fill.Visibility(nativeLevel
         ? wx::Visibility::Collapsed : wx::Visibility::Visible);
     // Segoe Fluent Icons is provided by Windows; no external font assets.
-    state.icon.Text(value.brightness ? L"\uE706" :
-        (value.muted || percent == 0 ? L"\uE74F" : L"\uE767"));
+    state.icon.Text(value.brightness ? osd_glyph::kBrightness :
+        (value.muted || percent == 0 ? osd_glyph::kMute : osd_glyph::kVolume));
     const int iconFontSize = std::clamp(value.iconSize, 10, 24);
     const int numberFontSize = std::clamp(value.fontSize, 10, 24);
     state.icon.FontSize(iconFontSize);
@@ -4974,18 +5393,18 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     }
 
     if (mixerButton.visible) {
-        state.mixerChevron.Content(winrt::box_value(
+        state.mixerView.mixerChevron.Content(winrt::box_value(
             winrt::hstring(osd_layout::MixerChevronGlyph(value.mixerDirection))));
-        state.mixerChevron.Width(mixerButton.size);
-        state.mixerChevron.Height(mixerButton.size);
-        controls::Canvas::SetLeft(state.mixerChevron, mixerButton.x);
-        controls::Canvas::SetTop(state.mixerChevron, mixerButton.y);
-        state.mixerChevron.Visibility(wx::Visibility::Visible);
+        state.mixerView.mixerChevron.Width(mixerButton.size);
+        state.mixerView.mixerChevron.Height(mixerButton.size);
+        controls::Canvas::SetLeft(state.mixerView.mixerChevron, mixerButton.x);
+        controls::Canvas::SetTop(state.mixerView.mixerChevron, mixerButton.y);
+        state.mixerView.mixerChevron.Visibility(wx::Visibility::Visible);
     }
     ShowPositionedSurface(state, value, insetX, insetY, bodyW, bodyH);
 }
 void DeliverPending(State& root); // Defined after native/XAML host creation.
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+LRESULT WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_NCCREATE) {
         auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA,
@@ -5001,12 +5420,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 catch (const winrt::hresult_error& ex) {
                     Wh_Log(L"Fluent OSD/XAML: draw exception 0x%08lX; disabling renderer",
                            static_cast<unsigned long>(ex.code()));
-                    g_lifecycle.MarkFailedAndWithdrawReady();
-                    HideAll(*state);
+                    GetXamlState().lifecycle.MarkFailedAndWithdrawReady();
+                    try { HideAll(*state); }
+                    catch (...) { Wh_Log(L"Fluent OSD/XAML: draw cleanup failed"); }
+                    PostQuitMessage(0);
                 } catch (...) {
                     Wh_Log(L"Fluent OSD/XAML: unexpected draw exception; disabling renderer");
-                    g_lifecycle.MarkFailedAndWithdrawReady();
-                    HideAll(*state);
+                    GetXamlState().lifecycle.MarkFailedAndWithdrawReady();
+                    try { HideAll(*state); }
+                    catch (...) { Wh_Log(L"Fluent OSD/XAML: draw cleanup failed"); }
+                    PostQuitMessage(0);
                 }
             }
             return 0;
@@ -5081,6 +5504,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
+// C++/WinRT exceptions must never escape a Win32 window callback.
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    try {
+        return WndProcImpl(hwnd, msg, wp, lp);
+    } catch (const winrt::hresult_error& ex) {
+        Wh_Log(L"Fluent OSD/XAML: HWND callback exception 0x%08lX",
+               static_cast<unsigned long>(ex.code()));
+    } catch (...) {
+        Wh_Log(L"Fluent OSD/XAML: unexpected HWND callback exception");
+    }
+    GetXamlState().lifecycle.MarkFailedAndWithdrawReady();
+    auto* state = reinterpret_cast<State*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (state) {
+        try { HideAll(*state); }
+        catch (...) { Wh_Log(L"Fluent OSD/XAML: error cleanup also failed"); }
+    }
+    PostQuitMessage(0);
+    return 0;
+}
 void CreateContent(State& state) {
     // The XAML Border owns the user-configured radius and alpha.
     // DWM rounding is disabled on the host to avoid conflicting clips.
@@ -5097,7 +5539,7 @@ void CreateContent(State& state) {
 
     controls::TextBlock icon;
     icon.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
-    icon.Text(L"\uE767");
+    icon.Text(osd_glyph::kVolume);
     icon.FontSize(16.0);
     icon.Foreground(Brush(0xf8f8fc));
     canvas.Children().Append(icon);
@@ -5173,7 +5615,7 @@ void CreateContent(State& state) {
 
     controls::Button noticeChevron;
     noticeChevron.Visibility(wx::Visibility::Collapsed);
-    noticeChevron.Content(winrt::box_value(winrt::hstring(L"\uE70D")));
+    noticeChevron.Content(winrt::box_value(winrt::hstring(osd_glyph::kChevronDown)));
     noticeChevron.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
     noticeChevron.MinWidth(0.0);
     noticeChevron.MinHeight(0.0);
@@ -5214,7 +5656,7 @@ void CreateContent(State& state) {
     // becomes a typed command; the render thread owns no Core Audio object.
     controls::Button mixerChevron;
     mixerChevron.Visibility(wx::Visibility::Collapsed);
-    mixerChevron.Content(winrt::box_value(winrt::hstring(L"\uE70D")));
+    mixerChevron.Content(winrt::box_value(winrt::hstring(osd_glyph::kChevronDown)));
     mixerChevron.FontFamily(media::FontFamily{L"Segoe Fluent Icons"});
     // Default Button styles can exceed the width of a vertical OSD.
     mixerChevron.MinWidth(0.0);
@@ -5273,26 +5715,26 @@ void CreateContent(State& state) {
     state.fillClip = fillClip;
     state.levelSlider = levelSlider;
     state.value = value;
-    state.statusTile = statusTile;
-    state.statusGlyph = statusGlyph;
-    state.statusTitle = statusTitle;
-    state.statusDetail = statusDetail;
-    state.statusUnderline = statusUnderline;
-    state.noticeChevron = noticeChevron;
-    state.noticeHeading = noticeHeading;
-    state.noticeRows = noticeRows;
-    state.noticeScroll = noticeScroll;
-    state.clipboardFrame = clipboardFrame;
-    state.clipboardImage = clipboardImage;
-    state.clipboardCaption = clipboardCaption;
-    state.mixerChevron = mixerChevron;
-    state.mixerSurface = mixerSurface;
-    state.mixerColumn = mixerColumn;
-    state.mixerRows = mixerRows;
-    state.mixerOutputs = mixerOutputs;
-    state.mixerRowsScroll = mixerRowsScroll;
-    state.mixerOutputsScroll = mixerOutputsScroll;
-    state.mediaSurface = mediaSurface;
+    state.statusView.statusTile = statusTile;
+    state.statusView.statusGlyph = statusGlyph;
+    state.statusView.statusTitle = statusTitle;
+    state.statusView.statusDetail = statusDetail;
+    state.statusView.statusUnderline = statusUnderline;
+    state.statusView.noticeChevron = noticeChevron;
+    state.statusView.noticeHeading = noticeHeading;
+    state.statusView.noticeRows = noticeRows;
+    state.statusView.noticeScroll = noticeScroll;
+    state.clipboardView.clipboardFrame = clipboardFrame;
+    state.clipboardView.clipboardImage = clipboardImage;
+    state.clipboardView.clipboardCaption = clipboardCaption;
+    state.mixerView.mixerChevron = mixerChevron;
+    state.mixerView.mixerSurface = mixerSurface;
+    state.mixerView.mixerColumn = mixerColumn;
+    state.mixerView.mixerRows = mixerRows;
+    state.mixerView.mixerOutputs = mixerOutputs;
+    state.mixerView.mixerRowsScroll = mixerRowsScroll;
+    state.mixerView.mixerOutputsScroll = mixerOutputsScroll;
+    state.mediaView.mediaSurface = mediaSurface;
     canvas.PointerPressed([&state](auto const&, const xinput::PointerRoutedEventArgs& e) {
         PointerPressed(state, e);
     });
@@ -5363,7 +5805,8 @@ void CreateSurface(State& state, HINSTANCE instance) {
 }
 
 void CloseSurface(State& state) {
-    HideSurface(state);
+    try { HideSurface(state); }
+    catch (...) { Wh_Log(L"Fluent OSD/XAML: teardown hide failed"); }
     // Detach Composition callbacks from all user-defined layers before
     // tearing down the XAML Island and its owning STA.
     try { ClearBackgroundLayers(state); }
@@ -5375,31 +5818,10 @@ void CloseSurface(State& state) {
         catch (...) { Wh_Log(L"Custom background detach failed"); }
     }
     state.backgroundCached = false;
-    state.mediaSlider=nullptr;
-    state.mediaElapsed=nullptr;
-    state.mediaCover=nullptr;
-    state.mediaBitmap=nullptr;
-    state.mediaArtworkCache.clear();
-    state.mediaSurface=nullptr;
-    state.mixerOutputsScroll = nullptr;
-    state.mixerRowsScroll = nullptr;
-    state.mixerOutputs = nullptr;
-    state.mixerRows = nullptr;
-    state.mixerColumn = nullptr;
-    state.mixerSurface = nullptr;
-    state.mixerChevron = nullptr;
-    state.clipboardCaption = nullptr;
-    state.clipboardImage = nullptr;
-    state.clipboardFrame = nullptr;
-    state.noticeScroll = nullptr;
-    state.noticeRows = nullptr;
-    state.noticeHeading = nullptr;
-    state.noticeChevron = nullptr;
-    state.statusUnderline = nullptr;
-    state.statusDetail = nullptr;
-    state.statusTitle = nullptr;
-    state.statusGlyph = nullptr;
-    state.statusTile = nullptr;
+    state.mediaView.ReleaseBeforeIslandClose();
+    state.mixerView.ReleaseBeforeIslandClose();
+    state.clipboardView.ReleaseBeforeIslandClose();
+    state.statusView.ReleaseBeforeIslandClose();
     state.levelSlider = nullptr;
     state.fillClip = nullptr;
     state.fill = nullptr;
@@ -5421,10 +5843,10 @@ void CloseSurface(State& state) {
 }
 
 // The primary STA HWND is the dispatcher. DDC uses one HWND and Island
-// per *physical* target. Every update is a complete snapshot batch,
-// so removed/unresolved targets do not retain stale visible windows.
+// per *physical* target. DDC updates are deltas; other categories reconcile
+// complete snapshots. Each DDC peer keeps its own visibility timer.
 void DeliverPending(State& root) {
-    std::vector<Snapshot> batch = g_snapshots.Take();
+    std::vector<Snapshot> batch = GetXamlState().snapshots.Take();
     if (batch.empty()) return;
     const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
     const bool attached = batch.size() >= 2 &&
@@ -5446,7 +5868,15 @@ void DeliverPending(State& root) {
     root.attachedPeerOpen = false;
     root.pairedPanel = nullptr;
     for (auto it = root.peers.begin(); it != root.peers.end();) {
-        if (active.find(it->first) == active.end()) {
+        const State& peer = *it->second;
+        // A DDC snapshot only updates its changed physical targets. Keep
+        // unrelated, still-visible DDC Islands and their independent timers.
+        // Hidden peers are reclaimed on the next batch; other categories
+        // retain their existing full-snapshot reconciliation behavior.
+        const bool independentDdc = ddc &&
+            peer.current.kind == LevelKind::DdcBrightness &&
+            peer.host && IsWindowVisible(peer.host);
+        if (active.find(it->first) == active.end() && !independentDdc) {
             it->second->pairedVolume = nullptr;
             CloseSurface(*it->second);
             it = root.peers.erase(it);
@@ -5530,11 +5960,11 @@ DWORD WINAPI ThreadProc(void*) {
     bool apartment = false, registered = false;
     const HINSTANCE instance = GetModuleHandleW(nullptr);
     PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
-    g_lifecycle.PublishThreadId(GetCurrentThreadId());
+    GetXamlState().lifecycle.PublishThreadId(GetCurrentThreadId());
     try {
         winrt::init_apartment(winrt::apartment_type::single_threaded);
         apartment = true;
-        if (!g_lifecycle.IsStopping()) {
+        if (!GetXamlState().lifecycle.IsStopping()) {
             WNDCLASSEXW wc{sizeof(wc)};
             wc.lpfnWndProc = WndProc;
             wc.hInstance = instance;
@@ -5546,14 +5976,14 @@ DWORD WINAPI ThreadProc(void*) {
 
             root.manager =
                 hosting::WindowsXamlManager::InitializeForCurrentThread();
-            if (!g_lifecycle.IsStopping()) {
+            if (!GetXamlState().lifecycle.IsStopping()) {
                 CreateSurface(root, instance);
                 // Window.Current is available once the first Island has
                 // been created; the interface applies to the entire STA.
                 TryEnableIslandTransparency();
-                g_lifecycle.PublishReady(root.host);
+                GetXamlState().lifecycle.PublishReady(root.host);
                 Wh_Log(L"Fluent OSD/XAML: renderer ready (per-display DDC)");
-                while (!g_lifecycle.IsStopping() &&
+                while (!GetXamlState().lifecycle.IsStopping() &&
                        GetMessageW(&msg, nullptr, 0, 0) > 0) {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -5563,12 +5993,12 @@ DWORD WINAPI ThreadProc(void*) {
     } catch (const winrt::hresult_error& ex) {
         Wh_Log(L"Fluent OSD/XAML: startup failed 0x%08lX (%s)",
                static_cast<unsigned long>(ex.code()), ex.message().c_str());
-        g_lifecycle.MarkFailed();
+        GetXamlState().lifecycle.MarkFailed();
     } catch (...) {
         Wh_Log(L"Fluent OSD/XAML: unexpected startup exception");
-        g_lifecycle.MarkFailed();
+        GetXamlState().lifecycle.MarkFailed();
     }
-    g_lifecycle.WithdrawReady();
+    GetXamlState().lifecycle.WithdrawReady();
     // Break STA-only peer references before either Island is destroyed;
     // CloseSurface releases pointer captures and may invoke callbacks.
     root.attachedPeerOpen = false;
@@ -5585,34 +6015,51 @@ DWORD WINAPI ThreadProc(void*) {
         root.manager = nullptr;
     }
     if (registered) UnregisterClassW(kClass, instance);
-    if (apartment) winrt::uninit_apartment();
-    g_lifecycle.PublishThreadId(0);
+    if (apartment) {
+        // Drop the STA-owned WinRT stream before CoUninitialize; the
+        // no_destroy TLS cache must not release it during thread exit.
+        osd_blur::ReleaseThreadNoiseCache();
+        winrt::uninit_apartment();
+    }
+    GetXamlState().lifecycle.PublishThreadId(0);
     return 0;
 }
-void Start() {
-    g_lifecycle.Start();
+void Start(HWND receiver) {
+    GetXamlState().lifecycle.Start(receiver);
+}
+bool Restart(HWND receiver) {
+    return GetXamlState().lifecycle.Restart(receiver);
+}
+bool IsFailed() {
+    return GetXamlState().lifecycle.IsFailed();
+}
+bool IsReady() {
+    return GetXamlState().lifecycle.ReadyWindow() != nullptr &&
+           !GetXamlState().lifecycle.IsFailed();
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
-    const HWND hwnd = g_lifecycle.ReadyWindow();
-    if (!hwnd || g_lifecycle.IsStopping() || g_lifecycle.IsFailed() ||
+    const HWND hwnd = GetXamlState().lifecycle.ReadyWindow();
+    if (!hwnd || GetXamlState().lifecycle.IsStopping() || GetXamlState().lifecycle.IsFailed() ||
         snapshots.empty()) return false;
-    g_snapshots.Publish(snapshots);
+    GetXamlState().snapshots.Publish(snapshots);
     return PostMessageW(hwnd, kShowMessage, 0, 0) != FALSE;
 }
 bool IsPrimaryVisible() {
-    const HWND hwnd=g_lifecycle.ReadyWindow();
+    const HWND hwnd=GetXamlState().lifecycle.ReadyWindow();
     return hwnd && IsWindowVisible(hwnd)!=FALSE;
 }
 void Hide() {
-    const HWND hwnd = g_lifecycle.ReadyWindow();
+    const HWND hwnd = GetXamlState().lifecycle.ReadyWindow();
     if (hwnd) PostMessageW(hwnd, kHideMessage, 0, 0);
 }
 void Stop() {
-    g_lifecycle.Stop();
+    GetXamlState().lifecycle.Stop();
 }
 } // namespace xaml_osd
 
 constexpr WCHAR kWindowClass[] = L"WH.NativeOSD.DDC.01E7AFB2";
+constexpr UINT kXamlFailureTrayCallback = WM_APP + 696;
+constexpr UINT kXamlFailureTrayId = 0x32032;
 constexpr ULONG_PTR kCopyDataTag = 0x1E7AFB2;
 constexpr UINT_PTR kEventBatchTimer = 322;
 constexpr UINT_PTR kDdcBatchTimer = 324;
@@ -5650,7 +6097,39 @@ enum class DurationKind : int {
 };
 enum class NoticeCategory { Usb, Bluetooth, Network };
 enum class NoticeIcon { Clipboard, ClipboardFile, ClipboardText, Usb, Bluetooth, Network, Wifi,
-                        Keyboard, Mouse, Headset, Speaker };
+                        Keyboard, Mouse, Headset, Headphone, Speaker };
+// Central icon selection; classification never needs renderer objects.
+namespace osd_glyph {
+constexpr PCWSTR ForNotice(NoticeIcon icon) {
+    switch (icon) {
+        case NoticeIcon::Clipboard:     return kClipboard;
+        case NoticeIcon::ClipboardFile: return kClipboardFile;
+        case NoticeIcon::ClipboardText: return kClipboardText;
+        case NoticeIcon::Usb:           return kUsb;
+        case NoticeIcon::Bluetooth:     return kBluetooth;
+        case NoticeIcon::Network:       return kNetwork;
+        case NoticeIcon::Wifi:          return kWifi;
+        case NoticeIcon::Keyboard:      return kKeyboardStandard;
+        case NoticeIcon::Mouse:         return kMouse;
+        case NoticeIcon::Headset:       return kHeadset;
+        case NoticeIcon::Headphone:     return kHeadphone;
+        case NoticeIcon::Speaker:       return kSpeakers;
+    }
+    return nullptr;
+}
+constexpr PCWSTR ForNative(Kind kind) {
+    switch (kind) {
+        case Kind::Keyboard:   return kKeyboardClassic;
+        case Kind::Airplane:   return kAirplane;
+        case Kind::Camera:     return kCamera;
+        case Kind::Microphone: return kMicrophone;
+        case Kind::Desktop:    return kTaskView;
+        case Kind::Text:       return kPage;
+        default:               return nullptr;
+    }
+}
+} // namespace osd_glyph
+
 enum class NoticeAction { Connected, Disconnected, Removed, NetworkChanged,
                           WifiEnabled, WifiDisabled };
 enum class PopupKind { DdcBrightness, NativeBrightness, NativeVolume, NativeEvent, LockStatus, Notification };
@@ -5796,6 +6275,8 @@ enum class OsdText : size_t {
     VolumeMixer,
     MediaPlayback,
     SystemSounds,
+    XamlRendererFailed,
+    XamlRetryHint,
     ProcessPrefix,
     On,
     Off,
@@ -5850,6 +6331,8 @@ constexpr LocalizedText kLocalizedText[] = {
     {L"Volume mixer", L"音量混音器"}, // VolumeMixer
     {L"Media playback", L"媒體播放"}, // MediaPlayback
     {L"System sounds", L"系統音效"}, // SystemSounds
+    {L"XAML renderer unavailable", L"XAML 顯示引擎無法使用"}, // XamlRendererFailed
+    {L"Click here or the temporary tray icon to retry.", L"點選通知或暫時的通知區圖示，即可手動重試。"}, // XamlRetryHint
     {L"Process ", L"處理程序 "}, // ProcessPrefix
     {L"On", L"開啟"}, // On
     {L"Off", L"關閉"}, // Off
@@ -5875,6 +6358,8 @@ struct PhysicalInfo {
     DWORD physicalIndex = 0;
     DWORD minimum = 0;
     DWORD maximum = 0; // 0 = unknown, do not pretend raw=percent
+    DWORD observedValue = 0;
+    bool valueObserved = false; // Read or successful write, per physical handle.
 };
 
 // Wire format: no process-local HANDLE or pointer crosses WM_COPYDATA.
@@ -5983,7 +6468,7 @@ struct OsdSettingsState {
     std::atomic<bool> validCustomTrack{false};
     std::atomic<int> backgroundOpacity{96};
     std::atomic<bool> useLayeredBackground{false};
-    std::mutex backgroundLayersMutex;
+    mutable std::mutex backgroundLayersMutex;
     std::vector<osd_model::BrushLayer> backgroundLayers;
     std::atomic<int> cornerRadius{17};
     std::atomic<int> fontSize{15};
@@ -6004,15 +6489,45 @@ struct OsdSettingsState {
         backgroundLayers = std::move(layers);
         useLayeredBackground.store(layered, std::memory_order_release);
     }
-    void CopyBrushLayers(bool& layered, std::vector<osd_model::BrushLayer>& layers) {
+    void CopyBrushLayers(bool& layered, std::vector<osd_model::BrushLayer>& layers) const {
         std::lock_guard<std::mutex> lock(backgroundLayersMutex);
         layered = useLayeredBackground.load(std::memory_order_acquire);
         if (layered) layers = backgroundLayers;
         else layers.clear();
     }
 };
-OsdSettingsState g_config;
+// Publish complete settings versions separately from the controller.
+// Readers hold shared ownership until their operations finish.
+struct SettingsModuleState final {
+    std::mutex reloadMutex;
+    std::shared_ptr<const OsdSettingsState> published =
+        std::make_shared<const OsdSettingsState>();
 
+    std::shared_ptr<const OsdSettingsState> Snapshot() const {
+        return std::atomic_load_explicit(&published, std::memory_order_acquire);
+    }
+    void Publish(std::shared_ptr<const OsdSettingsState> next) {
+        std::atomic_store_explicit(
+            &published, std::move(next), std::memory_order_release);
+    }
+    void ReleaseAfterThreadsStop() {
+        std::atomic_store_explicit(
+            &published, std::shared_ptr<const OsdSettingsState>{},
+            std::memory_order_release);
+    }
+};
+SettingsModuleState& GetSettingsModuleState() {
+    [[clang::no_destroy]] static SettingsModuleState instance;
+    return instance;
+}
+std::shared_ptr<const OsdSettingsState> GetSettingsState() {
+    return GetSettingsModuleState().Snapshot();
+}
+
+// Shell creation trampoline ABI is owned by the host module.
+using CreateWindowInBand_t =
+    HWND (WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD,
+                   int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID, DWORD);
 // Entry points and OSD receiver lifecycle; workers keep their own handles.
 struct ModuleRuntimeState {
     bool isExplorer = false;
@@ -6024,9 +6539,11 @@ struct ModuleRuntimeState {
     // The single cross-thread publication of the receiver HWND.
     std::atomic<HWND> publishedReceiver{nullptr};
     bool clipboardListener = false;
+    bool xamlFailureTrayVisible = false; // Receiver-thread only.
     HDEVNOTIFY usbNotification = nullptr;
     std::atomic<bool> closing{false};
     bool shellXamlStarted = false;
+    CreateWindowInBand_t createWindowInBandOriginal = nullptr;
 
     void PublishReceiver(HWND hwnd) {
         publishedReceiver.store(hwnd, std::memory_order_release);
@@ -6040,7 +6557,8 @@ struct ModuleRuntimeState {
         publishedReceiver.store(nullptr, std::memory_order_release);
     }
 };
-ModuleRuntimeState g_module;
+// Module host lifecycle is owned by CoreModuleState below.
+
 
 struct NoticeBatch {
     NoticeCategory category = NoticeCategory::Usb;
@@ -6067,7 +6585,8 @@ struct NoticeRuntimeState {
 
     void ResetBatch() { batch = NoticeBatch{}; }
 };
-NoticeRuntimeState g_notice;
+// Notice state is owned by NoticeModuleState below.
+
 
 struct NetInterfaceState {
     std::wstring name;
@@ -6099,14 +6618,24 @@ struct NetworkRuntimeState {
         hintPending = false;
         hintLevel = -1;
     }
+    void ReleaseAfterControllerStops() {
+        std::unordered_map<std::string, NetInterfaceState> oldInterfaces;
+        interfaces.swap(oldInterfaces);
+    }
     // Stop subscriptions before WLAN teardown; release iphlpapi.dll last.
-    void CancelCallbacksOnControllerThread();
+    // Preserve handles on cancellation failure for another shutdown attempt.
+    bool CancelCallbacksOnControllerThread();
     void ReleaseLibraryOnControllerThread() {
+        if (notification || ipNotification || addressNotification) {
+            Wh_Log(L"Fluent OSD/network: iphlpapi still owns active registrations");
+            return;
+        }
         if (dll) FreeLibrary(dll);
         dll = nullptr;
     }
 };
-NetworkRuntimeState g_network;
+// Network state is owned by ConnectivityModuleState below.
+
 
 // The SMTC worker never touches HWND/GDI+/CoreAudio objects directly.
 struct MediaSnapshot {
@@ -6216,10 +6745,12 @@ struct MediaRuntimeState {
         // Old storage is destroyed after both locks are released.
     }
 };
-[[clang::no_destroy]] MediaRuntimeState g_media;
+// Explicit media worker lifetime is owned by AudioModuleState below.
+
 
 struct MixerEntry {
     std::wstring title;
+    std::wstring sessionId; // IAudioSessionControl2 session instance identity.
     HICON appIcon = nullptr; // owned; released before clear
     std::vector<uint8_t> iconPixels; // Captured once per session refresh.
     Microsoft::WRL::ComPtr<ISimpleAudioVolume> volume;
@@ -6341,7 +6872,8 @@ struct MixerRuntimeState {
         outputId.swap(oldOutputId);
     }
 };
-[[clang::no_destroy]] MixerRuntimeState g_mixer;
+// Core Audio / Mixer lifetime is owned by AudioModuleState below.
+
 
 // Interactive panel state is independent of Core Audio ownership.
 struct PanelControllerState {
@@ -6350,7 +6882,17 @@ struct PanelControllerState {
     bool mediaOpen = false;
     uint32_t mixerGeneration = 1, mediaGeneration = 1;
 };
-PanelControllerState g_panel;
+// All Core Audio COM operations retain their controller-apartment owner.
+// no_destroy retains the existing explicit worker/controller cleanup contract.
+struct AudioModuleState final {
+    MediaRuntimeState media;
+    MixerRuntimeState mixer;
+    PanelControllerState panel;
+};
+AudioModuleState& GetAudioState() {
+    [[clang::no_destroy]] static AudioModuleState instance;
+    return instance;
+}
 
 // Low-level keyboard hook and key latches share a single UI-thread owner.
 struct LockKeyState {
@@ -6360,7 +6902,28 @@ struct LockKeyState {
     int last = 0;
     bool lastValue = false;
 };
-LockKeyState g_keys;
+// Notice and keyboard state remain controller-thread owned.
+struct NoticeModuleState final {
+    NoticeRuntimeState notice;
+    LockKeyState keys;
+    void ReleaseAfterControllerStops() {
+        // The receiver already revoked its hook and released its HBITMAP.
+        // Only dynamic storage belongs here; never release HWND/HHOOK off-owner.
+        std::wstring oldTitle, oldBody;
+        NoticeBatch oldBatch;
+        std::vector<std::wstring> oldDetails;
+        std::unordered_map<std::wstring, std::wstring> oldUsbNames;
+        notice.title.swap(oldTitle);
+        notice.body.swap(oldBody);
+        std::swap(notice.batch, oldBatch);
+        notice.details.swap(oldDetails);
+        notice.usbNames.swap(oldUsbNames);
+    }
+};
+NoticeModuleState& GetNoticeState() {
+    [[clang::no_destroy]] static NoticeModuleState instance;
+    return instance;
+}
 
 // --- Event state and worker coordination ---
 struct NativeEventMailbox {
@@ -6398,9 +6961,17 @@ struct NativeEventMailbox {
         ReleaseSRWLockExclusive(&lock);
     }
 };
-[[clang::no_destroy]] NativeEventMailbox g_nativeMailbox;
+struct NativeEventModuleState final {
+    NativeEventMailbox mailbox;
+};
+NativeEventModuleState& GetNativeEventState() {
+    [[clang::no_destroy]] static NativeEventModuleState instance;
+    return instance;
+}
 
 struct DdcRuntimeState {
+    // This guard belongs to the DDC owner type but remains per-calling-thread.
+    static thread_local bool insideHighLevelSet;
     // Handle identity cache is hook-thread shared; batches and pending writes
     // are exclusively owned by the native controller thread.
     struct PendingWrite {
@@ -6437,6 +7008,28 @@ struct DdcRuntimeState {
             it->second.maximum = high;
         }
         ReleaseSRWLockExclusive(&handleLock);
+    }
+    void ObserveRead(HANDLE handle, DWORD value) {
+        AcquireSRWLockExclusive(&handleLock);
+        auto it = handles.find(reinterpret_cast<ULONG_PTR>(handle));
+        if (it != handles.end()) {
+            it->second.observedValue = value;
+            it->second.valueObserved = true;
+        }
+        ReleaseSRWLockExclusive(&handleLock);
+    }
+    bool RecordSuccessfulWrite(HANDLE handle, DWORD value) {
+        AcquireSRWLockExclusive(&handleLock);
+        auto it = handles.find(reinterpret_cast<ULONG_PTR>(handle));
+        bool changed = true; // Unknown baseline: do not suppress the first write.
+        if (it != handles.end()) {
+            changed = !it->second.valueObserved ||
+                it->second.observedValue != value;
+            it->second.observedValue = value;
+            it->second.valueObserved = true;
+        }
+        ReleaseSRWLockExclusive(&handleLock);
+        return changed;
     }
     void RememberHandles(PCWSTR device, DWORD count,
                          LPPHYSICAL_MONITOR items) {
@@ -6539,7 +7132,9 @@ struct DdcRuntimeState {
         batchPending = false;
     }
 };
-[[clang::no_destroy]] DdcRuntimeState g_ddc;
+thread_local bool DdcRuntimeState::insideHighLevelSet = false;
+// DDC hook data and worker use the same explicit unload phase.
+
 
 struct BrightnessWriterState {
     SRWLOCK lock = SRWLOCK_INIT;
@@ -6626,8 +7221,29 @@ struct BrightnessWriterState {
         ReleaseSRWLockExclusive(&lock);
     }
 };
-[[clang::no_destroy]] BrightnessWriterState g_writer;
+// DDC and brightness writer state are owned independently of the UI module.
+struct BrightnessModuleState final {
+    DdcRuntimeState ddc;
+    BrightnessWriterState writer;
+};
+BrightnessModuleState& GetBrightnessState() {
+    [[clang::no_destroy]] static BrightnessModuleState instance;
+    return instance;
+}
 
+struct PopupPlacement {
+    float scale = 1.0f;
+    int width = 0, height = 0;
+    RECT work{}, monitorBounds{}, bounds{};
+};
+// Controller-thread-owned geometry belongs to the existing UI presentation
+// state. There is no independent global Placement lifetime to manage.
+struct PlacementModuleState final {
+    PopupPlacement current{};
+    bool valid = false;
+};
+static_assert(std::is_trivially_destructible_v<PlacementModuleState>,
+              "Placement state must remain trivially destructible");
 // UI-thread-owned platform provider and current on-screen event.
 struct UiPresentationState {
     HMODULE combase = nullptr;
@@ -6636,19 +7252,36 @@ struct UiPresentationState {
     IUiSettings3Raw* uiSettings = nullptr;
     BrightnessEvent visible{};
     PopupKind popupKind = PopupKind::DdcBrightness;
+    PlacementModuleState placement;
     NativeEventInfo nativeEventCurrent;
     int nativePercent = 0;
     bool nativePercentKnown = false;
     bool nativeMuted = false;
+    void ReleaseAfterControllerStops() {
+        std::wstring oldText;
+        nativeEventCurrent.text.swap(oldText);
+    }
 };
-UiPresentationState g_presentation;
+struct CoreModuleState final {
+    ModuleRuntimeState module;
+    UiPresentationState presentation;
+    void ReleaseAfterThreadsStop() {
+        presentation.ReleaseAfterControllerStops();
+    }
+};
+// Settings callbacks and the receiver must not race global STL/mutex
+// destructors during Explorer process termination.
+CoreModuleState& GetCoreState() {
+    [[clang::no_destroy]] static CoreModuleState instance;
+    return instance;
+}
 
 // ============================================================
 // Shared helpers: localization, settings, UI state and geometry
 // ============================================================
 
 bool UseTraditionalChinese() {
-    const int selected = g_config.displayLanguage.load(std::memory_order_relaxed);
+    const int selected = GetSettingsState()->displayLanguage.load(std::memory_order_relaxed);
     if (selected == 2) return true;
     if (selected == 1) return false;
     const LANGID lang = GetUserDefaultUILanguage();
@@ -6664,11 +7297,15 @@ PCWSTR Tr(OsdText id) {
     return UseTraditionalChinese() ? kLocalizedText[index].zhTw
                                    : kLocalizedText[index].en;
 }
-UINT OsdDuration(DurationKind kind) {
-    if (!g_config.individualDurations.load(std::memory_order_relaxed))
-        return static_cast<UINT>(g_config.globalDurationMs.load(std::memory_order_relaxed));
-    return static_cast<UINT>(g_config.durationOverrides[static_cast<int>(kind)]
+UINT OsdDuration(DurationKind kind, const OsdSettingsState& settings) {
+    if (!settings.individualDurations.load(std::memory_order_relaxed))
+        return static_cast<UINT>(settings.globalDurationMs.load(std::memory_order_relaxed));
+    return static_cast<UINT>(settings.durationOverrides[static_cast<int>(kind)]
         .load(std::memory_order_relaxed));
+}
+UINT OsdDuration(DurationKind kind) {
+    const auto settings = GetSettingsState();
+    return OsdDuration(kind, *settings);
 }
 bool ParseRgbHex(PCWSTR str, DWORD& rgb) {
     if (!str) return false;
@@ -6748,19 +7385,21 @@ void LoadBoolSettings(std::atomic<bool> (&target)[N],
 }
 
 
-BYTE OsdBackgroundAlpha() {
-    return static_cast<BYTE>((g_config.backgroundOpacity.load() * 255 + 50) / 100);
+BYTE OsdBackgroundAlpha(const OsdSettingsState& settings) {
+    return static_cast<BYTE>((settings.backgroundOpacity.load() * 255 + 50) / 100);
 }
 
 // A single direction and anchor rule drives panel placement and chevrons.
 // --- Common placement, sizing and monitor identity ---
 float MainLogicalWidth() {
-    return static_cast<float>(g_config.verticalVolumeBrightness.load()
-        ? g_config.verticalOsdWidth.load() : g_config.horizontalOsdWidth.load());
+    const auto settings = GetSettingsState();
+    return static_cast<float>(settings->verticalVolumeBrightness.load()
+        ? settings->verticalOsdWidth.load() : settings->horizontalOsdWidth.load());
 }
 float MainLogicalHeight() {
-    return static_cast<float>(g_config.verticalVolumeBrightness.load()
-        ? g_config.verticalOsdHeight.load() : g_config.horizontalOsdHeight.load());
+    const auto settings = GetSettingsState();
+    return static_cast<float>(settings->verticalVolumeBrightness.load()
+        ? settings->verticalOsdHeight.load() : settings->horizontalOsdHeight.load());
 }
 bool PositionIsTop(int pos) {
     return pos == 3 || pos == 5 || pos == 6;
@@ -6877,29 +7516,33 @@ namespace bt_monitor {
 } // namespace bt_monitor
 
 void LoadSettings() {
+    // Reloads are serialized, but readers never lock against the writer.
+    std::lock_guard<std::mutex> reload(GetSettingsModuleState().reloadMutex);
+    auto staged = std::make_shared<OsdSettingsState>();
+    OsdSettingsState& settings = *staged;
     PCWSTR selectedLanguage = Wh_GetStringSetting(L"displayLanguage");
     const int chosen = selectedLanguage &&
         _wcsicmp(selectedLanguage, L"zh-TW") == 0 ? 2 :
         selectedLanguage && _wcsicmp(selectedLanguage, L"en") == 0 ? 1 : 0;
-    g_config.displayLanguage.store(chosen, std::memory_order_relaxed);
+    settings.displayLanguage.store(chosen, std::memory_order_relaxed);
     Wh_FreeStringSetting(selectedLanguage);
-    g_config.hideAllNativeOsd.store(
+    settings.hideAllNativeOsd.store(
         Wh_GetIntSetting(L"NativeHide.hideAllNativeOsd") != 0);
-    LoadBoolSettings(g_config.hide, kNativeHideSettingKeys);
-    LoadBoolSettings(g_config.showCustomNative, kCustomNativeSettingKeys);
-    g_config.showDdcBrightness.store(Wh_GetIntSetting(L"CustomOSD.Switches.showDdcBrightness") != 0);
-    g_config.verticalVolumeBrightness.store(Wh_GetIntSetting(L"CustomOSD.Layout.verticalVolumeBrightness") != 0);
-    g_config.fromExplorer.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromExplorer") != 0);
-    g_config.fromTwinkle.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromTwinkle") != 0);
-    g_config.vcpCode.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcVcpCode"), 0, 255));
-    g_config.globalDurationMs.store(std::clamp(
+    LoadBoolSettings(settings.hide, kNativeHideSettingKeys);
+    LoadBoolSettings(settings.showCustomNative, kCustomNativeSettingKeys);
+    settings.showDdcBrightness.store(Wh_GetIntSetting(L"CustomOSD.Switches.showDdcBrightness") != 0);
+    settings.verticalVolumeBrightness.store(Wh_GetIntSetting(L"CustomOSD.Layout.verticalVolumeBrightness") != 0);
+    settings.fromExplorer.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromExplorer") != 0);
+    settings.fromTwinkle.store(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcFromTwinkle") != 0);
+    settings.vcpCode.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.BrightnessSources.ddcVcpCode"), 0, 255));
+    settings.globalDurationMs.store(std::clamp(
         Wh_GetIntSetting(L"CustomOSD.Timing.globalDurationMs"), 500, 20000));
-    g_config.individualDurations.store(
+    settings.individualDurations.store(
         Wh_GetIntSetting(L"CustomOSD.Timing.individualDurations") != 0);
     for (int i = 0; i < static_cast<int>(DurationKind::Count); ++i) {
         std::wstring path = L"CustomOSD.Timing.";
         path += kDurationSettingKeys[i];
-        g_config.durationOverrides[i].store(std::clamp(
+        settings.durationOverrides[i].store(std::clamp(
             Wh_GetIntSetting(path.c_str()), 500, 20000));
     }
     PCWSTR selectedTheme = Wh_GetStringSetting(L"CustomOSD.Appearance.ddcTheme");
@@ -6908,52 +7551,52 @@ void LoadSettings() {
         ? 1 : selectedTheme &&
         (_wcsicmp(selectedTheme, L"dark") == 0 || wcscmp(selectedTheme, L"2") == 0)
         ? 2 : 0;
-    g_config.ddcTheme.store(selectedMode);
+    settings.ddcTheme.store(selectedMode);
     Wh_FreeStringSetting(selectedTheme);
-    g_config.ddcSizePercent.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcSizePercent"), 55, 120));
-    g_config.horizontalOsdWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdWidth"), 300, 650));
-    g_config.horizontalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdHeight"), 72, 220));
-    g_config.verticalOsdWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.verticalOsdWidth"), 72, 180));
-    g_config.verticalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.verticalOsdHeight"), 160, 430));
-    g_config.horizontalSmtcHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.horizontalSmtcHeight"), 176, 480));
-    g_config.horizontalMixerHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.horizontalMixerHeight"), 176, 480));
-    g_config.verticalSmtcWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.verticalSmtcWidth"), 300, 650));
-    g_config.verticalMixerWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.verticalMixerWidth"), 300, 650));
-    g_config.ddcBorderless.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBorderless") != 0);
-    g_config.showSmtcOnVolume.store(Wh_GetIntSetting(L"CustomOSD.Switches.showSmtcOnVolume") != 0);
-    g_config.showMediaArtwork.store(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.showMediaArtwork") != 0);
-    g_config.showMediaControls.store(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.showMediaControls") != 0);
-    g_config.mediaControlSizePercent.store(std::clamp(
+    settings.ddcSizePercent.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcSizePercent"), 55, 120));
+    settings.horizontalOsdWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdWidth"), 300, 650));
+    settings.horizontalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.horizontalOsdHeight"), 72, 220));
+    settings.verticalOsdWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.verticalOsdWidth"), 72, 180));
+    settings.verticalOsdHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.MainOSDSize.verticalOsdHeight"), 160, 430));
+    settings.horizontalSmtcHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.horizontalSmtcHeight"), 176, 480));
+    settings.horizontalMixerHeight.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.horizontalMixerHeight"), 176, 480));
+    settings.verticalSmtcWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.verticalSmtcWidth"), 300, 650));
+    settings.verticalMixerWidth.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ExpandedPanelSize.verticalMixerWidth"), 300, 650));
+    settings.ddcBorderless.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBorderless") != 0);
+    settings.showSmtcOnVolume.store(Wh_GetIntSetting(L"CustomOSD.Switches.showSmtcOnVolume") != 0);
+    settings.showMediaArtwork.store(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.showMediaArtwork") != 0);
+    settings.showMediaControls.store(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.showMediaControls") != 0);
+    settings.mediaControlSizePercent.store(std::clamp(
         Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.mediaControlSizePercent"), 90, 135));
     {
         PCWSTR shape = Wh_GetStringSetting(L"CustomOSD.Appearance.controlButtonShape");
-        g_config.controlButtonSquare.store(shape && _wcsicmp(shape, L"square") == 0);
+        settings.controlButtonSquare.store(shape && _wcsicmp(shape, L"square") == 0);
         Wh_FreeStringSetting(shape);
     }
-    g_config.controlButtonCornerRadius.store(std::clamp(
+    settings.controlButtonCornerRadius.store(std::clamp(
         Wh_GetIntSetting(L"CustomOSD.Appearance.controlButtonCornerRadius"), 0, 16));
-    g_config.showMixerArrow.store(Wh_GetIntSetting(L"CustomOSD.Switches.showVolumeMixerArrow") != 0);
-    g_config.mixerMaxRows.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.mixerMaxRows"), 3, 16));
-    LoadBoolSettings(g_config.showLockKeys, kLockSettingKeys);
-    g_config.innerPadding.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcInnerPadding"), 6, 22));
-    g_config.showClipboardOsd.store(Wh_GetIntSetting(L"CustomOSD.Switches.showClipboardOsd") != 0);
-    g_config.clipboardTextPreview.store(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardTextPreview") != 0);
-    g_config.clipboardImagePreview.store(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardImagePreview") != 0);
-    g_config.clipboardChars.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardMaxChars"), 12, 100));
-    g_config.showUsbEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showUsbEvents") != 0);
-    g_config.showBluetoothEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showBluetoothEvents") != 0);
-    g_config.showNetworkEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showNetworkEvents") != 0);
-    g_config.fadeEnabled.store(Wh_GetIntSetting(L"CustomOSD.Layout.fadeOsd") != 0);
-    g_config.fadeDuration.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.fadeDurationMs"), 60, 450));
-    g_config.accentMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcAccentMode"));
-    g_config.backgroundMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcBackgroundMode"));
-    g_config.textMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcTextMode"));
-    g_config.trackMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcTrackMode"));
-    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomAccent", g_config.customAccent, g_config.validCustomAccent);
-    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomBackground", g_config.customBackground, g_config.validCustomBackground);
-    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomText", g_config.customText, g_config.validCustomText);
-    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomTrack", g_config.customTrack, g_config.validCustomTrack);
-    g_config.backgroundOpacity.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBackgroundOpacity"), 0, 100));
+    settings.showMixerArrow.store(Wh_GetIntSetting(L"CustomOSD.Switches.showVolumeMixerArrow") != 0);
+    settings.mixerMaxRows.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.AudioAndMedia.mixerMaxRows"), 3, 16));
+    LoadBoolSettings(settings.showLockKeys, kLockSettingKeys);
+    settings.innerPadding.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcInnerPadding"), 6, 22));
+    settings.showClipboardOsd.store(Wh_GetIntSetting(L"CustomOSD.Switches.showClipboardOsd") != 0);
+    settings.clipboardTextPreview.store(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardTextPreview") != 0);
+    settings.clipboardImagePreview.store(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardImagePreview") != 0);
+    settings.clipboardChars.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.ClipboardAndDevices.clipboardMaxChars"), 12, 100));
+    settings.showUsbEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showUsbEvents") != 0);
+    settings.showBluetoothEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showBluetoothEvents") != 0);
+    settings.showNetworkEvents.store(Wh_GetIntSetting(L"CustomOSD.Switches.showNetworkEvents") != 0);
+    settings.fadeEnabled.store(Wh_GetIntSetting(L"CustomOSD.Layout.fadeOsd") != 0);
+    settings.fadeDuration.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.fadeDurationMs"), 60, 450));
+    settings.accentMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcAccentMode"));
+    settings.backgroundMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcBackgroundMode"));
+    settings.textMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcTextMode"));
+    settings.trackMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcTrackMode"));
+    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomAccent", settings.customAccent, settings.validCustomAccent);
+    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomBackground", settings.customBackground, settings.validCustomBackground);
+    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomText", settings.customText, settings.validCustomText);
+    LoadHexSetting(L"CustomOSD.Appearance.ddcCustomTrack", settings.customTrack, settings.validCustomTrack);
+    settings.backgroundOpacity.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcBackgroundOpacity"), 0, 100));
     {
         PCWSTR effect = Wh_GetStringSetting(L"CustomOSD.Appearance.ddcBackgroundEffect");
         const bool layered = effect && _wcsicmp(effect, L"layers") == 0;
@@ -6981,38 +7624,40 @@ void LoadSettings() {
             Wh_Log(L"Fluent OSD/XAML: layered settings loaded=%u",
                    static_cast<unsigned>(layers.size()));
         // Publish the entire array as one snapshot for the OSD controller.
-        g_config.SetBrushLayers(layered, std::move(layers));
+        settings.SetBrushLayers(layered, std::move(layers));
     }
-    g_config.cornerRadius.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcCornerRadius"), 0, 34));
-    g_config.fontSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcFontSize"), 10, 24));
-    g_config.iconSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcIconSize"), 10, 24));
-    g_config.showSun.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowSun") != 0);
-    g_config.showValue.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowValue") != 0);
+    settings.cornerRadius.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcCornerRadius"), 0, 34));
+    settings.fontSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcFontSize"), 10, 24));
+    settings.iconSize.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcIconSize"), 10, 24));
+    settings.showSun.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowSun") != 0);
+    settings.showValue.store(Wh_GetIntSetting(L"CustomOSD.Appearance.ddcShowValue") != 0);
     PCWSTR outputMode = Wh_GetStringSetting(L"CustomOSD.Layout.displayOutputMode");
     const int displayMode = outputMode && _wcsicmp(outputMode, L"all") == 0 ? 3 :
         outputMode && _wcsicmp(outputMode, L"selected") == 0 ? 2 :
         outputMode && _wcsicmp(outputMode, L"primary") == 0 ? 1 : 0;
-    g_config.displayOutputMode.store(displayMode);
+    settings.displayOutputMode.store(displayMode);
     Wh_FreeStringSetting(outputMode);
-    g_config.displayOutputNumber.store(std::clamp(
+    settings.displayOutputNumber.store(std::clamp(
         Wh_GetIntSetting(L"CustomOSD.Layout.displayOutputNumber"), 1, 16));
-    g_config.position.store(ReadPositionSetting());
-    g_config.offsetX.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetX"), -500, 500));
-    g_config.offsetY.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetY"), -500, 500));
+    settings.position.store(ReadPositionSetting());
+    settings.offsetX.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetX"), -500, 500));
+    settings.offsetY.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.ddcOffsetY"), -500, 500));
+    // Commit scalars and brush layers with a single atomic publication.
+    GetSettingsModuleState().Publish(std::move(staged));
 }
 
 // ============================================================
 // Native shell hooks and event routing
 // ============================================================
 bool Hidden(Kind k) {
-    // Hide never changes whether the custom OSD is displayed. A master
-    // override hides all native categories, even if their local Hide is off.
-    return g_config.hideAllNativeOsd.load(std::memory_order_relaxed) ||
-           g_config.hide[static_cast<int>(k)].load(std::memory_order_relaxed);
+    const auto settings = GetSettingsState();
+    return settings->hideAllNativeOsd.load(std::memory_order_relaxed) ||
+           settings->hide[static_cast<int>(k)].load(std::memory_order_relaxed);
 }
 
 bool ShowCustomNative(Kind kind) {
-    return g_config.showCustomNative[static_cast<int>(kind)].load(
+    const auto settings = GetSettingsState();
+    return settings->showCustomNative[static_cast<int>(kind)].load(
         std::memory_order_relaxed);
 }
 
@@ -7044,17 +7689,17 @@ bool RouteNativeExtra(Kind kind, int value, int variant = 0,
     if (!ShowCustomNative(kind)) return false;
     HWND receiver = FindWindowExW(HWND_MESSAGE, nullptr, kWindowClass, nullptr);
     if (!receiver) return false;
-    if (!g_nativeMailbox.Offer(
+    if (!GetNativeEventState().mailbox.Offer(
             NativeEventInfo{kind, value, variant, std::move(text)})) return true;
     if (PostMessageW(receiver, kNativeExtraMessage, 0, 0)) return true;
-    g_nativeMailbox.PostFailed();
+    GetNativeEventState().mailbox.PostFailed();
     return false;
 }
 
 bool DdcAllowed() {
-    return g_config.showDdcBrightness.load(std::memory_order_relaxed) &&
-        (g_module.isExplorer ? g_config.fromExplorer.load(std::memory_order_relaxed)
-                      : g_config.fromTwinkle.load(std::memory_order_relaxed));
+    return GetSettingsState()->showDdcBrightness.load(std::memory_order_relaxed) &&
+        (GetCoreState().module.isExplorer ? GetSettingsState()->fromExplorer.load(std::memory_order_relaxed)
+                      : GetSettingsState()->fromTwinkle.load(std::memory_order_relaxed));
 }
 
 // Display routing is independent of native visibility. Show controls whether
@@ -7152,10 +7797,10 @@ int WINAPI TextHook(void* self, void* text, bool value) {
 }
 
 void HookNativeOsd() {
-    g_module.confirmatorDll = LoadLibraryExW(
+    GetCoreState().module.confirmatorDll = LoadLibraryExW(
         L"Windows.Internal.HardwareConfirmator.dll", nullptr,
         LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!g_module.confirmatorDll) {
+    if (!GetCoreState().module.confirmatorDll) {
         Wh_Log(L"Windows HardwareConfirmator DLL not available");
         return;
     }
@@ -7176,7 +7821,7 @@ void HookNativeOsd() {
         {{LR"(private: struct winrt::fire_and_forget __cdecl winrt::Windows::Internal::HardwareConfirmator::implementation::HardwareConfirmatorHost::ShowCameraOnAsync(bool))"}, &CameraAsync_Original, CameraAsync_Hook, true},
         {{LR"(private: struct winrt::fire_and_forget __cdecl winrt::Windows::Internal::HardwareConfirmator::implementation::HardwareConfirmatorHost::ShowCameraAccessEnabledAsync(bool))"}, &CameraAccessAsync_Original, CameraAccessAsync_Hook, true},
     };
-    if (!WindhawkUtils::HookSymbols(g_module.confirmatorDll, hooks, ARRAYSIZE(hooks)))
+    if (!WindhawkUtils::HookSymbols(GetCoreState().module.confirmatorDll, hooks, ARRAYSIZE(hooks)))
         Wh_Log(L"HardwareConfirmator HookSymbols failed");
     Wh_Log(L"Native OSD hooks: volume=%d brightness=%d microphone=%d text=%d",
            VolumeThunk_Original || VolumeAsync_Original,
@@ -7197,21 +7842,21 @@ BOOL WINAPI GetPhysicalHook(HMONITOR display, DWORD count,
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
     if (!GetMonitorInfoW(display, &mi)) return ok;
-    g_ddc.RememberHandles(mi.szDevice, count, items);
+    GetBrightnessState().ddc.RememberHandles(mi.szDevice, count, items);
     return ok;
 }
 
 using DestroyPhysical_t = BOOL(WINAPI*)(HANDLE);
 DestroyPhysical_t DestroyPhysicalOriginal = nullptr;
 BOOL WINAPI DestroyPhysicalHook(HANDLE handle) {
-    g_ddc.ForgetHandle(handle);
+    GetBrightnessState().ddc.ForgetHandle(handle);
     return DestroyPhysicalOriginal(handle);
 }
 
 using DestroyPhysicalArray_t = BOOL(WINAPI*)(DWORD, LPPHYSICAL_MONITOR);
 DestroyPhysicalArray_t DestroyPhysicalArrayOriginal = nullptr;
 BOOL WINAPI DestroyPhysicalArrayHook(DWORD count, LPPHYSICAL_MONITOR items) {
-    g_ddc.ForgetHandles(count, items);
+    GetBrightnessState().ddc.ForgetHandles(count, items);
     return DestroyPhysicalArrayOriginal(count, items);
 }
 
@@ -7220,7 +7865,10 @@ GetBrightness_t GetBrightnessOriginal = nullptr;
 BOOL WINAPI GetBrightnessHook(HANDLE handle, LPDWORD low, LPDWORD current,
                               LPDWORD high) {
     BOOL ok = GetBrightnessOriginal(handle, low, current, high);
-    if (ok && low && high) g_ddc.UpdateHandleRange(handle, *low, *high);
+    if (ok && low && high)
+        GetBrightnessState().ddc.UpdateHandleRange(handle, *low, *high);
+    if (ok && current && !DdcRuntimeState::insideHighLevelSet)
+        GetBrightnessState().ddc.ObserveRead(handle, *current);
     return ok;
 }
 
@@ -7230,26 +7878,30 @@ GetVcp_t GetVcpOriginal = nullptr;
 BOOL WINAPI GetVcpHook(HANDLE handle, BYTE code, LPMC_VCP_CODE_TYPE type,
                        LPDWORD current, LPDWORD maximum) {
     BOOL ok = GetVcpOriginal(handle, code, type, current, maximum);
-    if (ok && maximum && code == static_cast<BYTE>(g_config.vcpCode.load()))
-        g_ddc.UpdateHandleRange(handle, 0, *maximum);
+    if (ok && code == static_cast<BYTE>(GetSettingsState()->vcpCode.load())) {
+        if (maximum)
+            GetBrightnessState().ddc.UpdateHandleRange(handle, 0, *maximum);
+        if (current && !DdcRuntimeState::insideHighLevelSet)
+            GetBrightnessState().ddc.ObserveRead(handle, *current);
+    }
     return ok;
 }
 
 void QueueBrightnessWheelTask(const BrightnessWheelTask& task) {
-    g_writer.EnqueueAndSignal(task);
+    GetBrightnessState().writer.EnqueueAndSignal(task);
 }
 
 void Publish(HANDLE handle, DWORD value) {
     if (!DdcAllowed()) return;
-    PhysicalInfo info = g_ddc.LookupHandle(handle);
+    PhysicalInfo info = GetBrightnessState().ddc.LookupHandle(handle);
     if (!info.device[0]) {
-        if (!g_module.loggedUnmapped.exchange(true))
+        if (!GetCoreState().module.loggedUnmapped.exchange(true))
             Wh_Log(L"DDC target monitor unknown: handle was not observed in "
                    L"GetPhysicalMonitorsFromHMONITOR. Fully quit/restart "
                    L"Twinkle Tray to rebuild its physical-monitor handle map.");
         // The Event target monitor mode must not silently move an unknown
         // target to DISPLAY1. Other output modes are location-independent.
-        if (g_config.displayOutputMode.load(std::memory_order_relaxed) == 0)
+        if (GetSettingsState()->displayOutputMode.load(std::memory_order_relaxed) == 0)
             return;
     }
     BrightnessEvent ev{};
@@ -7274,14 +7926,15 @@ void Publish(HANDLE handle, DWORD value) {
 
 using SetBrightness_t = BOOL(WINAPI*)(HANDLE, DWORD);
 SetBrightness_t SetBrightnessOriginal = nullptr;
-thread_local bool g_insideHighLevelSet = false;
 BOOL WINAPI SetBrightnessHook(HANDLE handle, DWORD value) {
-    bool prior = g_insideHighLevelSet;
-    g_insideHighLevelSet = true;
+    bool prior = DdcRuntimeState::insideHighLevelSet;
+    DdcRuntimeState::insideHighLevelSet = true;
     BOOL ok = SetBrightnessOriginal(handle, value);
     DWORD lastError = GetLastError();
-    g_insideHighLevelSet = prior;
-    if (ok && !prior) Publish(handle, value);
+    DdcRuntimeState::insideHighLevelSet = prior;
+    if (ok && !prior &&
+        GetBrightnessState().ddc.RecordSuccessfulWrite(handle, value))
+        Publish(handle, value);
     SetLastError(lastError);
     return ok;
 }
@@ -7291,17 +7944,18 @@ SetVcp_t SetVcpOriginal = nullptr;
 BOOL WINAPI SetVcpHook(HANDLE handle, BYTE code, DWORD value) {
     BOOL ok = SetVcpOriginal(handle, code, value);
     DWORD lastError = GetLastError();
-    if (ok && !g_insideHighLevelSet &&
-        code == static_cast<BYTE>(g_config.vcpCode.load()))
+    if (ok && !DdcRuntimeState::insideHighLevelSet &&
+        code == static_cast<BYTE>(GetSettingsState()->vcpCode.load()) &&
+        GetBrightnessState().ddc.RecordSuccessfulWrite(handle, value))
         Publish(handle, value);
     SetLastError(lastError);
     return ok;
 }
 
 void HookDdc() {
-    g_module.ddcDll = LoadLibraryExW(L"dxva2.dll", nullptr,
+    GetCoreState().module.ddcDll = LoadLibraryExW(L"dxva2.dll", nullptr,
                               LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!g_module.ddcDll) {
+    if (!GetCoreState().module.ddcDll) {
         Wh_Log(L"Cannot load dxva2.dll");
         return;
     }
@@ -7316,7 +7970,7 @@ void HookDdc() {
         {"SetVCPFeature", reinterpret_cast<void*>(SetVcpHook), reinterpret_cast<void**>(&SetVcpOriginal)},
     };
     for (auto& e : entries) {
-        void* address = reinterpret_cast<void*>(GetProcAddress(g_module.ddcDll, e.name));
+        void* address = reinterpret_cast<void*>(GetProcAddress(GetCoreState().module.ddcDll, e.name));
         if (!address || !Wh_SetFunctionHook(address, e.detour, e.original))
             Wh_Log(L"DDC Hook failed: %hs", e.name);
     }
@@ -7326,26 +7980,26 @@ void HookDdc() {
 // Windows accent/theme helpers
 // ============================================================
 void InitWindowsAccentProvider() {
-    g_presentation.combase = LoadLibraryExW(L"combase.dll", nullptr,
+    GetCoreState().presentation.combase = LoadLibraryExW(L"combase.dll", nullptr,
                                LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!g_presentation.combase) return;
+    if (!GetCoreState().presentation.combase) return;
     auto roInit = reinterpret_cast<RoInitialize_t>(
-        GetProcAddress(g_presentation.combase, "RoInitialize"));
+        GetProcAddress(GetCoreState().presentation.combase, "RoInitialize"));
     auto activate = reinterpret_cast<RoActivateInstance_t>(
-        GetProcAddress(g_presentation.combase, "RoActivateInstance"));
+        GetProcAddress(GetCoreState().presentation.combase, "RoActivateInstance"));
     auto createString = reinterpret_cast<WindowsCreateString_t>(
-        GetProcAddress(g_presentation.combase, "WindowsCreateString"));
+        GetProcAddress(GetCoreState().presentation.combase, "WindowsCreateString"));
     auto deleteString = reinterpret_cast<WindowsDeleteString_t>(
-        GetProcAddress(g_presentation.combase, "WindowsDeleteString"));
-    g_presentation.roUninitialize = reinterpret_cast<RoUninitialize_t>(
-        GetProcAddress(g_presentation.combase, "RoUninitialize"));
+        GetProcAddress(GetCoreState().presentation.combase, "WindowsDeleteString"));
+    GetCoreState().presentation.roUninitialize = reinterpret_cast<RoUninitialize_t>(
+        GetProcAddress(GetCoreState().presentation.combase, "RoUninitialize"));
     if (!roInit || !activate || !createString || !deleteString ||
-        !g_presentation.roUninitialize) return;
+        !GetCoreState().presentation.roUninitialize) return;
 
     // Dedicated UI thread: initialize WinRT on this same thread.
     HRESULT hr = roInit(1); // RO_INIT_MULTITHREADED
     if (FAILED(hr)) return;
-    g_presentation.roInitialized = true;
+    GetCoreState().presentation.roInitialized = true;
     void* classId = nullptr;
     if (FAILED(createString(kUiSettingsRuntimeClass, ARRAYSIZE(kUiSettingsRuntimeClass) - 1, &classId)))
         return;
@@ -7354,7 +8008,7 @@ void InitWindowsAccentProvider() {
     deleteString(classId);
     if (SUCCEEDED(hr) && object) {
         hr = object->QueryInterface(kIUiSettings3,
-                                    reinterpret_cast<void**>(&g_presentation.uiSettings));
+                                    reinterpret_cast<void**>(&GetCoreState().presentation.uiSettings));
         object->Release();
     }
     if (FAILED(hr))
@@ -7363,24 +8017,24 @@ void InitWindowsAccentProvider() {
 }
 
 void ReleaseWindowsAccentProvider() {
-    if (g_presentation.uiSettings) {
-        g_presentation.uiSettings->Release();
-        g_presentation.uiSettings = nullptr;
+    if (GetCoreState().presentation.uiSettings) {
+        GetCoreState().presentation.uiSettings->Release();
+        GetCoreState().presentation.uiSettings = nullptr;
     }
-    if (g_presentation.roInitialized && g_presentation.roUninitialize)
-        g_presentation.roUninitialize();
-    g_presentation.roInitialized = false;
-    g_presentation.roUninitialize = nullptr;
-    if (g_presentation.combase) FreeLibrary(g_presentation.combase);
-    g_presentation.combase = nullptr;
+    if (GetCoreState().presentation.roInitialized && GetCoreState().presentation.roUninitialize)
+        GetCoreState().presentation.roUninitialize();
+    GetCoreState().presentation.roInitialized = false;
+    GetCoreState().presentation.roUninitialize = nullptr;
+    if (GetCoreState().presentation.combase) FreeLibrary(GetCoreState().presentation.combase);
+    GetCoreState().presentation.combase = nullptr;
 }
 
 DWORD SystemAccentRgb() {
     // Reading UISettings for each actual render supports changes to the
     // Windows accent without a timer, additional thread, or injected hook.
-    if (g_presentation.uiSettings) {
+    if (GetCoreState().presentation.uiSettings) {
         UiColor c{};
-        if (SUCCEEDED(g_presentation.uiSettings->GetColorValue(5, &c))) // UIColorType.Accent
+        if (SUCCEEDED(GetCoreState().presentation.uiSettings->GetColorValue(5, &c))) // UIColorType.Accent
             return (DWORD(c.r) << 16) | (DWORD(c.g) << 8) | DWORD(c.b);
     }
     DWORD value = 0, bytes = sizeof(value);
@@ -7410,8 +8064,8 @@ DWORD SystemAccentRgb() {
            (DWORD(GetGValue(fallback)) << 8) | DWORD(GetBValue(fallback));
 }
 
-bool IsLightTheme() {
-    const int setting = g_config.ddcTheme.load(std::memory_order_relaxed);
+bool IsLightTheme(const OsdSettingsState& settings) {
+    const int setting = settings.ddcTheme.load(std::memory_order_relaxed);
     if (setting == 1) return true;
     if (setting == 2) return false;
     DWORD light = 0;
@@ -7430,23 +8084,23 @@ DWORD ConfiguredOsdRgb(const std::atomic<int>& mode,
                         const std::atomic<DWORD>& rgb, DWORD fallback) {
     return mode.load() && valid.load() ? rgb.load() : fallback;
 }
-DWORD OsdBackgroundRgb(bool light) {
-    return ConfiguredOsdRgb(g_config.backgroundMode, g_config.validCustomBackground,
-                            g_config.customBackground, light ? 0xFAFAFC : 0x26262A);
+DWORD OsdBackgroundRgb(bool light, const OsdSettingsState& settings) {
+    return ConfiguredOsdRgb(settings.backgroundMode, settings.validCustomBackground,
+                            settings.customBackground, light ? 0xFAFAFC : 0x26262A);
 }
-DWORD OsdTextRgb(bool light) {
-    return ConfiguredOsdRgb(g_config.textMode, g_config.validCustomText,
-                            g_config.customText, light ? 0x1C1C20 : 0xFAFAFB);
+DWORD OsdTextRgb(bool light, const OsdSettingsState& settings) {
+    return ConfiguredOsdRgb(settings.textMode, settings.validCustomText,
+                            settings.customText, light ? 0x1C1C20 : 0xFAFAFB);
 }
-DWORD OsdTrackRgb(bool light, bool mixer = false) {
-    return ConfiguredOsdRgb(g_config.trackMode, g_config.validCustomTrack,
-                            g_config.customTrack, mixer
+DWORD OsdTrackRgb(bool light, bool mixer, const OsdSettingsState& settings) {
+    return ConfiguredOsdRgb(settings.trackMode, settings.validCustomTrack,
+                            settings.customTrack, mixer
                                 ? (light ? 0xE0E1E7 : 0x5E5E65)
                                 : (light ? 0xDEDFE3 : 0x595A60));
 }
-DWORD OsdAccentRgb() {
-    return g_config.accentMode.load() && g_config.validCustomAccent.load()
-        ? g_config.customAccent.load() : SystemAccentRgb();
+DWORD OsdAccentRgb(const OsdSettingsState& settings) {
+    return settings.accentMode.load() && settings.validCustomAccent.load()
+        ? settings.customAccent.load() : SystemAccentRgb();
 }
 
 int BrightnessPercent(const BrightnessEvent& brightness, bool* known) {
@@ -7503,7 +8157,7 @@ bool ReadDefaultAudioVolume(int& percent, bool& muted) {
 
 // Core Audio operation: the XAML controller owns rendering and timeouts.
 bool AdjustDefaultAudioWheel(int steps) {
-    if (!steps || g_presentation.popupKind != PopupKind::NativeVolume) return false;
+    if (!steps || GetCoreState().presentation.popupKind != PopupKind::NativeVolume) return false;
     Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
     if (!OpenDefaultAudioEndpointVolume(volume)) return false;
     float scalar = 0.0f;
@@ -7516,10 +8170,10 @@ bool AdjustDefaultAudioWheel(int steps) {
         scalar = requested;
     BOOL muted = FALSE;
     (void)volume->GetMute(&muted);
-    g_presentation.nativePercent = static_cast<int>(std::lround(
+    GetCoreState().presentation.nativePercent = static_cast<int>(std::lround(
         std::clamp(scalar, 0.0f, 1.0f) * 100.0f));
-    g_presentation.nativePercentKnown = true;
-    g_presentation.nativeMuted = muted != FALSE;
+    GetCoreState().presentation.nativePercentKnown = true;
+    GetCoreState().presentation.nativeMuted = muted != FALSE;
     return true;
 }
 
@@ -7527,9 +8181,9 @@ bool AdjustDefaultAudioWheel(int steps) {
 // is a separate user state, and moving the track should not silently clear it.
 bool SetDefaultAudioBarPercent(int percent) {
     percent = std::clamp(percent, 0, 100);
-    if (g_presentation.popupKind != PopupKind::NativeVolume || !g_presentation.nativePercentKnown)
+    if (GetCoreState().presentation.popupKind != PopupKind::NativeVolume || !GetCoreState().presentation.nativePercentKnown)
         return false;
-    if (percent == g_presentation.nativePercent) return true;
+    if (percent == GetCoreState().presentation.nativePercent) return true;
     Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
     if (!OpenDefaultAudioEndpointVolume(volume)) return false;
     HRESULT hr = volume->SetMasterVolumeLevelScalar(percent / 100.0f, nullptr);
@@ -7540,15 +8194,15 @@ bool SetDefaultAudioBarPercent(int percent) {
         volume->GetMute(&muted);
     }
     if (FAILED(hr)) return false;
-    g_presentation.nativePercent = static_cast<int>(std::lround(
+    GetCoreState().presentation.nativePercent = static_cast<int>(std::lround(
         std::clamp(actual, 0.0f, 1.0f) * 100.0f));
-    g_presentation.nativeMuted = muted != FALSE;
+    GetCoreState().presentation.nativeMuted = muted != FALSE;
     return true;
 }
 
 // Toggle the default endpoint's mute without changing its stored volume.
 bool ToggleDefaultAudioMute() {
-    if (g_presentation.popupKind != PopupKind::NativeVolume || g_module.closing.load())
+    if (GetCoreState().presentation.popupKind != PopupKind::NativeVolume || GetCoreState().module.closing.load())
         return false;
     Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
     if (!OpenDefaultAudioEndpointVolume(volume)) return false;
@@ -7560,21 +8214,21 @@ bool ToggleDefaultAudioMute() {
     (void)volume->GetMute(&actual);
     float scalar = 0.0f;
     if (SUCCEEDED(volume->GetMasterVolumeLevelScalar(&scalar))) {
-        g_presentation.nativePercent = static_cast<int>(std::lround(
+        GetCoreState().presentation.nativePercent = static_cast<int>(std::lround(
             std::clamp(scalar, 0.0f, 1.0f) * 100.0f));
-        g_presentation.nativePercentKnown = true;
+        GetCoreState().presentation.nativePercentKnown = true;
     }
-    g_presentation.nativeMuted = actual != FALSE;
-    if (g_panel.mixerOpen) g_mixer.masterMuted = g_presentation.nativeMuted;
+    GetCoreState().presentation.nativeMuted = actual != FALSE;
+    if (GetAudioState().panel.mixerOpen) GetAudioState().mixer.masterMuted = GetCoreState().presentation.nativeMuted;
     return true;
 }
 
 // Clipboard image acquisition uses an ephemeral Win32 HBITMAP. Only
 // bounded pixel bytes cross to the XAML STA renderer.
 void ClearClipboardThumbnail() {
-    if (g_notice.clipboardThumbnail) {
-        DeleteObject(g_notice.clipboardThumbnail);
-        g_notice.clipboardThumbnail = nullptr;
+    if (GetNoticeState().notice.clipboardThumbnail) {
+        DeleteObject(GetNoticeState().notice.clipboardThumbnail);
+        GetNoticeState().notice.clipboardThumbnail = nullptr;
     }
 }
 
@@ -7584,45 +8238,45 @@ void ClearClipboardThumbnail() {
 void AddNoticeEvent(NoticeCategory category, NoticeAction action,
                     std::wstring identity, std::wstring label,
                     NoticeIcon deviceIcon = NoticeIcon::Bluetooth) {
-    if (!g_module.receiveWnd || g_module.closing.load()) return;
+    if (!GetCoreState().module.receiveWnd || GetCoreState().module.closing.load()) return;
     if (identity.empty()) identity = label;
     if (label.empty()) label = std::wstring(NoticeCategoryLabel(category)) +
         L" " + Tr(OsdText::Device);
-    if (g_notice.batch.pending &&
-        (g_notice.batch.category != category || g_notice.batch.action != action))
+    if (GetNoticeState().notice.batch.pending &&
+        (GetNoticeState().notice.batch.category != category || GetNoticeState().notice.batch.action != action))
         FlushNoticeBatch();
-    if (!g_notice.batch.pending) {
-        g_notice.ResetBatch();
-        g_notice.batch.pending = true;
-        g_notice.batch.category = std::move(category);
-        g_notice.batch.action = std::move(action);
+    if (!GetNoticeState().notice.batch.pending) {
+        GetNoticeState().notice.ResetBatch();
+        GetNoticeState().notice.batch.pending = true;
+        GetNoticeState().notice.batch.category = std::move(category);
+        GetNoticeState().notice.batch.action = std::move(action);
     }
     if (label.size() > 120) label.resize(120);
     if (identity.size() > 2048) identity.resize(2048);
-    if (g_notice.batch.identities.insert(identity).second &&
-        g_notice.batch.names.size() < 64) {
+    if (GetNoticeState().notice.batch.identities.insert(identity).second &&
+        GetNoticeState().notice.batch.names.size() < 64) {
         if (category == NoticeCategory::Bluetooth ||
             category == NoticeCategory::Network) {
-            if (!g_notice.batch.iconKnown) {
-                g_notice.batch.icon = deviceIcon;
-                g_notice.batch.iconKnown = true;
-            } else if (g_notice.batch.icon != deviceIcon) {
-                g_notice.batch.mixedIcons = true;
+            if (!GetNoticeState().notice.batch.iconKnown) {
+                GetNoticeState().notice.batch.icon = deviceIcon;
+                GetNoticeState().notice.batch.iconKnown = true;
+            } else if (GetNoticeState().notice.batch.icon != deviceIcon) {
+                GetNoticeState().notice.batch.mixedIcons = true;
             }
         }
-        g_notice.batch.names.push_back(std::move(label));
+        GetNoticeState().notice.batch.names.push_back(std::move(label));
     }
     // 320 ms debounce; repeated device-interface announcements coalesce.
-    SetTimer(g_module.receiveWnd, kEventBatchTimer, 320, nullptr);
+    SetTimer(GetCoreState().module.receiveWnd, kEventBatchTimer, 320, nullptr);
 }
 
 void FlushNoticeBatch() {
-    if (g_module.receiveWnd) KillTimer(g_module.receiveWnd, kEventBatchTimer);
-    if (!g_notice.batch.pending) return;
-    NoticeBatch batch = std::move(g_notice.batch);
-    g_notice.ResetBatch();
+    if (GetCoreState().module.receiveWnd) KillTimer(GetCoreState().module.receiveWnd, kEventBatchTimer);
+    if (!GetNoticeState().notice.batch.pending) return;
+    NoticeBatch batch = std::move(GetNoticeState().notice.batch);
+    GetNoticeState().notice.ResetBatch();
     if (batch.names.empty()) return;
-    g_notice.details = batch.names;
+    GetNoticeState().notice.details = batch.names;
     std::wstring title;
     std::wstring body;
     if (batch.names.size() == 1) {
@@ -7650,15 +8304,15 @@ void FlushNoticeBatch() {
 
 void ShowNotice(std::wstring title, std::wstring body, DurationKind kind,
                 NoticeIcon icon) {
-    if (g_module.closing.load() || !g_module.receiveWnd) return;
+    if (GetCoreState().module.closing.load() || !GetCoreState().module.receiveWnd) return;
     if (kind != DurationKind::Clipboard) ClearClipboardThumbnail();
-    g_presentation.popupKind = PopupKind::Notification;
-    g_notice.panelOpen = false;
-    ++g_notice.generation;
-    g_notice.duration = kind;
-    g_notice.title = std::move(title);
-    g_notice.body = std::move(body);
-    g_notice.icon = icon;
+    GetCoreState().presentation.popupKind = PopupKind::Notification;
+    GetNoticeState().notice.panelOpen = false;
+    ++GetNoticeState().notice.generation;
+    GetNoticeState().notice.duration = kind;
+    GetNoticeState().notice.title = std::move(title);
+    GetNoticeState().notice.body = std::move(body);
+    GetNoticeState().notice.icon = icon;
     BrightnessEvent event{};
     MovePopupToDisplay(event);
     if (kind == DurationKind::Clipboard)
@@ -7672,8 +8326,8 @@ void ShowNotice(std::wstring title, std::wstring body, DurationKind kind,
 // Clipboard event processing
 // ============================================================
 void ProcessClipboard() {
-    if (!g_config.showClipboardOsd.load()) return;
-    if (!OpenClipboard(g_module.receiveWnd)) return;
+    if (!GetSettingsState()->showClipboardOsd.load()) return;
+    if (!OpenClipboard(GetCoreState().module.receiveWnd)) return;
     std::wstring title = Tr(OsdText::Clipboard), body = Tr(OsdText::ContentCopied);
     HBITMAP newThumbnail = nullptr;
     NoticeIcon icon = NoticeIcon::Clipboard;
@@ -7688,7 +8342,7 @@ void ProcessClipboard() {
                IsClipboardFormatAvailable(CF_DIBV5)) {
         title = Tr(OsdText::ImageCopied);
         body = Tr(OsdText::ClipboardImage);
-        if (g_config.clipboardImagePreview.load()) {
+        if (GetSettingsState()->clipboardImagePreview.load()) {
             HBITMAP source = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
             BITMAP bm{};
             if (source && GetObjectW(source, sizeof(bm), &bm) == sizeof(bm) &&
@@ -7713,21 +8367,21 @@ void ProcessClipboard() {
         title = Tr(OsdText::TextCopied);
         body = Tr(OsdText::ClipboardText);
         icon = NoticeIcon::ClipboardText;
-        if (g_config.clipboardTextPreview.load()) {
+        if (GetSettingsState()->clipboardTextPreview.load()) {
             HANDLE handle = GetClipboardData(CF_UNICODETEXT);
             SIZE_T cb = handle ? GlobalSize(handle) : 0;
             if (handle && cb >= sizeof(wchar_t)) {
                 const wchar_t* text = static_cast<const wchar_t*>(GlobalLock(handle));
                 if (text) {
                     const size_t bound = std::min<size_t>(cb / sizeof(wchar_t),
-                            static_cast<size_t>(g_config.clipboardChars.load()) + 1);
+                            static_cast<size_t>(GetSettingsState()->clipboardChars.load()) + 1);
                     body.clear();
                     for (size_t i = 0; i < bound && text[i]; ++i) {
                         const wchar_t ch = text[i];
                         body.push_back(ch < 0x20 || ch == 0x7f ? L' ' : ch);
                     }
                     if (cb / sizeof(wchar_t) > body.size() &&
-                        body.size() >= static_cast<size_t>(g_config.clipboardChars.load()))
+                        body.size() >= static_cast<size_t>(GetSettingsState()->clipboardChars.load()))
                         body += L"…";
                     GlobalUnlock(handle);
                 }
@@ -7737,8 +8391,8 @@ void ProcessClipboard() {
     }
     CloseClipboard();
     ClearClipboardThumbnail();
-    g_notice.details.clear();
-    g_notice.clipboardThumbnail = newThumbnail;
+    GetNoticeState().notice.details.clear();
+    GetNoticeState().notice.clipboardThumbnail = newThumbnail;
     ShowNotice(std::move(title), std::move(body), DurationKind::Clipboard,
                icon);
 }
@@ -7765,22 +8419,30 @@ using RegisterNetworkHint = DWORD (WINAPI*)(NetworkCallback, void*, BOOLEAN, HAN
 using GetNetworkHint = DWORD (WINAPI*)(NetworkHintAbi*);
 using CancelNetworkHint = DWORD (WINAPI*)(HANDLE);
 
-void NetworkRuntimeState::CancelCallbacksOnControllerThread() {
-    if (dll) {
-        const auto cancel = reinterpret_cast<CancelNetworkHint>(
-            GetProcAddress(dll, "CancelMibChangeNotify2"));
-        if (cancel) {
-            if (addressNotification)
-                (void)cancel(addressNotification);
-            if (ipNotification)
-                (void)cancel(ipNotification);
-            if (notification)
-                (void)cancel(notification);
-        }
+bool NetworkRuntimeState::CancelCallbacksOnControllerThread() {
+    if (!notification && !ipNotification && !addressNotification)
+        return true;
+    const auto cancel = dll ? reinterpret_cast<CancelNetworkHint>(
+        GetProcAddress(dll, "CancelMibChangeNotify2")) : nullptr;
+    if (!cancel) {
+        Wh_Log(L"Fluent OSD/network: cancellation API unavailable");
+        return false;
     }
-    notification = nullptr;
-    ipNotification = nullptr;
-    addressNotification = nullptr;
+    bool complete = true;
+    const auto revoke = [&](HANDLE& handle, PCWSTR label) {
+        if (!handle) return;
+        const DWORD result = cancel(handle);
+        if (result == NO_ERROR) {
+            handle = nullptr;
+        } else {
+            complete = false;
+            Wh_Log(L"Fluent OSD/network: cancel %s returned %lu", label, result);
+        }
+    };
+    revoke(addressNotification, L"address");
+    revoke(ipNotification, L"interface");
+    revoke(notification, L"connectivity");
+    return complete;
 }
 
 // Native Wi-Fi callbacks expose association changes even when the physical
@@ -7845,8 +8507,28 @@ struct WlanRuntimeState {
         physicalLuids.clear();
         inventoryValid = false;
     }
+    void ReleaseAfterControllerStops() {
+        std::unordered_map<ULONGLONG, WlanLiveState> oldLive;
+        std::unordered_set<ULONGLONG> oldPhysicalLuids;
+        live.swap(oldLive);
+        physicalLuids.swap(oldPhysicalLuids);
+    }
 };
-WlanRuntimeState g_wlan;
+// IP and WLAN state are bound to one controller-owned connectivity module.
+struct ConnectivityModuleState final {
+    NetworkRuntimeState network;
+    WlanRuntimeState wlan;
+    void ReleaseAfterControllerStops() {
+        // Subscriptions and WLAN handles were released by the receiver owner.
+        // This only frees retained baseline container capacities.
+        network.ReleaseAfterControllerStops();
+        wlan.ReleaseAfterControllerStops();
+    }
+};
+ConnectivityModuleState& GetConnectivityState() {
+    [[clang::no_destroy]] static ConnectivityModuleState instance;
+    return instance;
+}
 
 void QueueNetworkRefreshEvent(WPARAM source, LPARAM hintLevel);
 void WINAPI WlanChanged(WlanNotificationCompat* notice, void*) {
@@ -7870,14 +8552,14 @@ using RegisterNetworkMib = DWORD (WINAPI*)(
     ADDRESS_FAMILY, NetworkMibCallback, void*, BOOLEAN, HANDLE*);
 
 void QueueNetworkRefreshEvent(WPARAM source, LPARAM hintLevel) {
-    if (!g_config.showNetworkEvents.load()) return;
-    const HWND receiver = g_module.ReceiverForCallbacks();
+    if (!GetSettingsState()->showNetworkEvents.load()) return;
+    const HWND receiver = GetCoreState().module.ReceiverForCallbacks();
     if (receiver) (void)PostMessageW(
         receiver, kNetworkNoticeMessage, source, hintLevel);
 }
 
 void WINAPI NetworkChanged(void*, NetworkHintAbi hint) {
-    const int prior = g_network.previousLevel.exchange(hint.connectivityLevel);
+    const int prior = GetConnectivityState().network.previousLevel.exchange(hint.connectivityLevel);
     if (prior < 0 || prior == hint.connectivityLevel) return;
     QueueNetworkRefreshEvent(1, static_cast<LPARAM>(hint.connectivityLevel));
 }
@@ -7894,27 +8576,30 @@ void CaptureNetworkBaseline() {
         Wh_Log(L"Fluent OSD/network: adapter baseline unavailable");
         return;
     }
-    g_network.interfaces.clear();
+    GetConnectivityState().network.interfaces.clear();
     for (auto& item : current)
-        g_network.interfaces.emplace(std::move(item.first),
+        GetConnectivityState().network.interfaces.emplace(std::move(item.first),
                                     std::move(item.second));
 }
 
 void RefreshNetworkHintBaseline() {
-    if (!g_network.dll) return;
+    if (!GetConnectivityState().network.dll) return;
     const auto hint = reinterpret_cast<GetNetworkHint>(
-        GetProcAddress(g_network.dll, "GetNetworkConnectivityHint"));
+        GetProcAddress(GetConnectivityState().network.dll, "GetNetworkConnectivityHint"));
     NetworkHintAbi state{};
     if (hint && hint(&state) == NO_ERROR)
-        g_network.previousLevel.store(state.connectivityLevel);
+        GetConnectivityState().network.previousLevel.store(state.connectivityLevel);
 }
 
 void InitNetworkEvents() {
-    g_network.dll = LoadLibraryExW(
-        L"iphlpapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const bool enabled = GetSettingsState()->showNetworkEvents.load();
+    GetConnectivityState().network.uiSettingEnabled = enabled;
+    if (!enabled) return; // No network subscriptions unless explicitly enabled.
     CaptureNetworkBaseline();
-    g_network.uiSettingEnabled = g_config.showNetworkEvents.load();
-    if (!g_network.dll) {
+    if (!GetConnectivityState().network.dll)
+        GetConnectivityState().network.dll = LoadLibraryExW(
+            L"iphlpapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!GetConnectivityState().network.dll) {
         Wh_Log(L"Fluent OSD/network: iphlpapi unavailable (%lu)",
                GetLastError());
         return;
@@ -7922,12 +8607,12 @@ void InitNetworkEvents() {
 
     RefreshNetworkHintBaseline();
     const auto subscribeHint = reinterpret_cast<RegisterNetworkHint>(
-        GetProcAddress(g_network.dll, "NotifyNetworkConnectivityHintChange"));
-    if (subscribeHint) {
+        GetProcAddress(GetConnectivityState().network.dll, "NotifyNetworkConnectivityHintChange"));
+    if (subscribeHint && !GetConnectivityState().network.notification) {
         const DWORD err = subscribeHint(NetworkChanged, nullptr, FALSE,
-                                       &g_network.notification);
+                                       &GetConnectivityState().network.notification);
         if (err != NO_ERROR) {
-            g_network.notification = nullptr;
+            GetConnectivityState().network.notification = nullptr;
             Wh_Log(L"Fluent OSD/network: hint registration failed (%lu)", err);
         }
     }
@@ -7936,34 +8621,34 @@ void InitNetworkEvents() {
     // still provides Internet access. Both are needed for interface and IP
     // transitions on Wi-Fi, Ethernet, and virtual adapters.
     const auto subscribeInterface = reinterpret_cast<RegisterNetworkMib>(
-        GetProcAddress(g_network.dll, "NotifyIpInterfaceChange"));
-    if (subscribeInterface) {
+        GetProcAddress(GetConnectivityState().network.dll, "NotifyIpInterfaceChange"));
+    if (subscribeInterface && !GetConnectivityState().network.ipNotification) {
         const DWORD err = subscribeInterface(AF_UNSPEC, NetworkMibChanged,
-            nullptr, FALSE, &g_network.ipNotification);
+            nullptr, FALSE, &GetConnectivityState().network.ipNotification);
         if (err != NO_ERROR) {
-            g_network.ipNotification = nullptr;
+            GetConnectivityState().network.ipNotification = nullptr;
             Wh_Log(L"Fluent OSD/network: interface registration failed (%lu)", err);
         }
-    } else {
+    } else if (!subscribeInterface) {
         Wh_Log(L"Fluent OSD/network: interface notification API unavailable");
     }
 
     const auto subscribeAddress = reinterpret_cast<RegisterNetworkMib>(
-        GetProcAddress(g_network.dll, "NotifyUnicastIpAddressChange"));
-    if (subscribeAddress) {
+        GetProcAddress(GetConnectivityState().network.dll, "NotifyUnicastIpAddressChange"));
+    if (subscribeAddress && !GetConnectivityState().network.addressNotification) {
         const DWORD err = subscribeAddress(AF_UNSPEC, NetworkMibChanged,
-            nullptr, FALSE, &g_network.addressNotification);
+            nullptr, FALSE, &GetConnectivityState().network.addressNotification);
         if (err != NO_ERROR) {
-            g_network.addressNotification = nullptr;
+            GetConnectivityState().network.addressNotification = nullptr;
             Wh_Log(L"Fluent OSD/network: address registration failed (%lu)", err);
         }
-    } else {
+    } else if (!subscribeAddress) {
         Wh_Log(L"Fluent OSD/network: address notification API unavailable");
     }
     Wh_Log(L"Fluent OSD/network: subscriptions hint=%d interface=%d address=%d",
-           g_network.notification != nullptr,
-           g_network.ipNotification != nullptr,
-           g_network.addressNotification != nullptr);
+           GetConnectivityState().network.notification != nullptr,
+           GetConnectivityState().network.ipNotification != nullptr,
+           GetConnectivityState().network.addressNotification != nullptr);
 }
 
 void InitDeviceEvents() {
@@ -7971,19 +8656,20 @@ void InitDeviceEvents() {
     usb.dbcc_size = sizeof(usb);
     usb.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
     usb.dbcc_classguid = kUsbDeviceInterface;
-    g_module.usbNotification = RegisterDeviceNotificationW(
-        g_module.receiveWnd, &usb, DEVICE_NOTIFY_WINDOW_HANDLE);
+    GetCoreState().module.usbNotification = RegisterDeviceNotificationW(
+        GetCoreState().module.receiveWnd, &usb, DEVICE_NOTIFY_WINDOW_HANDLE);
     bt_monitor::Start(); // No-op unless opt-in is enabled.
 }
 
 void StopDeviceEvents() {
     // Revoke WinRT callbacks before destroying the UI receiver or COM MTA.
     bt_monitor::Stop();
-    if (g_module.usbNotification) UnregisterDeviceNotification(g_module.usbNotification);
-    g_module.usbNotification = nullptr;
-    g_network.CancelCallbacksOnControllerThread();
-    g_wlan.StopClientOnControllerThread();
-    g_network.ReleaseLibraryOnControllerThread();
+    if (GetCoreState().module.usbNotification) UnregisterDeviceNotification(GetCoreState().module.usbNotification);
+    GetCoreState().module.usbNotification = nullptr;
+    if (!GetConnectivityState().network.CancelCallbacksOnControllerThread())
+        Wh_Log(L"Fluent OSD/network: one or more subscriptions survived stop");
+    GetConnectivityState().wlan.StopClientOnControllerThread();
+    GetConnectivityState().network.ReleaseLibraryOnControllerThread();
 }
 
 // This may fail for removed devices; the arrival-side path cache is
@@ -8053,34 +8739,34 @@ static_assert(sizeof(WlanPhyRadioCompat) == 12);
 static_assert(offsetof(WlanRadioCompat, phys) == sizeof(DWORD));
 
 bool EnsureWlanClient() {
-    if (!g_wlan.dll) {
-        g_wlan.dll = LoadLibraryExW(
+    if (!GetConnectivityState().wlan.dll) {
+        GetConnectivityState().wlan.dll = LoadLibraryExW(
             L"wlanapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!g_wlan.dll) return false;
+        if (!GetConnectivityState().wlan.dll) return false;
     }
-    if (!g_wlan.client) {
+    if (!GetConnectivityState().wlan.client) {
         using Open = DWORD (WINAPI*)(DWORD, PVOID, PDWORD, PHANDLE);
         const auto open = reinterpret_cast<Open>(
-            GetProcAddress(g_wlan.dll, "WlanOpenHandle"));
+            GetProcAddress(GetConnectivityState().wlan.dll, "WlanOpenHandle"));
         DWORD negotiated = 0;
-        if (!open || open(2, nullptr, &negotiated, &g_wlan.client) !=
-                ERROR_SUCCESS || !g_wlan.client)
+        if (!open || open(2, nullptr, &negotiated, &GetConnectivityState().wlan.client) !=
+                ERROR_SUCCESS || !GetConnectivityState().wlan.client)
             return false; // WLAN AutoConfig unavailable; retry next refresh.
     }
-    if (!g_wlan.notifyRegistered) {
+    if (!GetConnectivityState().wlan.notifyRegistered) {
         const auto subscribe = reinterpret_cast<WlanRegisterNotify>(
-            GetProcAddress(g_wlan.dll, "WlanRegisterNotification"));
-        if (subscribe && subscribe(g_wlan.client,
+            GetProcAddress(GetConnectivityState().wlan.dll, "WlanRegisterNotification"));
+        if (subscribe && subscribe(GetConnectivityState().wlan.client,
                 kWlanAcmSource | kWlanMsmSource, FALSE,
                 WlanChanged, nullptr, nullptr, nullptr) == ERROR_SUCCESS)
-            g_wlan.notifyRegistered = true;
+            GetConnectivityState().wlan.notifyRegistered = true;
     }
     return true;
 }
 
 void RefreshPhysicalWlanLuids() {
-    g_wlan.inventoryValid = false;
-    if (!g_network.dll || !EnsureWlanClient()) return;
+    GetConnectivityState().wlan.inventoryValid = false;
+    if (!GetConnectivityState().network.dll || !EnsureWlanClient()) return;
     using Enumerate = DWORD (WINAPI*)(
         HANDLE, PVOID, WlanInterfaceListCompat**);
     using Query = DWORD (WINAPI*)(
@@ -8088,27 +8774,27 @@ void RefreshPhysicalWlanLuids() {
     using Free = void (WINAPI*)(void*);
     using GuidToLuid = DWORD (WINAPI*)(const GUID*, void*);
     const auto convert = reinterpret_cast<GuidToLuid>(
-        GetProcAddress(g_network.dll, "ConvertInterfaceGuidToLuid"));
+        GetProcAddress(GetConnectivityState().network.dll, "ConvertInterfaceGuidToLuid"));
     const auto enumerate = reinterpret_cast<Enumerate>(
-        GetProcAddress(g_wlan.dll, "WlanEnumInterfaces"));
+        GetProcAddress(GetConnectivityState().wlan.dll, "WlanEnumInterfaces"));
     const auto query = reinterpret_cast<Query>(
-        GetProcAddress(g_wlan.dll, "WlanQueryInterface"));
+        GetProcAddress(GetConnectivityState().wlan.dll, "WlanQueryInterface"));
     const auto freeMemory = reinterpret_cast<Free>(
-        GetProcAddress(g_wlan.dll, "WlanFreeMemory"));
+        GetProcAddress(GetConnectivityState().wlan.dll, "WlanFreeMemory"));
     if (!convert || !enumerate || !freeMemory) return;
     WlanInterfaceListCompat* list = nullptr;
-    if (enumerate(g_wlan.client, nullptr, &list) != ERROR_SUCCESS ||
+    if (enumerate(GetConnectivityState().wlan.client, nullptr, &list) != ERROR_SUCCESS ||
         !list) {
         if (list) freeMemory(list);
         return;
     }
-    g_wlan.inventoryValid = true;
+    GetConnectivityState().wlan.inventoryValid = true;
     std::unordered_map<ULONGLONG, WlanLiveState> live;
     for (DWORD i = 0; i < std::min<DWORD>(list->count, 64); ++i) {
         ULONGLONG luid = 0;
         if (convert(&list->interfaces[i].guid, &luid) != NO_ERROR ||
             !luid) continue;
-        g_wlan.RememberPhysicalLuid(luid);
+        GetConnectivityState().wlan.RememberPhysicalLuid(luid);
         WlanLiveState entry;
         // The Native Wi-Fi interface state reflects 802.11 association,
         // independently of NDIS OperStatus and IPv4/IPv6 addressing.
@@ -8117,7 +8803,7 @@ void RefreshPhysicalWlanLuids() {
             DWORD dataSize = 0, opcodeType = 0;
             void* data = nullptr;
             // wlan_intf_opcode_radio_state == 4; not a profile query.
-            if (query(g_wlan.client, &list->interfaces[i].guid, 4, nullptr,
+            if (query(GetConnectivityState().wlan.client, &list->interfaces[i].guid, 4, nullptr,
                     &dataSize, &data, &opcodeType) == ERROR_SUCCESS &&
                 data && dataSize >= offsetof(WlanRadioCompat, phys)) {
                 const auto* radio = reinterpret_cast<const WlanRadioCompat*>(data);
@@ -8151,7 +8837,7 @@ void RefreshPhysicalWlanLuids() {
             DWORD dataSize = 0, opcodeType = 0;
             void* data = nullptr;
             // wlan_intf_opcode_current_connection == 7.
-            if (query(g_wlan.client, &list->interfaces[i].guid, 7, nullptr,
+            if (query(GetConnectivityState().wlan.client, &list->interfaces[i].guid, 7, nullptr,
                     &dataSize, &data, &opcodeType) == ERROR_SUCCESS &&
                 data && dataSize >= sizeof(WlanConnectionPrefix)) {
                 const auto* info =
@@ -8169,7 +8855,7 @@ void RefreshPhysicalWlanLuids() {
         live.emplace(luid, std::move(entry));
     }
     freeMemory(list);
-    g_wlan.live = std::move(live);
+    GetConnectivityState().wlan.live = std::move(live);
 }
 
 // Bluetooth PAN is an IP/Ethernet-like adapter (often IfType 6), not an
@@ -8284,11 +8970,11 @@ std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot(
         // interfaces; leave Ethernet, VPN and TUN adapters untouched.
         bool physicalWifi = false;
         if (adapter->IfType == IF_TYPE_IEEE80211 &&
-            g_wlan.HasPhysicalLuids()) {
+            GetConnectivityState().wlan.HasPhysicalLuids()) {
             ULONGLONG luid = 0;
             static_assert(sizeof(luid) == sizeof(adapter->Luid));
             memcpy(&luid, &adapter->Luid, sizeof(luid));
-            physicalWifi = g_wlan.IsPhysicalLuid(luid);
+            physicalWifi = GetConnectivityState().wlan.IsPhysicalLuid(luid);
             if (!physicalWifi) continue;
         }
         NetInterfaceState state;
@@ -8297,13 +8983,13 @@ std::vector<std::pair<std::string, NetInterfaceState>> GetNetworkSnapshot(
         if (physicalWifi) {
             ULONGLONG luid = 0;
             memcpy(&luid, &adapter->Luid, sizeof(luid));
-            const auto wlan = g_wlan.live.find(luid);
-            if (wlan != g_wlan.live.end()) {
+            const auto wlan = GetConnectivityState().wlan.live.find(luid);
+            if (wlan != GetConnectivityState().wlan.live.end()) {
                 state.connected = wlan->second.connected;
                 state.wlanProfile = wlan->second.profile;
                 state.wlanRadioKnown = wlan->second.radioKnown;
                 state.wlanRadioOn = wlan->second.radioOn;
-            } else if (g_wlan.inventoryValid) {
+            } else if (GetConnectivityState().wlan.inventoryValid) {
                 // The physical adapter remains in IP Helper's inventory but
                 // disappeared from a *successful* Native WLAN enumeration.
                 // That means its WLAN interface is disabled/unavailable,
@@ -8327,14 +9013,14 @@ bool CaptureNetworkEvents() {
     if (!succeeded) return false;
     bool changed = false;
     std::unordered_map<std::string, NetInterfaceState> next;
-    next.reserve(current.size() + g_network.interfaces.size());
+    next.reserve(current.size() + GetConnectivityState().network.interfaces.size());
 
     for (auto& item : current) {
         if (item.first.empty()) continue;
-        const auto previous = g_network.interfaces.find(item.first);
+        const auto previous = GetConnectivityState().network.interfaces.find(item.first);
         // A new active adapter is also a connection event. Initial adapters
         // were captured at registration and are not announced at startup.
-        const bool wasConnected = previous != g_network.interfaces.end()
+        const bool wasConnected = previous != GetConnectivityState().network.interfaces.end()
             && previous->second.connected;
         // On a WLAN disconnect, WlanQueryInterface no longer returns the
         // previous profile. Use our snapshot from when it was connected.
@@ -8343,11 +9029,11 @@ bool CaptureNetworkEvents() {
             !item.second.wlanProfile.empty()
             ? item.second.wlanProfile : item.second.name;
         const std::wstring previousLabel = wifi &&
-            previous != g_network.interfaces.end() &&
+            previous != GetConnectivityState().network.interfaces.end() &&
             !previous->second.wlanProfile.empty()
             ? previous->second.wlanProfile : item.second.name;
         const bool radioChanged = wifi &&
-            previous != g_network.interfaces.end() &&
+            previous != GetConnectivityState().network.interfaces.end() &&
             previous->second.wlanRadioKnown &&
             item.second.wlanRadioKnown &&
             previous->second.wlanRadioOn != item.second.wlanRadioOn;
@@ -8363,7 +9049,7 @@ bool CaptureNetworkEvents() {
         }
         const bool switchedProfile = wifi && wasConnected &&
             item.second.connected &&
-            previous != g_network.interfaces.end() &&
+            previous != GetConnectivityState().network.interfaces.end() &&
             !previous->second.wlanProfile.empty() &&
             !item.second.wlanProfile.empty() &&
             previous->second.wlanProfile != item.second.wlanProfile;
@@ -8390,12 +9076,12 @@ bool CaptureNetworkEvents() {
         // eventual adapter removal can still identify the old connection.
         if (wifi && !item.second.connected &&
             item.second.wlanProfile.empty() &&
-            previous != g_network.interfaces.end())
+            previous != GetConnectivityState().network.interfaces.end())
             item.second.wlanProfile = previous->second.wlanProfile;
         // A temporary radio-query failure is not evidence that the radio
         // changed state; preserve the last known radio state.
         if (wifi && !item.second.wlanRadioKnown &&
-            previous != g_network.interfaces.end() &&
+            previous != GetConnectivityState().network.interfaces.end() &&
             previous->second.wlanRadioKnown) {
             item.second.wlanRadioKnown = true;
             item.second.wlanRadioOn = previous->second.wlanRadioOn;
@@ -8405,7 +9091,7 @@ bool CaptureNetworkEvents() {
 
     // Disabled adapters can disappear from the returned list altogether.
     // Preserve their last identity as "down" so re-enabling is reported.
-    for (const auto& prior : g_network.interfaces) {
+    for (const auto& prior : GetConnectivityState().network.interfaces) {
         if (next.find(prior.first) != next.end()) continue;
         if (prior.second.icon == NoticeIcon::Wifi &&
             prior.second.wlanRadioKnown && prior.second.wlanRadioOn) {
@@ -8432,20 +9118,20 @@ bool CaptureNetworkEvents() {
             next.emplace(prior.first, std::move(down));
         }
     }
-    g_network.interfaces = std::move(next);
+    GetConnectivityState().network.interfaces = std::move(next);
     return changed;
 }
 
 void FinishNetworkRefresh() {
-    if (g_network.hintPending && !g_network.sawInterfaceTransition) {
+    if (GetConnectivityState().network.hintPending && !GetConnectivityState().network.sawInterfaceTransition) {
         // A genuine aggregate change without any observed NIC transition.
         // A level hint is not proof that any specific interface changed.
-        AddNoticeEvent(NoticeCategory::Network, g_network.hintLevel == 1 ?
+        AddNoticeEvent(NoticeCategory::Network, GetConnectivityState().network.hintLevel == 1 ?
             NoticeAction::Disconnected : NoticeAction::NetworkChanged,
             L"aggregate-connectivity", Tr(OsdText::WindowsNetwork),
             NoticeIcon::Network);
     }
-    g_network.ResetRefresh();
+    GetConnectivityState().network.ResetRefresh();
 }
 
 bool HandleDeviceChange(WPARAM type, LPARAM value) {
@@ -8458,7 +9144,7 @@ bool HandleDeviceChange(WPARAM type, LPARAM value) {
             return false;
         const auto* dev = reinterpret_cast<const DEV_BROADCAST_DEVICEINTERFACE_W*>(value);
         if (!IsEqualGUID(dev->dbcc_classguid, kUsbDeviceInterface)) return false;
-        if (!g_config.showUsbEvents.load()) return true;
+        if (!GetSettingsState()->showUsbEvents.load()) return true;
         const size_t pathMax = (header->dbch_size -
             offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name)) / sizeof(WCHAR);
         if (pathMax == 0) return true;
@@ -8468,14 +9154,14 @@ bool HandleDeviceChange(WPARAM type, LPARAM value) {
         const std::wstring path(dev->dbcc_name, pathChars);
         if (path.empty()) return true;
         std::wstring label;
-        auto known = g_notice.usbNames.find(path);
-        if (known != g_notice.usbNames.end()) label = known->second;
+        auto known = GetNoticeState().notice.usbNames.find(path);
+        if (known != GetNoticeState().notice.usbNames.end()) label = known->second;
         else label = UsbDeviceLabel(path);
         if (type == DBT_DEVICEARRIVAL) {
-            if (g_notice.usbNames.size() >= 256) g_notice.usbNames.clear();
-            g_notice.usbNames[path] = label;
+            if (GetNoticeState().notice.usbNames.size() >= 256) GetNoticeState().notice.usbNames.clear();
+            GetNoticeState().notice.usbNames[path] = label;
         } else {
-            g_notice.usbNames.erase(path);
+            GetNoticeState().notice.usbNames.erase(path);
         }
         AddNoticeEvent(NoticeCategory::Usb, type == DBT_DEVICEARRIVAL ?
             NoticeAction::Connected : NoticeAction::Removed,
@@ -8533,13 +9219,21 @@ struct Watcher {
 
 // The receive window owns all device states. Callback threads only append to
 // this short, bounded queue, then post a zero-payload message to the OSD UI.
-[[clang::no_destroy]] std::mutex queueMutex;
-[[clang::no_destroy]] std::vector<Event> queue;
-[[clang::no_destroy]] std::unordered_map<std::wstring, DeviceState> known;
-[[clang::no_destroy]] std::array<std::unique_ptr<Watcher>, 2> watchers;
-std::array<bool, 2> enumerationComplete{};
-std::atomic<HWND> receiver{nullptr};
-std::atomic<bool> accepting{false};
+// Watchers, callbacks and baseline state form a single Bluetooth module.
+// Stop() revokes callbacks before releasing owned collections.
+struct BluetoothModuleState final {
+    std::mutex queueMutex;
+    std::vector<Event> queue;
+    std::unordered_map<std::wstring, DeviceState> known;
+    std::array<std::unique_ptr<Watcher>, 2> watchers;
+    std::array<bool, 2> enumerationComplete{};
+    std::atomic<HWND> receiver{nullptr};
+    std::atomic<bool> accepting{false};
+};
+BluetoothModuleState& GetBluetoothState() {
+    [[clang::no_destroy]] static BluetoothModuleState instance;
+    return instance;
+}
 constexpr auto kInitialSnapshotTimeout = std::chrono::milliseconds(1800);
 
 // Share exactly the same AEP property list across initial enumeration and
@@ -8584,8 +9278,10 @@ NoticeIcon Classify(fc::IMapView<winrt::hstring,
                 default: break; // Composite keyboard+mouse is ambiguous.
             }
         } else if (major == 4) { // SIG audio/video minor classes.
-            if (minor == 1 || minor == 2 || minor == 6)
+            if (minor == 1 || minor == 2)
                 return NoticeIcon::Headset;
+            if (minor == 6) // SIG Audio/Video: Headphones.
+                return NoticeIcon::Headphone;
             if (minor == 5 || minor == 7 || minor == 10)
                 return NoticeIcon::Speaker;
         }
@@ -8612,18 +9308,18 @@ bool TryConnected(fc::IMapView<winrt::hstring, winrt::Windows::Foundation::IInsp
 }
 
 void Post(Event&& event) {
-    if (!accepting.load(std::memory_order_acquire) ||
-        g_module.closing.load(std::memory_order_relaxed)) return;
-    HWND target = receiver.load(std::memory_order_acquire);
+    if (!GetBluetoothState().accepting.load(std::memory_order_acquire) ||
+        GetCoreState().module.closing.load(std::memory_order_relaxed)) return;
+    HWND target = GetBluetoothState().receiver.load(std::memory_order_acquire);
     if (!target) return;
     bool queued = false;
     {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        queued = accepting.load(std::memory_order_relaxed) &&
-                 queue.size() < kMaxQueuedEvents;
-        if (queued) queue.emplace_back(std::move(event));
+        std::lock_guard<std::mutex> lock(GetBluetoothState().queueMutex);
+        queued = GetBluetoothState().accepting.load(std::memory_order_relaxed) &&
+                 GetBluetoothState().queue.size() < kMaxQueuedEvents;
+        if (queued) GetBluetoothState().queue.emplace_back(std::move(event));
     }
-    // A failed PostMessage leaves the event in the queue. Any later callback
+    // A failed PostMessage leaves the event in the GetBluetoothState().queue. Any later callback
     // will retry; there is no heap pointer stranded in a destroyed HWND.
     if (queued) (void)PostMessageW(target, kBluetoothQueueMessage, 0, 0);
 }
@@ -8642,9 +9338,9 @@ void WithGate(std::weak_ptr<CallbackGate> const& weak, Fn&& action) noexcept {
 }
 
 void Stop() {
-    accepting.store(false, std::memory_order_release);
-    receiver.store(nullptr, std::memory_order_release);
-    for (auto& watcher : watchers) {
+    GetBluetoothState().accepting.store(false, std::memory_order_release);
+    GetBluetoothState().receiver.store(nullptr, std::memory_order_release);
+    for (auto& watcher : GetBluetoothState().watchers) {
         if (!watcher) continue;
         watcher->gate->enabled.store(false, std::memory_order_release);
         try {
@@ -8662,9 +9358,9 @@ void Stop() {
             // Release the projection objects regardless of device removal.
         }
     }
-    for (auto& watcher : watchers) {
+    for (auto& watcher : GetBluetoothState().watchers) {
         if (!watcher) continue;
-        // All callbacks are bounded to a property read and a queue append.
+        // All callbacks are bounded to a property read and a GetBluetoothState().queue append.
         // They cannot call user callbacks or wait for the OSD message loop.
         while (watcher->gate->inFlight.load(std::memory_order_acquire))
             Sleep(1);
@@ -8672,14 +9368,14 @@ void Stop() {
     }
     std::vector<Event> oldQueue;
     {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        queue.swap(oldQueue);
+        std::lock_guard<std::mutex> lock(GetBluetoothState().queueMutex);
+        GetBluetoothState().queue.swap(oldQueue);
     }
     // Stop already revoked every watcher and joined in-flight callbacks.
     // Release buckets instead of only clearing values in no_destroy globals.
     std::unordered_map<std::wstring, DeviceState> oldKnown;
-    known.swap(oldKnown);
-    enumerationComplete = {false, false};
+    GetBluetoothState().known.swap(oldKnown);
+    GetBluetoothState().enumerationComplete = {false, false};
 }
 
 // Capture existing paired AEPs during monitor initialization, before
@@ -8691,7 +9387,7 @@ void SeedInitialState(int transport, winrt::hstring const& selector) {
             de::DeviceInformationKind::AssociationEndpoint);
         const auto status = operation.wait_for(kInitialSnapshotTimeout);
         if (status != winrt::Windows::Foundation::AsyncStatus::Completed) {
-            // The device broker must not block the OSD receiver indefinitely.
+            // The device broker must not block the OSD GetBluetoothState().receiver indefinitely.
             // Unknown IsConnected stays unknown, never assumed false.
             operation.Cancel();
             Wh_Log(L"Fluent OSD/Bluetooth: initial query transport=%d status=%d",
@@ -8700,7 +9396,7 @@ void SeedInitialState(int transport, winrt::hstring const& selector) {
         }
         size_t seeded = 0, unknown = 0;
         for (auto const& info : operation.GetResults()) {
-            if (known.size() >= kMaxKnownDevices) break;
+            if (GetBluetoothState().known.size() >= kMaxKnownDevices) break;
             try {
                 const std::wstring id = Limited(info.Id(), 512);
                 if (id.empty()) continue;
@@ -8712,7 +9408,7 @@ void SeedInitialState(int transport, winrt::hstring const& selector) {
                 state.connectionKnown =
                     TryConnected(info.Properties(), state.connected);
                 if (!state.connectionKnown) ++unknown;
-                if (known.emplace(key, std::move(state)).second) ++seeded;
+                if (GetBluetoothState().known.emplace(key, std::move(state)).second) ++seeded;
             } catch (...) {
                 ++unknown; // One malformed device must not discard the set.
             }
@@ -8787,16 +9483,16 @@ void StartOne(int transport, winrt::hstring const& selector) {
         });
     });
     // Ownership precedes Start; an early callback can only enqueue a message.
-    watchers[transport] = std::move(item);
-    watchers[transport]->value.Start();
+    GetBluetoothState().watchers[transport] = std::move(item);
+    GetBluetoothState().watchers[transport]->value.Start();
 }
 
 void Start() {
-    if (!g_module.receiveWnd || g_module.closing.load() ||
-        !g_config.showBluetoothEvents.load()) return;
-    if (watchers[0] || watchers[1]) return;
-    receiver.store(g_module.receiveWnd, std::memory_order_release);
-    accepting.store(true, std::memory_order_release);
+    if (!GetCoreState().module.receiveWnd || GetCoreState().module.closing.load() ||
+        !GetSettingsState()->showBluetoothEvents.load()) return;
+    if (GetBluetoothState().watchers[0] || GetBluetoothState().watchers[1]) return;
+    GetBluetoothState().receiver.store(GetCoreState().module.receiveWnd, std::memory_order_release);
+    GetBluetoothState().accepting.store(true, std::memory_order_release);
     try {
         // Paired-only selectors do not trigger scans for arbitrary unpaired
         // nearby BLE devices. Classic and LE are both tracked as AEPs.
@@ -8817,53 +9513,53 @@ void Start() {
         Wh_Log(L"Bluetooth LE watcher failed: 0x%08lX",
                static_cast<unsigned long>(error.code().value));
     } catch (...) { Wh_Log(L"Bluetooth LE watcher failed"); }
-    if (!watchers[0] && !watchers[1]) Stop();
+    if (!GetBluetoothState().watchers[0] && !GetBluetoothState().watchers[1]) Stop();
 }
 
 void Drain() {
     std::vector<Event> events;
     {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        events.swap(queue);
+        std::lock_guard<std::mutex> lock(GetBluetoothState().queueMutex);
+        events.swap(GetBluetoothState().queue);
     }
-    if (!accepting.load(std::memory_order_acquire)) return;
+    if (!GetBluetoothState().accepting.load(std::memory_order_acquire)) return;
 
     for (auto& event : events) {
         if (event.transport < 0 || event.transport > 1) continue;
         const size_t transport = static_cast<size_t>(event.transport);
         if (event.change == Change::Completed) {
-            enumerationComplete[transport] = true; // Initial scan is silent.
+            GetBluetoothState().enumerationComplete[transport] = true; // Initial scan is silent.
             continue;
         }
         if (event.id.empty()) continue;
         const std::wstring id = (transport ? L"ble:" : L"classic:") + event.id;
-        auto previous = known.find(id);
+        auto previous = GetBluetoothState().known.find(id);
         if (event.change == Change::Removed) {
             // DeviceWatcher collection removal is not proof of a transport
             // disconnect. Discard the baseline and do not notify.
-            if (previous != known.end()) known.erase(previous);
+            if (previous != GetBluetoothState().known.end()) GetBluetoothState().known.erase(previous);
             continue;
         }
-        if (previous == known.end()) {
-            if (known.size() >= kMaxKnownDevices) continue;
-            previous = known.emplace(id, DeviceState{}).first;
+        if (previous == GetBluetoothState().known.end()) {
+            if (GetBluetoothState().known.size() >= kMaxKnownDevices) continue;
+            previous = GetBluetoothState().known.emplace(id, DeviceState{}).first;
         }
         auto& current = previous->second;
         if (!event.name.empty()) current.name = std::move(event.name);
-        // Partial updates without classification cannot erase a known icon.
+        // Partial updates without classification cannot erase a GetBluetoothState().known icon.
         if (event.icon != NoticeIcon::Bluetooth) current.icon = event.icon;
         if (!event.connectionPresent) continue;
         // A proactive startup snapshot seeds the state; Watcher Added then
         // silently reconciles observations made during subscription.
         // Require the initial enumeration to finish
         // and an explicit IsConnected transition from a live Updated event.
-        const bool liveUpdate = enumerationComplete[transport] &&
+        const bool liveUpdate = GetBluetoothState().enumerationComplete[transport] &&
             event.change == Change::Updated;
         const bool wasConnected = current.connected;
         const ConnectionTransition transition =
             current.ObserveConnection(event.connected, liveUpdate);
         if (transition != ConnectionTransition::None &&
-            g_config.showBluetoothEvents.load()) {
+            GetSettingsState()->showBluetoothEvents.load()) {
             Wh_Log(L"Fluent OSD/Bluetooth: AEP update transport=%d old=%d new=%d",
                    event.transport, static_cast<int>(wasConnected),
                    static_cast<int>(event.connected));
@@ -8882,24 +9578,22 @@ void Drain() {
 // ============================================================
 // No DDC or monitor I/O, timers or extra worker threads in this renderer.
 // Draw to premultiplied BGRA pixels before publishing a layered surface.
-struct PopupPlacement {
-    float scale = 1.0f;
-    int width = 0, height = 0;
-    RECT work{}, monitorBounds{}, bounds{};
-};
 // Shared placement output is authoritative for both render backends.
 // A renderer reads the calculated bounds, never measures another
 // backend's hidden HWND to discover where it should draw.
 namespace osd_placement {
-PopupPlacement g_main{};
-bool g_valid = false; // All placement callbacks run on the same UI thread.
 void Publish(const PopupPlacement& placement) {
-    g_main = placement;
-    g_valid = true;
+    auto& state = GetCoreState().presentation.placement;
+    state.current = placement;
+    state.valid = true;
+}
+void Invalidate() {
+    GetCoreState().presentation.placement.valid = false;
 }
 bool CurrentAnchor(RECT& anchor) {
-    if (!g_valid) return false;
-    anchor = g_main.bounds;
+    const auto& state = GetCoreState().presentation.placement;
+    if (!state.valid) return false;
+    anchor = state.current.bounds;
     return true;
 }
 }
@@ -8913,13 +9607,13 @@ bool CalculatePopupPlacement(HMONITOR monitor, PopupPlacement& p) {
     // The renderer keeps the same Win11-inspired vector geometry.
     const float dpiScale = std::clamp(dpiX / 96.0f, 0.75f, 3.0f);
     const float sizeScale =
-        g_config.ddcSizePercent.load(std::memory_order_relaxed) / 100.0f;
+        GetSettingsState()->ddcSizePercent.load(std::memory_order_relaxed) / 100.0f;
     p.scale = dpiScale * sizeScale;
-    const bool statusNotice = g_presentation.popupKind == PopupKind::LockStatus ||
-        g_presentation.popupKind == PopupKind::NativeEvent ||
-        g_presentation.popupKind == PopupKind::Notification;
-    const bool imageNotice = g_presentation.popupKind == PopupKind::Notification &&
-        g_notice.clipboardThumbnail;
+    const bool statusNotice = GetCoreState().presentation.popupKind == PopupKind::LockStatus ||
+        GetCoreState().presentation.popupKind == PopupKind::NativeEvent ||
+        GetCoreState().presentation.popupKind == PopupKind::Notification;
+    const bool imageNotice = GetCoreState().presentation.popupKind == PopupKind::Notification &&
+        GetNoticeState().notice.clipboardThumbnail;
     const float logicalWidth = imageNotice ? kClipboardImageCanvasW :
         statusNotice ? kStatusNoticeWidth : MainLogicalWidth();
     const float logicalHeight = imageNotice ? kClipboardImageCanvasH :
@@ -8944,7 +9638,7 @@ bool CalculatePopupPlacement(HMONITOR monitor, PopupPlacement& p) {
     // Stable mapping retains positions chosen in v1.4.1.
     // bottom center, bottom left/right, top center, center,
     // top left/right, center left/right.
-    switch (g_config.position.load(std::memory_order_relaxed)) {
+    switch (GetSettingsState()->position.load(std::memory_order_relaxed)) {
         case 1: x = leftX; break;                      // bottom-left
         case 2: x = rightX; break;                     // bottom-right
         case 3: y = topY; break;                       // top-center
@@ -8955,9 +9649,9 @@ bool CalculatePopupPlacement(HMONITOR monitor, PopupPlacement& p) {
         case 8: x = rightX; y = centerY; break;        // center-right
         default: break;                               // bottom-center
     }
-    x += static_cast<int>(std::lround(g_config.offsetX.load() * dpiScale));
-    y += static_cast<int>(std::lround(g_config.offsetY.load() * dpiScale));
-    const int position = g_config.position.load(std::memory_order_relaxed);
+    x += static_cast<int>(std::lround(GetSettingsState()->offsetX.load() * dpiScale));
+    y += static_cast<int>(std::lround(GetSettingsState()->offsetY.load() * dpiScale));
+    const int position = GetSettingsState()->position.load(std::memory_order_relaxed);
     x = ClampPopupAxis(x, p.width,
         PositionCentersX(position) ? display : work, true);
     y = ClampPopupAxis(y, p.height,
@@ -8976,25 +9670,25 @@ BOOL CALLBACK FindMirrorCallback(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
 }
 void MovePopupToDisplay(const BrightnessEvent& ev) {
     WCHAR device[CCHDEVICENAME]{};
-    const int outputMode = g_config.displayOutputMode.load(std::memory_order_relaxed);
+    const int outputMode = GetSettingsState()->displayOutputMode.load(std::memory_order_relaxed);
     if ((outputMode == 0 ||
-         (outputMode == 3 && g_presentation.popupKind == PopupKind::DdcBrightness)) &&
+         (outputMode == 3 && GetCoreState().presentation.popupKind == PopupKind::DdcBrightness)) &&
         ev.device[0]) {
         wcscpy_s(device, ev.device);
     } else if (outputMode == 2) {
         swprintf_s(device, L"\\\\.\\DISPLAY%d",
-                   g_config.displayOutputNumber.load(std::memory_order_relaxed));
+                   GetSettingsState()->displayOutputNumber.load(std::memory_order_relaxed));
     }
     HMONITOR monitor = FindMonitorByDeviceName(device);
     if (!monitor)
         monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
     PopupPlacement place{};
     if (!CalculatePopupPlacement(monitor, place)) {
-        osd_placement::g_valid = false;
+        osd_placement::Invalidate();
         return;
     }
     osd_placement::Publish(place);
-    g_panel.scale = place.scale;
+    GetAudioState().panel.scale = place.scale;
     // XAML owns the visible HWND; this adapter publishes owned geometry.
 }
 
@@ -9005,6 +9699,7 @@ void MovePopupToDisplay(const BrightnessEvent& ev) {
 // value, event identity and monitor placement remain category-specific.
 xaml_osd::Snapshot MakeXamlSnapshot(
         PopupKind kind, const RECT& anchor, float scale) {
+    const auto settings = GetSettingsState();
     xaml_osd::Snapshot data;
     data.kind = kind == PopupKind::NativeVolume
         ? xaml_osd::LevelKind::Volume
@@ -9012,36 +9707,36 @@ xaml_osd::Snapshot MakeXamlSnapshot(
         ? xaml_osd::LevelKind::DdcBrightness
         : xaml_osd::LevelKind::NativeBrightness;
     data.brightness = kind != PopupKind::NativeVolume;
-    data.receiver = g_module.receiveWnd;
-    data.showIcon = !data.brightness || g_config.showSun.load();
-    data.percent = g_presentation.nativePercent;
-    data.rawValue = g_presentation.nativePercent;
-    data.valueKnown = g_presentation.nativePercentKnown;
-    data.muted = !data.brightness && g_presentation.nativeMuted;
+    data.receiver = GetCoreState().module.receiveWnd;
+    data.showIcon = !data.brightness || settings->showSun.load();
+    data.percent = GetCoreState().presentation.nativePercent;
+    data.rawValue = GetCoreState().presentation.nativePercent;
+    data.valueKnown = GetCoreState().presentation.nativePercentKnown;
+    data.muted = !data.brightness && GetCoreState().presentation.nativeMuted;
     data.mixerChevron = kind == PopupKind::NativeVolume &&
-        g_config.showMixerArrow.load();
+        settings->showMixerArrow.load();
     data.durationMs = OsdDuration(kind == PopupKind::DdcBrightness
         ? DurationKind::DdcBrightness
         : kind == PopupKind::NativeBrightness
-        ? DurationKind::NativeBrightness : DurationKind::Volume);
+        ? DurationKind::NativeBrightness : DurationKind::Volume, *settings);
     data.anchor = anchor;
     data.scale = scale;
-    data.vertical = g_config.verticalVolumeBrightness.load();
-    data.showValue = g_config.showValue.load();
-    data.innerPadding = g_config.innerPadding.load();
-    data.iconSize = g_config.iconSize.load();
-    data.fontSize = g_config.fontSize.load();
-    const bool light = IsLightTheme();
-    data.background = OsdBackgroundRgb(light);
-    data.backgroundAlpha = OsdBackgroundAlpha();
-    g_config.CopyBrushLayers(data.layeredBackground, data.backgroundLayers);
-    data.borderless = g_config.ddcBorderless.load();
-    data.cornerRadius = g_config.cornerRadius.load();
-    data.fadeEnabled = g_config.fadeEnabled.load();
-    data.fadeDurationMs = static_cast<DWORD>(g_config.fadeDuration.load());
-    data.text = OsdTextRgb(light);
-    data.accent = OsdAccentRgb();
-    data.track = OsdTrackRgb(light);
+    data.vertical = settings->verticalVolumeBrightness.load();
+    data.showValue = settings->showValue.load();
+    data.innerPadding = settings->innerPadding.load();
+    data.iconSize = settings->iconSize.load();
+    data.fontSize = settings->fontSize.load();
+    const bool light = IsLightTheme(*settings);
+    data.background = OsdBackgroundRgb(light, *settings);
+    data.backgroundAlpha = OsdBackgroundAlpha(*settings);
+    settings->CopyBrushLayers(data.layeredBackground, data.backgroundLayers);
+    data.borderless = settings->ddcBorderless.load();
+    data.cornerRadius = settings->cornerRadius.load();
+    data.fadeEnabled = settings->fadeEnabled.load();
+    data.fadeDurationMs = static_cast<DWORD>(settings->fadeDuration.load());
+    data.text = OsdTextRgb(light, *settings);
+    data.accent = OsdAccentRgb(*settings);
+    data.track = OsdTrackRgb(light, false, *settings);
     return data;
 }
 
@@ -9061,7 +9756,7 @@ int XamlMirrorOffset(int position, int difference, bool horizontal) {
 }
 bool ShowXamlMirroredBatch(std::vector<xaml_osd::Snapshot> batch) {
     if (batch.empty()) return false;
-    if (g_config.displayOutputMode.load(std::memory_order_relaxed) == 3 &&
+    if (GetSettingsState()->displayOutputMode.load(std::memory_order_relaxed) == 3 &&
         batch.front().kind != xaml_osd::LevelKind::DdcBrightness) {
         const bool attached = batch.size() == 2 &&
             ((batch.front().kind == xaml_osd::LevelKind::Volume &&
@@ -9074,7 +9769,7 @@ bool ShowXamlMirroredBatch(std::vector<xaml_osd::Snapshot> batch) {
             MONITOR_DEFAULTTONEAREST), {}};
         EnumDisplayMonitors(nullptr, nullptr, FindMirrorCallback,
             reinterpret_cast<LPARAM>(&scan));
-        const int position = g_config.position.load(std::memory_order_relaxed);
+        const int position = GetSettingsState()->position.load(std::memory_order_relaxed);
         const double originalScale = std::max(.5, double(master.scale));
         for (HMONITOR monitor : scan.peers) {
             MONITORINFOEXW info{};
@@ -9170,21 +9865,22 @@ xaml_osd::Snapshot MakeXamlStatusSnapshot(
         xaml_osd::LevelKind category, const RECT& anchor,
         DurationKind duration, bool fluentIcon = false) {
     return osd_model::AsStatus(
-        MakeXamlSnapshot(PopupKind::NativeBrightness, anchor, g_panel.scale),
+        MakeXamlSnapshot(PopupKind::NativeBrightness, anchor, GetAudioState().panel.scale),
         category, OsdDuration(duration), fluentIcon);
 }
 
 // Category changes are controller state, never rendering side effects.
 void PrepareXamlCategory() {
-    if (g_presentation.popupKind != PopupKind::NativeVolume) {
+    if (GetCoreState().presentation.popupKind != PopupKind::NativeVolume) {
         ResetXamlMixerController();
         ResetXamlMediaController();
     }
 }
-bool ShowXamlDdcTargets(const BrightnessEvent& master) {
-    const int mode = g_config.displayOutputMode.load(std::memory_order_relaxed);
+bool ShowXamlDdcTargets(
+        const BrightnessEvent& master,
+        const std::vector<BrightnessEvent>* changedTargets = nullptr) {
+    const int mode = GetSettingsState()->displayOutputMode.load(std::memory_order_relaxed);
     std::vector<xaml_osd::Snapshot> batch;
-    const ULONGLONG now = GetTickCount64();
     auto push = [&](const BrightnessEvent& ev,
                     const RECT& anchor, float scale) {
         auto snapshot = MakeXamlSnapshot(
@@ -9201,27 +9897,33 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
     };
 
     if (mode == 0 || mode == 3) {
-        for (const auto& target : g_ddc.targets) {
-            if (target.expiresAt <= now) continue;
-            HMONITOR monitor =
-                FindMonitorByDeviceName(target.event.device);
+        // Source and All both pin DDC to the *changed* physical outputs.
+        // Cached values remain available for input/rollback, but do not
+        // cause previously touched monitors to reappear or restart timers.
+        const auto appendTarget = [&](const BrightnessEvent& ev) {
+            HMONITOR monitor = FindMonitorByDeviceName(ev.device);
             PopupPlacement placement{};
             if (!monitor || !CalculatePopupPlacement(monitor, placement)) {
                 Wh_Log(L"Fluent OSD/XAML: unresolved DDC display '%s'",
-                       target.event.device);
-                continue;
+                       ev.device);
+                return;
             }
-            push(target.event, placement.bounds, placement.scale);
+            push(ev, placement.bounds, placement.scale);
+        };
+        if (changedTargets) {
+            for (const auto& ev : *changedTargets) appendTarget(ev);
+        } else {
+            appendTarget(master);
         }
     } else {
         // Primary/selected output remains one card with the chosen event.
         RECT anchor{};
         if (osd_placement::CurrentAnchor(anchor))
-            push(master, anchor, g_panel.scale);
+            push(master, anchor, GetAudioState().panel.scale);
     }
     if (batch.empty()) {
         Wh_Log(L"Fluent OSD/XAML: no resolvable DDC snapshots");
-        xaml_osd::Hide();
+        // An unresolved delta must not dismiss another monitor's live OSD.
         return false;
     }
     const bool ok = xaml_osd::ShowBatch(batch);
@@ -9234,53 +9936,41 @@ bool ShowXamlDdcTargets(const BrightnessEvent& master) {
 // target's raw value and range survive the burst for independent painting.
 void DisplayDdcBatch() {
     std::vector<BrightnessEvent> events =
-        g_ddc.TakeBatchOnControllerThread();
-    if (g_module.closing.load() || !g_config.showDdcBrightness.load() || events.empty())
+        GetBrightnessState().ddc.TakeBatchOnControllerThread();
+    if (GetCoreState().module.closing.load() || !GetSettingsState()->showDdcBrightness.load() || events.empty())
         return;
 
     const ULONGLONG now = GetTickCount64();
-    const int mode = g_config.displayOutputMode.load(std::memory_order_relaxed);
+    const int mode = GetSettingsState()->displayOutputMode.load(std::memory_order_relaxed);
     const ULONGLONG expiry = now + static_cast<ULONGLONG>(
         OsdDuration(DurationKind::DdcBrightness));
     // The cache lasts only for the active OSD period, never indefinitely.
-    g_ddc.targets.erase(std::remove_if(g_ddc.targets.begin(),
-        g_ddc.targets.end(), [now](const DdcTargetState& item) {
+    GetBrightnessState().ddc.targets.erase(std::remove_if(GetBrightnessState().ddc.targets.begin(),
+        GetBrightnessState().ddc.targets.end(), [now](const DdcTargetState& item) {
             return item.expiresAt <= now;
-        }), g_ddc.targets.end());
+        }), GetBrightnessState().ddc.targets.end());
 
     BrightnessEvent master{};
     bool masterChosen = false;
+    std::vector<BrightnessEvent> changedTargets;
+    changedTargets.reserve(events.size());
     // XAML keeps the primary host hidden in DDC multi-target mode. The
     // unexpired per-display target cache, not that HWND, determines pinning.
     const bool priorTargetActive = std::any_of(
-        g_ddc.targets.begin(), g_ddc.targets.end(),
+        GetBrightnessState().ddc.targets.begin(), GetBrightnessState().ddc.targets.end(),
         [&](const DdcTargetState& previous) {
             return previous.expiresAt > now &&
-                previous.event.physicalIndex == g_presentation.visible.physicalIndex &&
-                _wcsicmp(previous.event.device, g_presentation.visible.device) == 0;
+                previous.event.physicalIndex == GetCoreState().presentation.visible.physicalIndex &&
+                _wcsicmp(previous.event.device, GetCoreState().presentation.visible.device) == 0;
         });
-    bool pinnedMaster = false;
-    if ((mode == 0 || mode == 3) &&
-        g_presentation.popupKind == PopupKind::DdcBrightness &&
-        priorTargetActive && g_presentation.visible.device[0]) {
-        auto current = std::find_if(events.begin(), events.end(),
-            [&](const BrightnessEvent& event) {
-                return event.physicalIndex == g_presentation.visible.physicalIndex &&
-                       _wcsicmp(event.device, g_presentation.visible.device) == 0;
-            });
-        if (current != events.end()) {
-            master = *current;
-            masterChosen = true;
-            pinnedMaster = true;
-        }
-    }
+    bool pinnedMaster = false; // Only a genuinely changed target may pin.
     WCHAR preferredDevice[CCHDEVICENAME]{};
     if (mode == 1 || mode == 2) {
         HMONITOR preferredMonitor = nullptr;
         if (mode == 2) {
             WCHAR device[CCHDEVICENAME]{};
             swprintf_s(device, L"\\\\.\\DISPLAY%d",
-                g_config.displayOutputNumber.load(std::memory_order_relaxed));
+                GetSettingsState()->displayOutputNumber.load(std::memory_order_relaxed));
             preferredMonitor = FindMonitorByDeviceName(device);
         }
         if (!preferredMonitor)
@@ -9295,9 +9985,9 @@ void DisplayDdcBatch() {
     for (const BrightnessEvent& ev : events) {
         const HMONITOR target = FindMonitorByDeviceName(ev.device);
         if (!target && (mode == 0 || mode == 3)) {
-            if (_wcsicmp(g_ddc.lastUnresolved, ev.device) != 0 ||
-                !g_ddc.lastUnresolved[0]) {
-                wcscpy_s(g_ddc.lastUnresolved, ev.device);
+            if (_wcsicmp(GetBrightnessState().ddc.lastUnresolved, ev.device) != 0 ||
+                !GetBrightnessState().ddc.lastUnresolved[0]) {
+                wcscpy_s(GetBrightnessState().ddc.lastUnresolved, ev.device);
                 Wh_Log(L"DDC event target unresolved: device='%s', "
                        L"physicalIndex=%lu, senderPID=%lu; skipping "
                        L"unknown target.", ev.device, ev.physicalIndex,
@@ -9305,44 +9995,57 @@ void DisplayDdcBatch() {
             }
             continue;
         }
+        bool valueChanged = true;
         if (target) {
-            if (_wcsicmp(g_ddc.lastTarget, ev.device) != 0) {
-                wcscpy_s(g_ddc.lastTarget, ev.device);
+            if (_wcsicmp(GetBrightnessState().ddc.lastTarget, ev.device) != 0) {
+                wcscpy_s(GetBrightnessState().ddc.lastTarget, ev.device);
                 Wh_Log(L"DDC target resolved: '%s' (physicalIndex=%lu)",
                        ev.device, ev.physicalIndex);
             }
-            g_ddc.lastUnresolved[0] = L'\0';
+            GetBrightnessState().ddc.lastUnresolved[0] = L'\0';
             const auto sameDevice = [&](const DdcTargetState& state) {
                 return state.event.physicalIndex == ev.physicalIndex &&
                        _wcsicmp(state.event.device, ev.device) == 0;
             };
-            auto it = std::find_if(g_ddc.targets.begin(),
-                                   g_ddc.targets.end(), sameDevice);
-            if (it != g_ddc.targets.end()) {
-                it->event = ev;
-                it->expiresAt = expiry;
-            } else if (g_ddc.targets.size() < kMaxDdcTargets) {
-                g_ddc.targets.push_back({ev, expiry});
+            auto it = std::find_if(GetBrightnessState().ddc.targets.begin(),
+                                   GetBrightnessState().ddc.targets.end(), sameDevice);
+            if (it != GetBrightnessState().ddc.targets.end()) {
+                valueChanged = it->event.value != ev.value;
+                it->event = ev; // Preserve the latest range even for same-value writes.
+                if (valueChanged) it->expiresAt = expiry;
+            } else if (GetBrightnessState().ddc.targets.size() < kMaxDdcTargets) {
+                GetBrightnessState().ddc.targets.push_back({ev, expiry});
             }
         }
-        // Source mode puts the latest event on its own monitor. For fixed
-        // output/mirror modes prefer that screen's value if it was updated.
-        if (!masterChosen ||
-            ((mode == 0 || mode == 3) && !pinnedMaster) ||
-            (preferredDevice[0] &&
-             _wcsicmp(preferredDevice, ev.device) == 0)) {
+        if (!valueChanged) continue;
+        changedTargets.push_back(ev);
+        // Preserve an actively edited physical target as controller master
+        // only when that target actually changed in this batch.
+        const bool editedMaster = (mode == 0 || mode == 3) &&
+            GetCoreState().presentation.popupKind == PopupKind::DdcBrightness &&
+            priorTargetActive &&
+            ev.physicalIndex == GetCoreState().presentation.visible.physicalIndex &&
+            _wcsicmp(ev.device, GetCoreState().presentation.visible.device) == 0;
+        if (editedMaster) {
+            master = ev;
+            masterChosen = true;
+            pinnedMaster = true;
+        } else if (!masterChosen ||
+                   ((mode == 0 || mode == 3) && !pinnedMaster) ||
+                   (preferredDevice[0] &&
+                    _wcsicmp(preferredDevice, ev.device) == 0)) {
             master = ev;
             masterChosen = true;
         }
     }
     if (!masterChosen) return;
 
-    g_presentation.visible = master;
-    g_ddc.lastConfirmedDdc = master.value;
-    g_presentation.popupKind = PopupKind::DdcBrightness;
+    GetCoreState().presentation.visible = master;
+    GetBrightnessState().ddc.lastConfirmedDdc = master.value;
+    GetCoreState().presentation.popupKind = PopupKind::DdcBrightness;
     MovePopupToDisplay(master);
     PrepareXamlCategory();
-    (void)ShowXamlDdcTargets(master);
+    (void)ShowXamlDdcTargets(master, &changedTargets);
 }
 
 // ============================================================
@@ -9477,9 +10180,9 @@ bool WriteExternalBrightnessDdc(const BrightnessWheelTask& task) {
         std::vector<PHYSICAL_MONITOR> monitors(n);
         if (get(display.monitor, n, monitors.data())) {
             HANDLE monitor = monitors[task.monitor.physicalIndex].hPhysicalMonitor;
-            g_ddc.UpdateHandleRange(
+            GetBrightnessState().ddc.UpdateHandleRange(
                 monitor, task.monitor.minimum, task.monitor.maximum);
-            const int vcp = g_config.vcpCode.load();
+            const int vcp = GetSettingsState()->vcpCode.load();
             ok = setVcp(monitor, static_cast<BYTE>(vcp),
                         static_cast<DWORD>(task.value)) != FALSE;
             if (!ok && vcp == 16 && setBrightness)
@@ -9494,19 +10197,24 @@ bool WriteExternalBrightnessDdc(const BrightnessWheelTask& task) {
 DWORD WINAPI BrightnessWheelThreadProc(void*) {
     const HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool comReady = SUCCEEDED(init);
-    while (WaitForSingleObject(g_writer.wake, INFINITE) == WAIT_OBJECT_0) {
-        if (g_writer.stop.load()) break;
-        std::vector<BrightnessWheelTask> tasks = g_writer.TakePending();
+    while (WaitForSingleObject(GetBrightnessState().writer.wake, INFINITE) == WAIT_OBJECT_0) {
+        if (GetBrightnessState().writer.stop.load()) break;
+        std::vector<BrightnessWheelTask> tasks = GetBrightnessState().writer.TakePending();
         for (const auto& task : tasks) {
-            if (g_writer.stop.load()) break;
+            if (GetBrightnessState().writer.stop.load()) break;
             // Skip a snapshot superseded while another DDC command ran.
-            if (g_writer.IsSuperseded(task)) continue;
+            if (GetBrightnessState().writer.IsSuperseded(task)) continue;
+            const ULONGLONG startedAt = GetTickCount64();
             const bool success = task.native ?
                 (comReady && WriteNativeBrightnessWmi(
                     static_cast<BYTE>(std::clamp(task.value, 0, 100))))
                 : WriteExternalBrightnessDdc(task);
+            const ULONGLONG elapsed = GetTickCount64() - startedAt;
+            if (elapsed >= 1500)
+                Wh_Log(L"Fluent OSD/brightness: slow worker operation native=%d duration=%llu ms",
+                       task.native, static_cast<unsigned long long>(elapsed));
             // This worker must not read the controller-owned HWND.
-            const HWND receiver = g_module.ReceiverForCallbacks();
+            const HWND receiver = GetCoreState().module.ReceiverForCallbacks();
             if (receiver)
                 PostMessageW(receiver, kBrightnessWheelResultMessage,
                     static_cast<WPARAM>(task.generation),
@@ -9543,7 +10251,7 @@ bool AwaitReady(Operation const& operation, DWORD timeoutMs = 1800) {
         if (state == wf::AsyncStatus::Completed) return true;
         if (state == wf::AsyncStatus::Error ||
             state == wf::AsyncStatus::Canceled) return false;
-        if (g_media.stop.load(std::memory_order_relaxed) ||
+        if (GetAudioState().media.stop.load(std::memory_order_relaxed) ||
             GetTickCount64() - start >= timeoutMs) return false;
         Sleep(15);
     }
@@ -9642,7 +10350,7 @@ void ReadTimeline(Session const& session, MediaSnapshot& snapshot) {
 
 void ReadArtwork(streams::IRandomAccessStreamReference const& thumbnail,
                  std::vector<BYTE>& output) {
-    if (!thumbnail || !g_config.showMediaArtwork.load(std::memory_order_relaxed))
+    if (!thumbnail || !GetSettingsState()->showMediaArtwork.load(std::memory_order_relaxed))
         return;
     auto open = thumbnail.OpenReadAsync();
     if (!AwaitReady(open)) return;
@@ -9698,7 +10406,7 @@ void FillSnapshot(Session const& session, MediaSnapshot const& previous,
         if (props) {
             snapshot.title = MediaText(props.Title());
             snapshot.artist = MediaText(props.Artist());
-            if (g_config.showMediaArtwork.load(std::memory_order_relaxed)) {
+            if (GetSettingsState()->showMediaArtwork.load(std::memory_order_relaxed)) {
                 if (snapshot.sourceId == previous.sourceId &&
                     snapshot.selectionSerial == previous.selectionSerial &&
                     snapshot.title == previous.title &&
@@ -9720,7 +10428,7 @@ void FillSnapshot(Session const& session, MediaSnapshot const& previous,
 } // namespace smtc_projection
 
 void RequestMedia(int command = 0, INT64 position = 0) {
-    g_media.Request(command, position);
+    GetAudioState().media.Request(command, position);
 }
 
 DWORD WINAPI MediaThreadProc(void*) {
@@ -9750,8 +10458,8 @@ DWORD WINAPI MediaThreadProc(void*) {
         uint32_t selectionSerial = 0;
         std::wstring selectedSource;
         size_t selectedOrdinal = 0;
-        while (WaitForSingleObject(g_media.wake, INFINITE) == WAIT_OBJECT_0) {
-            if (g_media.stop.load()) break;
+        while (WaitForSingleObject(GetAudioState().media.wake, INFINITE) == WAIT_OBJECT_0) {
+            if (GetAudioState().media.stop.load()) break;
             try {
                 std::vector<smtc_projection::Session> sessions;
                 // GetSessions is a passive enumeration; no GATT/network polling.
@@ -9802,7 +10510,7 @@ DWORD WINAPI MediaThreadProc(void*) {
                     }
                 }
                 if (index >= sessions.size() && !sessions.empty()) index = 0;
-                std::vector<MediaCommand> commands = g_media.TakeCommands();
+                std::vector<MediaCommand> commands = GetAudioState().media.TakeCommands();
                 smtc_projection::Session session{nullptr};
                 if (index < sessions.size()) session = sessions[index];
                 else if (current) session = current;
@@ -9841,7 +10549,7 @@ DWORD WINAPI MediaThreadProc(void*) {
                     }
                 }
                 lastSnapshot = snapshot;
-                g_media.Publish(std::move(snapshot));
+                GetAudioState().media.Publish(std::move(snapshot));
                 HWND receiver = FindWindowExW(HWND_MESSAGE, nullptr, kWindowClass, nullptr);
                 if (receiver) PostMessageW(receiver, kMediaUpdateMessage, 0, 0);
             } catch (winrt::hresult_error const& e) {
@@ -9894,34 +10602,52 @@ HICON ProcessIcon(DWORD pid) {
     return result.hIcon; // caller owns and must destroy
 }
 
+// The Windows System Sounds session has no conventional application icon.
+// EarTrumpet uses audiosrv.dll RT_GROUP_ICON resource 203 for this purpose.
+// A negative ExtractIconEx index selects a resource ID (not its ordinal).
+// The caller owns the resulting HICON and must destroy it after conversion.
+HICON SystemSoundsIcon() {
+    WCHAR systemDir[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(systemDir, ARRAYSIZE(systemDir));
+    if (!length || length >= ARRAYSIZE(systemDir)) return nullptr;
+    std::wstring path(systemDir, length);
+    path += L"\\audiosrv.dll";
+    HICON icon = nullptr;
+    if (ExtractIconExW(path.c_str(), -203, nullptr, &icon, 1) != 1) {
+        if (icon) DestroyIcon(icon);
+        return nullptr;
+    }
+    return icon;
+}
+
 void ResetXamlMediaController() {
-    if (!g_panel.mediaOpen) return;
-    g_panel.mediaOpen=false;
-    if (g_module.receiveWnd) KillTimer(g_module.receiveWnd,kMediaAnimationTimer);
-    ++g_panel.mediaGeneration;
-    if (!g_panel.mediaGeneration) ++g_panel.mediaGeneration;
+    if (!GetAudioState().panel.mediaOpen) return;
+    GetAudioState().panel.mediaOpen=false;
+    if (GetCoreState().module.receiveWnd) KillTimer(GetCoreState().module.receiveWnd,kMediaAnimationTimer);
+    ++GetAudioState().panel.mediaGeneration;
+    if (!GetAudioState().panel.mediaGeneration) ++GetAudioState().panel.mediaGeneration;
 }
 void ResetXamlMixerController() {
-    if (!g_panel.mixerOpen) return;
-    g_panel.mixerOpen = false;
-    g_panel.mixerOutputExpanded = false;
-    g_mixer.ClosePanelOnControllerThread();
-    ++g_panel.mixerGeneration; // Discard commands from the old Mixer Island.
-    if (!g_panel.mixerGeneration) ++g_panel.mixerGeneration;
+    if (!GetAudioState().panel.mixerOpen) return;
+    GetAudioState().panel.mixerOpen = false;
+    GetAudioState().panel.mixerOutputExpanded = false;
+    GetAudioState().mixer.ClosePanelOnControllerThread();
+    ++GetAudioState().panel.mixerGeneration; // Discard commands from the old Mixer Island.
+    if (!GetAudioState().panel.mixerGeneration) ++GetAudioState().panel.mixerGeneration;
 }
 
 void StartMixerOutputNotifications() {
-    if (g_mixer.notify || !g_module.receiveWnd) return;
+    if (GetAudioState().mixer.notify || !GetCoreState().module.receiveWnd) return;
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
         CLSCTX_INPROC_SERVER, IID_PPV_ARGS(enumerator.GetAddressOf()));
     if (FAILED(hr)) return;
-    auto* callback = new (std::nothrow) MixerOutputNotifications(g_module.receiveWnd);
+    auto* callback = new (std::nothrow) MixerOutputNotifications(GetCoreState().module.receiveWnd);
     if (!callback) return;
     hr = enumerator->RegisterEndpointNotificationCallback(callback);
     if (SUCCEEDED(hr)) {
-        g_mixer.notify.Attach(callback); // callback's construction reference
-        g_mixer.notifyEnumerator = std::move(enumerator);
+        GetAudioState().mixer.notify.Attach(callback); // callback's construction reference
+        GetAudioState().mixer.notifyEnumerator = std::move(enumerator);
     } else {
         callback->Stop();
         callback->Release();
@@ -9948,13 +10674,13 @@ std::wstring AudioOutputFriendlyName(IMMDevice* device) {
 }
 
 void ReadMixerOutputDevices(IMMDeviceEnumerator* enumerator) {
-    g_mixer.ClearOutputDevicesOnControllerThread();
+    GetAudioState().mixer.ClearOutputDevicesOnControllerThread();
     Microsoft::WRL::ComPtr<IMMDevice> current;
     if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia,
                                                     current.GetAddressOf()))) {
         LPWSTR id = nullptr;
         if (SUCCEEDED(current->GetId(&id)) && id) {
-            g_mixer.outputId.assign(id);
+            GetAudioState().mixer.outputId.assign(id);
             CoTaskMemFree(id);
         }
     }
@@ -9964,7 +10690,7 @@ void ReadMixerOutputDevices(IMMDeviceEnumerator* enumerator) {
         return;
     UINT count = 0;
     if (FAILED(collection->GetCount(&count))) return;
-    for (UINT i = 0; i < count && g_mixer.outputOptions.size() <
+    for (UINT i = 0; i < count && GetAudioState().mixer.outputOptions.size() <
             static_cast<size_t>(kMaxMixerOutputDevices); ++i) {
         Microsoft::WRL::ComPtr<IMMDevice> device;
         if (FAILED(collection->Item(i, device.GetAddressOf()))) continue;
@@ -9972,10 +10698,10 @@ void ReadMixerOutputDevices(IMMDeviceEnumerator* enumerator) {
         if (FAILED(device->GetId(&id)) || !id) continue;
         AudioOutputOption output{id, AudioOutputFriendlyName(device.Get())};
         CoTaskMemFree(id);
-        if (output.id == g_mixer.outputId)
-            g_mixer.outputOptions.insert(g_mixer.outputOptions.begin(), std::move(output));
+        if (output.id == GetAudioState().mixer.outputId)
+            GetAudioState().mixer.outputOptions.insert(GetAudioState().mixer.outputOptions.begin(), std::move(output));
         else
-            g_mixer.outputOptions.push_back(std::move(output));
+            GetAudioState().mixer.outputOptions.push_back(std::move(output));
     }
 }
 
@@ -9998,14 +10724,14 @@ HRESULT SetWindowsDefaultPlaybackEndpoint(const std::wstring& id,
 }
 
 void RefreshMixer() {
-    ++g_panel.mixerGeneration;
-    if (!g_panel.mixerGeneration) ++g_panel.mixerGeneration;
-    g_mixer.PrepareRefreshOnControllerThread();
+    ++GetAudioState().panel.mixerGeneration;
+    if (!GetAudioState().panel.mixerGeneration) ++GetAudioState().panel.mixerGeneration;
+    GetAudioState().mixer.PrepareRefreshOnControllerThread();
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
         CLSCTX_ALL, IID_PPV_ARGS(enumerator.GetAddressOf()));
     if (FAILED(hr) || !enumerator) {
-        g_mixer.ClearOutputDevicesOnControllerThread();
+        GetAudioState().mixer.ClearOutputDevicesOnControllerThread();
         return;
     }
     ReadMixerOutputDevices(enumerator.Get());
@@ -10013,12 +10739,12 @@ void RefreshMixer() {
     hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
     if (FAILED(hr) || !device) return;
     device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
-        nullptr, reinterpret_cast<void**>(g_mixer.master.GetAddressOf()));
-    if (g_mixer.master) {
-        g_mixer.master->GetMasterVolumeLevelScalar(&g_mixer.masterLevel);
+        nullptr, reinterpret_cast<void**>(GetAudioState().mixer.master.GetAddressOf()));
+    if (GetAudioState().mixer.master) {
+        GetAudioState().mixer.master->GetMasterVolumeLevelScalar(&GetAudioState().mixer.masterLevel);
         BOOL muted = FALSE;
-        if (SUCCEEDED(g_mixer.master->GetMute(&muted)))
-            g_mixer.masterMuted = muted != FALSE;
+        if (SUCCEEDED(GetAudioState().mixer.master->GetMute(&muted)))
+            GetAudioState().mixer.masterMuted = muted != FALSE;
     }
     IAudioSessionManager2* manager = nullptr;
     hr = device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
@@ -10057,8 +10783,23 @@ void RefreshMixer() {
         if (SUCCEEDED(control->QueryInterface(
                 __uuidof(IAudioSessionControl2),
                 reinterpret_cast<void**>(&info))) && info) {
+            LPWSTR instanceId = nullptr;
+            if (SUCCEEDED(info->GetSessionInstanceIdentifier(&instanceId)) &&
+                instanceId)
+                entry.sessionId.assign(instanceId);
+            if (instanceId) CoTaskMemFree(instanceId);
+            // System Sounds may supply an indirect MUI resource string as its
+            // display name. Prefer Core Audio's explicit session identity
+            // instead of showing the unresolved resource or guessing by PID.
+            // S_FALSE means a normal application session, not an API failure.
+            const bool systemSounds = info->IsSystemSoundsSession() == S_OK;
+            if (systemSounds) {
+                entry.title = Tr(OsdText::SystemSounds);
+                entry.appIcon = SystemSoundsIcon();
+                entry.iconPixels = MixerIconPixels(entry.appIcon);
+            }
             DWORD pid = 0;
-            if (SUCCEEDED(info->GetProcessId(&pid))) {
+            if (!systemSounds && SUCCEEDED(info->GetProcessId(&pid))) {
                 if (entry.title.empty()) entry.title = ProcessTitle(pid);
                 entry.appIcon = ProcessIcon(pid);
                 entry.iconPixels = MixerIconPixels(entry.appIcon);
@@ -10067,21 +10808,21 @@ void RefreshMixer() {
         }
         if (entry.title.empty()) entry.title = L"Application";
         control->Release();
-        g_mixer.entries.emplace_back(std::move(entry));
+        GetAudioState().mixer.entries.emplace_back(std::move(entry));
     }
     sessions->Release();
 }
 
 void SelectMixerOutput(int index) {
-    if (index < 0 || index >= static_cast<int>(g_mixer.outputOptions.size()))
+    if (index < 0 || index >= static_cast<int>(GetAudioState().mixer.outputOptions.size()))
         return;
-    const std::wstring target = g_mixer.outputOptions[index].id;
-    g_mixer.outputSwitchFailed = false;
-    if (target != g_mixer.outputId) {
+    const std::wstring target = GetAudioState().mixer.outputOptions[index].id;
+    GetAudioState().mixer.outputSwitchFailed = false;
+    if (target != GetAudioState().mixer.outputId) {
         const HRESULT hr = SetWindowsDefaultPlaybackEndpoint(target,
-                                                             g_mixer.outputId);
+                                                             GetAudioState().mixer.outputId);
         if (FAILED(hr)) {
-            g_mixer.outputSwitchFailed = true;
+            GetAudioState().mixer.outputSwitchFailed = true;
             Wh_Log(L"Mixer default output switch failed: 0x%08lX",
                    static_cast<unsigned long>(hr));
         } else {
@@ -10092,19 +10833,35 @@ void SelectMixerOutput(int index) {
     }
 }
 
+// Generation rejects commands from previous enumerations. This additional
+// POD fingerprint rejects mismatched session identities within a generation.
+// A missing ID falls back to the existing generation/index validation.
+bool MixerCommandMatchesCurrentRow(const osd_control::Command& cmd) {
+    if (cmd.index < 0 ||
+        cmd.index > static_cast<int>(GetAudioState().mixer.entries.size()))
+        return false;
+    if (!cmd.mixerSessionTag) return true;
+    if (cmd.index == 0)
+        return !GetAudioState().mixer.outputId.empty() &&
+            cmd.mixerSessionTag == osd_control::MixerIdentityTag(
+                L"@master:" + GetAudioState().mixer.outputId);
+    return cmd.mixerSessionTag == osd_control::MixerIdentityTag(
+        GetAudioState().mixer.entries[cmd.index - 1].sessionId);
+}
+
 // Shared Core Audio operation used by both view backends.
 bool SetMixerPercent(int index, int percent) {
-    if (index < 0 || index > static_cast<int>(g_mixer.entries.size()))
+    if (index < 0 || index > static_cast<int>(GetAudioState().mixer.entries.size()))
         return false;
     const float value = std::clamp(percent, 0, 100) / 100.0f;
     if (!index) {
-        if (!g_mixer.master || FAILED(
-            g_mixer.master->SetMasterVolumeLevelScalar(value, nullptr)))
+        if (!GetAudioState().mixer.master || FAILED(
+            GetAudioState().mixer.master->SetMasterVolumeLevelScalar(value, nullptr)))
             return false;
-        g_mixer.masterLevel = value;
+        GetAudioState().mixer.masterLevel = value;
         return true;
     }
-    auto& entry = g_mixer.entries[index - 1];
+    auto& entry = GetAudioState().mixer.entries[index - 1];
     if (!entry.volume || FAILED(entry.volume->SetMasterVolume(value, nullptr)))
         return false;
     entry.scalar = value;
@@ -10112,19 +10869,19 @@ bool SetMixerPercent(int index, int percent) {
 }
 
 void ToggleMixerMute(int index) {
-    if (index < 0 || index > static_cast<int>(g_mixer.entries.size())) return;
+    if (index < 0 || index > static_cast<int>(GetAudioState().mixer.entries.size())) return;
     if (index == 0) {
-        if (!g_mixer.master) return;
+        if (!GetAudioState().mixer.master) return;
         BOOL current = FALSE;
-        if (FAILED(g_mixer.master->GetMute(&current))) return;
+        if (FAILED(GetAudioState().mixer.master->GetMute(&current))) return;
         const BOOL requested = current ? FALSE : TRUE;
-        if (SUCCEEDED(g_mixer.master->SetMute(requested, nullptr))) {
+        if (SUCCEEDED(GetAudioState().mixer.master->SetMute(requested, nullptr))) {
             BOOL actual = requested;
-            g_mixer.master->GetMute(&actual);
-            g_mixer.masterMuted = actual != FALSE;
+            GetAudioState().mixer.master->GetMute(&actual);
+            GetAudioState().mixer.masterMuted = actual != FALSE;
         }
     } else {
-        auto& entry = g_mixer.entries[index - 1];
+        auto& entry = GetAudioState().mixer.entries[index - 1];
         if (!entry.volume) return;
         BOOL current = FALSE;
         if (FAILED(entry.volume->GetMute(&current))) return;
@@ -10147,27 +10904,27 @@ LRESULT CALLBACK LockKeyProc(int code, WPARAM wp, LPARAM lp) {
             if (event->vkCode != static_cast<DWORD>(kLockVk[i])) continue;
             bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
             bool up = wp == WM_KEYUP || wp == WM_SYSKEYUP;
-            if (down && !g_keys.pressed[i]) {
-                g_keys.pressed[i] = true;
-                g_keys.toggle[i] = !g_keys.toggle[i];
-                if (g_config.showLockKeys[i].load() && g_module.receiveWnd)
-                    PostMessageW(g_module.receiveWnd, kLockToggleMessage,
+            if (down && !GetNoticeState().keys.pressed[i]) {
+                GetNoticeState().keys.pressed[i] = true;
+                GetNoticeState().keys.toggle[i] = !GetNoticeState().keys.toggle[i];
+                if (GetSettingsState()->showLockKeys[i].load() && GetCoreState().module.receiveWnd)
+                    PostMessageW(GetCoreState().module.receiveWnd, kLockToggleMessage,
                                  static_cast<WPARAM>(i),
-                                 static_cast<LPARAM>(g_keys.toggle[i]));
-            } else if (up) g_keys.pressed[i] = false;
+                                 static_cast<LPARAM>(GetNoticeState().keys.toggle[i]));
+            } else if (up) GetNoticeState().keys.pressed[i] = false;
             break;
         }
     }
-    return CallNextHookEx(g_keys.hook, code, wp, lp);
+    return CallNextHookEx(GetNoticeState().keys.hook, code, wp, lp);
 }
 
 // XAML Island controls all pointer input; no detached hit HWND is needed.
 void ShowMigratedXamlLevel(PopupKind kind) {
     const bool brightness = kind == PopupKind::NativeBrightness;
-    if(!brightness&&g_config.showSmtcOnVolume.load()&&
-       g_media.current.available&&!g_panel.mixerOpen&&
+    if (!brightness&&GetSettingsState()->showSmtcOnVolume.load()&&
+       GetAudioState().media.current.available&&!GetAudioState().panel.mixerOpen&&
        ShowXamlMediaPanel()) return;
-    if(g_panel.mediaOpen) ResetXamlMediaController();
+    if (GetAudioState().panel.mediaOpen) ResetXamlMediaController();
     PrepareXamlCategory();
     RECT target{};
     if (!osd_placement::CurrentAnchor(target)) {
@@ -10175,10 +10932,10 @@ void ShowMigratedXamlLevel(PopupKind kind) {
                brightness ? L"brightness" : L"volume");
         return;
     }
-    auto snapshot = MakeXamlSnapshot(kind, target, g_panel.scale);
+    auto snapshot = MakeXamlSnapshot(kind, target, GetAudioState().panel.scale);
     if (!brightness && snapshot.mixerChevron) {
         RECT plannedMain{}, plannedPanel{};
-        if (BuildMixerPanelAnchors(plannedMain, plannedPanel, g_panel.scale))
+        if (BuildMixerPanelAnchors(plannedMain, plannedPanel, GetAudioState().panel.scale))
             snapshot.mixerDirection = osd_layout::MixerChevronDirection(
                 plannedMain, plannedPanel, snapshot.vertical, false);
     }
@@ -10211,11 +10968,11 @@ void ShowMigratedXamlLockStatus() {
     }
     auto snapshot = MakeXamlStatusSnapshot(
         xaml_osd::LevelKind::LockStatus, target, DurationKind::LockKeys);
-    snapshot.statusTitle = kLockDisplayNames[std::clamp(g_keys.last, 0, 3)];
-    snapshot.statusGlyph = kLockGlyphs[std::clamp(g_keys.last, 0, 3)];
-    snapshot.statusDetail = g_keys.lastValue
+    snapshot.statusTitle = kLockDisplayNames[std::clamp(GetNoticeState().keys.last, 0, 3)];
+    snapshot.statusGlyph = kLockGlyphs[std::clamp(GetNoticeState().keys.last, 0, 3)];
+    snapshot.statusDetail = GetNoticeState().keys.lastValue
         ? Tr(OsdText::On) : Tr(OsdText::Off);
-    snapshot.statusActive = g_keys.lastValue;
+    snapshot.statusActive = GetNoticeState().keys.lastValue;
     if (!ShowXamlMirrored(snapshot))
         Wh_Log(L"Fluent OSD/XAML: lock status unavailable; NO GDI+ fallback");
 }
@@ -10234,40 +10991,32 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
     auto snapshot = MakeXamlStatusSnapshot(
         xaml_osd::LevelKind::NoticeStatus, target, duration, true);
     snapshot.vertical = false; // Status notices are horizontal regardless of level settings.
-    snapshot.statusTitle = g_notice.title;
-    snapshot.statusDetail = g_notice.body;
-    snapshot.noticeDetails = g_notice.details;
+    snapshot.statusTitle = GetNoticeState().notice.title;
+    snapshot.statusDetail = GetNoticeState().notice.body;
+    snapshot.noticeDetails = GetNoticeState().notice.details;
     snapshot.noticeDetailsHeading = Tr(OsdText::EventDetails);
     snapshot.noticeInteractiveDurationMs = OsdDuration(DurationKind::Interactive);
-    snapshot.noticeGeneration = g_notice.generation;
-    switch (g_notice.icon) {
-        case NoticeIcon::Bluetooth: snapshot.statusGlyph = L"\uE702"; break;
-        case NoticeIcon::Usb:       snapshot.statusGlyph = L"\uE88E"; break;
-        case NoticeIcon::Network:   snapshot.statusGlyph = L"\uE968"; break;
-        case NoticeIcon::Wifi:      snapshot.statusGlyph = L"\uE701"; break;
-        case NoticeIcon::Keyboard:  snapshot.statusGlyph = L"\uE92E"; break;
-        case NoticeIcon::Mouse:     snapshot.statusGlyph = L"\uE962"; break;
-        case NoticeIcon::Headset:   snapshot.statusGlyph = L"\uE95B"; break;
-        case NoticeIcon::Speaker:   snapshot.statusGlyph = L"\uE995"; break;
-        default: return;
-    }
+    snapshot.noticeGeneration = GetNoticeState().notice.generation;
+    const PCWSTR glyph = osd_glyph::ForNotice(GetNoticeState().notice.icon);
+    if (!glyph) return; // Unknown category: do not invent an icon.
+    snapshot.statusGlyph = glyph;
     RECT detailsRect{};
     bool canPlace = false;
-    if (g_notice.details.size() > 1) {
+    if (GetNoticeState().notice.details.size() > 1) {
         MONITORINFO monitor{sizeof(monitor)};
         if (GetMonitorInfoW(MonitorFromRect(
                 &target, MONITOR_DEFAULTTONEAREST), &monitor)) {
             const int width = target.right - target.left;
             const int height = target.bottom - target.top;
             const int preferredHeight = std::max(84, static_cast<int>(std::lround(
-                (48.0 + std::min<size_t>(6, g_notice.details.size()) *
+                (48.0 + std::min<size_t>(6, GetNoticeState().notice.details.size()) *
                  std::max(26.0, snapshot.fontSize * 1.8)) *
                 std::max(0.5f, snapshot.scale))));
             const int panelHeight = std::clamp(preferredHeight, 64,
                 std::max(64, static_cast<int>(
                     monitor.rcWork.bottom - monitor.rcWork.top - 16)));
             const FlyoutDirection direction = DirectionForPopup(
-                target, monitor.rcWork, g_config.position.load(), false);
+                target, monitor.rcWork, GetSettingsState()->position.load(), false);
             const auto offset = GetPanelAttachment(
                 false, direction, snapshot.scale,
                 width, height, width, panelHeight);
@@ -10277,16 +11026,16 @@ void ShowMigratedXamlDeviceNotice(DurationKind duration) {
                 target.top + offset.y, panelHeight, monitor.rcWork, false);
             detailsRect = RECT{x, y, x + width, y + panelHeight};
             snapshot.noticeDirection = osd_layout::MixerChevronDirection(
-                target, detailsRect, false, g_notice.panelOpen);
+                target, detailsRect, false, GetNoticeState().notice.panelOpen);
             canPlace = true;
         }
     }
-    if (g_notice.panelOpen && canPlace) {
+    if (GetNoticeState().notice.panelOpen && canPlace) {
         auto details = MakeXamlStatusSnapshot(
             xaml_osd::LevelKind::NoticeDetails, detailsRect,
             DurationKind::Interactive, false);
         details.vertical = false;
-        details.noticeDetails = g_notice.details;
+        details.noticeDetails = GetNoticeState().notice.details;
         details.noticeDetailsHeading = Tr(OsdText::EventDetails);
         if (!ShowXamlMirroredBatch({snapshot, details}))
             Wh_Log(L"Fluent OSD/XAML: notice-details pair unavailable");
@@ -10309,7 +11058,10 @@ void ShowMigratedXamlNativeEvent() {
         xaml_osd::LevelKind::NativeEvent, target,
         DurationKind::NativeEvents, true);
 
-    const NativeEventInfo& event = g_presentation.nativeEventCurrent;
+    const NativeEventInfo& event = GetCoreState().presentation.nativeEventCurrent;
+    const PCWSTR glyph = osd_glyph::ForNative(event.kind);
+    if (!glyph) return;
+    snapshot.statusGlyph = glyph;
     switch (event.kind) {
         case Kind::Keyboard:
             snapshot.statusTitle = Tr(OsdText::KeyboardBacklight);
@@ -10317,13 +11069,11 @@ void ShowMigratedXamlNativeEvent() {
                 ? std::to_wstring(event.value) + L"%"
                 : std::wstring(Tr(OsdText::Level)) +
                   std::to_wstring(event.value);
-            snapshot.statusGlyph = L"\uE765"; // KeyboardClassic
             break;
         case Kind::Airplane:
             snapshot.statusTitle = Tr(OsdText::AirplaneMode);
             snapshot.statusDetail = event.value
                 ? Tr(OsdText::Enabled) : Tr(OsdText::Disabled);
-            snapshot.statusGlyph = L"\uE709"; // Airplane
             break;
         case Kind::Camera: {
             const bool access = event.variant == 1;
@@ -10332,7 +11082,6 @@ void ShowMigratedXamlNativeEvent() {
             snapshot.statusDetail = access
                 ? (event.value ? Tr(OsdText::Allowed) : Tr(OsdText::Blocked))
                 : (event.value ? Tr(OsdText::Enabled) : Tr(OsdText::Disabled));
-            snapshot.statusGlyph = L"\uE722"; // Camera (not Video E714)
             break;
         }
         case Kind::Microphone:
@@ -10341,19 +11090,16 @@ void ShowMigratedXamlNativeEvent() {
             snapshot.statusDetail = event.value == 0 ? Tr(OsdText::Unmuted)
                 : event.value == 1 ? Tr(OsdText::Muted)
                 : Tr(OsdText::StatusChanged);
-            snapshot.statusGlyph = L"\uE720"; // Microphone
             break;
         case Kind::Desktop:
             snapshot.statusTitle = Tr(OsdText::VirtualDesktop);
             snapshot.statusDetail = event.text.empty()
                 ? Tr(OsdText::DesktopSwitched) : event.text;
-            snapshot.statusGlyph = L"\uE7C4"; // TaskView
             break;
         case Kind::Text:
             snapshot.statusTitle = Tr(OsdText::SystemNotice);
             snapshot.statusDetail = event.text.empty()
                 ? Tr(OsdText::StatusChanged) : event.text;
-            snapshot.statusGlyph = L"\uE7C3"; // Page
             break;
         default:
             // Do not turn unknown payload kinds into invented status UI.
@@ -10414,14 +11160,11 @@ void ShowMigratedXamlClipboardNotice() {
     auto snapshot = MakeXamlStatusSnapshot(
         xaml_osd::LevelKind::NoticeStatus, target,
         DurationKind::Clipboard, true);
-    snapshot.statusTitle = g_notice.title;
-    snapshot.statusDetail = g_notice.body;
-    // TextBulletListSquare and KnowledgeArticle (Segoe Fluent Icons).
-    snapshot.statusGlyph = g_notice.icon == NoticeIcon::ClipboardFile
-        ? L"\uF000" : g_notice.icon == NoticeIcon::ClipboardText
-        ? L"\uE9A4" : L"\uE8C8";
+    snapshot.statusTitle = GetNoticeState().notice.title;
+    snapshot.statusDetail = GetNoticeState().notice.body;
+    snapshot.statusGlyph = osd_glyph::ForNotice(GetNoticeState().notice.icon);
     const bool image = CopyClipboardThumbnailPixels(
-        g_notice.clipboardThumbnail, snapshot);
+        GetNoticeState().notice.clipboardThumbnail, snapshot);
     if (image)
         snapshot.kind = xaml_osd::LevelKind::ClipboardImage;
     // XAML owns pixel bytes now. Release the transient GDI thumbnail
@@ -10433,7 +11176,7 @@ void ShowMigratedXamlClipboardNotice() {
         BrightnessEvent empty{};
         MovePopupToDisplay(empty);
         if (!osd_placement::CurrentAnchor(snapshot.anchor)) return;
-        snapshot.scale = g_panel.scale;
+        snapshot.scale = GetAudioState().panel.scale;
     }
     if (!ShowXamlMirrored(snapshot))
         Wh_Log(L"Fluent OSD/XAML: clipboard notice unavailable; NO GDI+ fallback");
@@ -10490,22 +11233,25 @@ osd_model::MixerModel BuildMixerModel() {
     model.title = Tr(OsdText::VolumeMixer);
     model.outputHeading = Tr(OsdText::AudioOutput);
     model.outputError = Tr(OsdText::AudioSwitchFailed);
-    model.generation = g_panel.mixerGeneration;
-    model.outputExpanded = g_panel.mixerOutputExpanded;
-    model.outputFailed = g_mixer.outputSwitchFailed;
-    model.maxVisibleRows = std::clamp(g_config.mixerMaxRows.load(), 3, 16);
+    model.generation = GetAudioState().panel.mixerGeneration;
+    model.outputExpanded = GetAudioState().panel.mixerOutputExpanded;
+    model.outputFailed = GetAudioState().mixer.outputSwitchFailed;
+    model.maxVisibleRows = std::clamp(GetSettingsState()->mixerMaxRows.load(), 3, 16);
     model.selectedOutput = Tr(OsdText::NoAudioOutputs);
-    for (const auto& item : g_mixer.outputOptions) {
-        const bool selected = item.id == g_mixer.outputId;
-        model.outputs.push_back({item.name, selected});
+    for (const auto& item : GetAudioState().mixer.outputOptions) {
+        const bool selected = item.id == GetAudioState().mixer.outputId;
+        model.outputs.push_back({item.name, selected, item.id});
         if (selected) model.selectedOutput = item.name;
     }
     model.rows.push_back({
         Tr(OsdText::MasterVolume),
         std::clamp(static_cast<int>(
-            std::lround(g_mixer.masterLevel * 100.0f)), 0, 100),
-        g_mixer.masterMuted, static_cast<bool>(g_mixer.master)});
-    for (const auto& item : g_mixer.entries) {
+            std::lround(GetAudioState().mixer.masterLevel * 100.0f)), 0, 100),
+        GetAudioState().mixer.masterMuted, static_cast<bool>(GetAudioState().mixer.master)});
+    // Master volume is tied to its output endpoint, not an app session.
+    if (!GetAudioState().mixer.outputId.empty())
+        model.rows.back().sessionId = L"@master:" + GetAudioState().mixer.outputId;
+    for (const auto& item : GetAudioState().mixer.entries) {
         if (model.rows.size() >= 129) break;
         osd_model::MixerRow row;
         row.title = item.title;
@@ -10514,6 +11260,7 @@ osd_model::MixerModel BuildMixerModel() {
         row.muted = item.muted;
         row.enabled = item.volume.Get() != nullptr;
         row.iconPixels = item.iconPixels;
+        row.sessionId = item.sessionId;
         model.rows.push_back(std::move(row));
     }
     return model;
@@ -10521,35 +11268,35 @@ osd_model::MixerModel BuildMixerModel() {
 
 osd_model::MediaModel BuildXamlMediaModel() {
     osd_model::MediaModel m;
-    m.generation=g_panel.mediaGeneration;
-    m.sessionCount=g_media.current.sessionCount;
-    m.selectionSerial=g_media.current.selectionSerial;
-    m.sourceId=g_media.current.sourceId;
-    m.title=g_media.current.title.empty()?
-        Tr(OsdText::MediaPlayback):g_media.current.title;
-    m.artist=g_media.current.artist;
-    if (g_config.showMediaArtwork.load())
-        m.encodedArtwork.assign(g_media.current.artwork.begin(),
-                                g_media.current.artwork.end());
-    m.playing=g_media.current.playing;
-    m.canPrevious=g_media.current.canPrevious;
-    m.canToggle=g_media.current.canToggle;
-    m.canNext=g_media.current.canNext;
-    m.canShuffle=g_media.current.canShuffle;
-    m.shuffleKnown=g_media.current.shuffleKnown;
-    m.shuffleActive=g_media.current.shuffleActive;
-    m.canRepeat=g_media.current.canRepeat;
-    m.repeatMode=g_media.current.repeatMode;
-    m.hasTimeline=g_media.current.hasTimeline;
-    m.canSeek=g_media.current.canSeek;
-    m.start=g_media.current.timelineStart;
-    m.end=g_media.current.timelineEnd;
-    m.position=g_media.current.timelinePosition;
-    m.observedTick=g_media.current.timelineObservedTick;
-    m.controlSizePercent=g_config.mediaControlSizePercent.load();
-    m.squareButtons=g_config.controlButtonSquare.load();
-    m.buttonCornerRadius=g_config.controlButtonCornerRadius.load();
-    if(!g_config.showMediaControls.load()) {
+    m.generation=GetAudioState().panel.mediaGeneration;
+    m.sessionCount=GetAudioState().media.current.sessionCount;
+    m.selectionSerial=GetAudioState().media.current.selectionSerial;
+    m.sourceId=GetAudioState().media.current.sourceId;
+    m.title=GetAudioState().media.current.title.empty()?
+        Tr(OsdText::MediaPlayback):GetAudioState().media.current.title;
+    m.artist=GetAudioState().media.current.artist;
+    if (GetSettingsState()->showMediaArtwork.load())
+        m.encodedArtwork.assign(GetAudioState().media.current.artwork.begin(),
+                                GetAudioState().media.current.artwork.end());
+    m.playing=GetAudioState().media.current.playing;
+    m.canPrevious=GetAudioState().media.current.canPrevious;
+    m.canToggle=GetAudioState().media.current.canToggle;
+    m.canNext=GetAudioState().media.current.canNext;
+    m.canShuffle=GetAudioState().media.current.canShuffle;
+    m.shuffleKnown=GetAudioState().media.current.shuffleKnown;
+    m.shuffleActive=GetAudioState().media.current.shuffleActive;
+    m.canRepeat=GetAudioState().media.current.canRepeat;
+    m.repeatMode=GetAudioState().media.current.repeatMode;
+    m.hasTimeline=GetAudioState().media.current.hasTimeline;
+    m.canSeek=GetAudioState().media.current.canSeek;
+    m.start=GetAudioState().media.current.timelineStart;
+    m.end=GetAudioState().media.current.timelineEnd;
+    m.position=GetAudioState().media.current.timelinePosition;
+    m.observedTick=GetAudioState().media.current.timelineObservedTick;
+    m.controlSizePercent=GetSettingsState()->mediaControlSizePercent.load();
+    m.squareButtons=GetSettingsState()->controlButtonSquare.load();
+    m.buttonCornerRadius=GetSettingsState()->controlButtonCornerRadius.load();
+    if (!GetSettingsState()->showMediaControls.load()) {
         m.canPrevious=m.canToggle=m.canNext=false;
         m.canShuffle=m.canRepeat=false;
     }
@@ -10562,15 +11309,15 @@ bool BuildAttachedPanelAnchors(
     MONITORINFO mi{sizeof(mi)};
     if (!GetMonitorInfoW(MonitorFromRect(&main,
             MONITOR_DEFAULTTONEAREST), &mi)) return false;
-    const bool vertical = g_config.verticalVolumeBrightness.load();
+    const bool vertical = GetSettingsState()->verticalVolumeBrightness.load();
     const int mw = main.right - main.left, mh = main.bottom - main.top;
     const int pw = vertical ? static_cast<int>(std::lround(
-        (isMedia?g_config.verticalSmtcWidth.load():
-                 g_config.verticalMixerWidth.load())*scale)) : mw;
+        (isMedia?GetSettingsState()->verticalSmtcWidth.load():
+                 GetSettingsState()->verticalMixerWidth.load())*scale)) : mw;
     const int ph = vertical ? mh : static_cast<int>(std::lround(
-        (isMedia?g_config.horizontalSmtcHeight.load():
-                 g_config.horizontalMixerHeight.load())*scale));
-    const int position = g_config.position.load();
+        (isMedia?GetSettingsState()->horizontalSmtcHeight.load():
+                 GetSettingsState()->horizontalMixerHeight.load())*scale));
+    const int position = GetSettingsState()->position.load();
     const auto direction = DirectionForPopup(main, mi.rcWork,
                                              position, vertical);
     auto attachment = GetPanelAttachment(vertical, direction, scale,
@@ -10608,61 +11355,66 @@ bool BuildAttachedPanelAnchors(
     return true;
 }
 
-bool BuildMixerPanelAnchors(RECT& main,RECT& panel,float scale) {
-    return BuildAttachedPanelAnchors(main,panel,scale,false);
+bool BuildMixerPanelAnchors(RECT& main, RECT& panel, float scale) {
+    return BuildAttachedPanelAnchors(main, panel, scale, false);
 }
-bool BuildMediaPanelAnchors(RECT& main,RECT& panel,float scale) {
-    return BuildAttachedPanelAnchors(main,panel,scale,true);
+bool BuildMediaPanelAnchors(RECT& main, RECT& panel, float scale) {
+    return BuildAttachedPanelAnchors(main, panel, scale, true);
 }
 bool ShowXamlMediaPanel(bool passiveRefresh) {
-    if(g_panel.mixerOpen||!g_config.showSmtcOnVolume.load()||
-       !g_media.current.available) return false;
-    RECT main{},panel{};
-    if(!BuildMediaPanelAnchors(main,panel,g_panel.scale)) return false;
+    if (GetAudioState().panel.mixerOpen ||
+        !GetSettingsState()->showSmtcOnVolume.load() ||
+        !GetAudioState().media.current.available)
+        return false;
+    RECT main{}, panel{};
+    if (!BuildMediaPanelAnchors(main, panel, GetAudioState().panel.scale))
+        return false;
     PrepareXamlCategory();
-    auto volume=MakeXamlSnapshot(PopupKind::NativeVolume,main,g_panel.scale);
-    volume.durationMs=OsdDuration(DurationKind::Media);
-    volume.passiveRefresh=passiveRefresh;
-    if(volume.mixerChevron) {
-        RECT pairedMain{},pairedPanel{};
-        if(BuildMixerPanelAnchors(pairedMain,pairedPanel,g_panel.scale))
-            volume.mixerDirection=osd_layout::MixerChevronDirection(
-                pairedMain,pairedPanel,volume.vertical,false);
+    auto volume = MakeXamlSnapshot(
+        PopupKind::NativeVolume, main, GetAudioState().panel.scale);
+    volume.durationMs = OsdDuration(DurationKind::Media);
+    volume.passiveRefresh = passiveRefresh;
+    if (volume.mixerChevron) {
+        RECT pairedMain{}, pairedPanel{};
+        if (BuildMixerPanelAnchors(pairedMain, pairedPanel, GetAudioState().panel.scale))
+            volume.mixerDirection = osd_layout::MixerChevronDirection(
+                pairedMain, pairedPanel, volume.vertical, false);
     }
-    auto media=MakeXamlSnapshot(PopupKind::NativeVolume,panel,g_panel.scale);
-    media.kind=osd_model::Kind::Media;
-    media.mixerChevron=false;
-    media.durationMs=OsdDuration(DurationKind::Media);
-    media.passiveRefresh=passiveRefresh;
-    media.media=BuildXamlMediaModel();
-    if(!ShowXamlMirroredBatch({volume,media})) {
+    auto media = MakeXamlSnapshot(
+        PopupKind::NativeVolume, panel, GetAudioState().panel.scale);
+    media.kind = osd_model::Kind::Media;
+    media.mixerChevron = false;
+    media.durationMs = OsdDuration(DurationKind::Media);
+    media.passiveRefresh = passiveRefresh;
+    media.media = BuildXamlMediaModel();
+    if (!ShowXamlMirroredBatch({volume, media})) {
         Wh_Log(L"XAML SMTC: panel unavailable");
         ResetXamlMediaController();
         return false;
     }
-    g_panel.mediaOpen=true;
-    if(g_module.receiveWnd)
-        SetTimer(g_module.receiveWnd,kMediaAnimationTimer,
-                 kMediaAnimationIntervalMs,nullptr);
+    GetAudioState().panel.mediaOpen = true;
+    if (GetCoreState().module.receiveWnd)
+        SetTimer(GetCoreState().module.receiveWnd, kMediaAnimationTimer,
+                 kMediaAnimationIntervalMs, nullptr);
     return true;
 }
 void ShowXamlMixerPanel() {
-    if (!g_panel.mixerOpen) return;
+    if (!GetAudioState().panel.mixerOpen) return;
     RECT main{}, panel{};
-    if (!BuildMixerPanelAnchors(main, panel, g_panel.scale)) {
+    if (!BuildMixerPanelAnchors(main, panel, GetAudioState().panel.scale)) {
         Wh_Log(L"XAML Mixer: missing calculated placement");
         ResetXamlMixerController();
         return;
     }
     PrepareXamlCategory();
     auto volume = MakeXamlSnapshot(
-        PopupKind::NativeVolume, main, g_panel.scale);
-    volume.mixerChevron = g_config.showMixerArrow.load();
+        PopupKind::NativeVolume, main, GetAudioState().panel.scale);
+    volume.mixerChevron = GetSettingsState()->showMixerArrow.load();
     volume.mixerDirection = osd_layout::MixerChevronDirection(
         main, panel, volume.vertical, true);
     volume.durationMs = OsdDuration(DurationKind::Interactive);
     auto mixer = MakeXamlSnapshot(
-        PopupKind::NativeVolume, panel, g_panel.scale);
+        PopupKind::NativeVolume, panel, GetAudioState().panel.scale);
     mixer.kind = osd_model::Kind::Mixer;
     mixer.anchor = panel;
     mixer.durationMs = OsdDuration(DurationKind::Interactive);
@@ -10677,82 +11429,96 @@ void ShowXamlMixerPanel() {
 void ShowNativeVolumePopup() {
     BrightnessEvent event{};
     MovePopupToDisplay(event);
-    if (g_config.showSmtcOnVolume.load() && !g_panel.mixerOpen) RequestMedia();
-    if (g_panel.mixerOpen) ShowXamlMixerPanel();
+    if (GetSettingsState()->showSmtcOnVolume.load() && !GetAudioState().panel.mixerOpen) RequestMedia();
+    if (GetAudioState().panel.mixerOpen) ShowXamlMixerPanel();
     else ShowMigratedXamlLevel(PopupKind::NativeVolume);
 }
 
 // Imperative control boundary: returns refresh intents instead of drawing.
 // Every hardware target keeps its existing identity and async write behavior.
 struct ControlEffects {
-    bool volume = false, nativeBrightness = false, ddc = false;
+    bool volume = false, nativeBrightness = false;
     bool mixer = false, notice = false;
+    std::vector<BrightnessEvent> changedDdcTargets;
+    void RecordDdc(const BrightnessEvent& event) {
+        auto existing = std::find_if(changedDdcTargets.begin(),
+            changedDdcTargets.end(), [&](const BrightnessEvent& prev) {
+                return prev.physicalIndex == event.physicalIndex &&
+                    _wcsicmp(prev.device, event.device) == 0;
+            });
+        if (existing != changedDdcTargets.end()) *existing = event;
+        else if (changedDdcTargets.size() < kMaxDdcTargets)
+            changedDdcTargets.push_back(event);
+    }
 };
 ControlEffects ApplyOsdCommands(
         const std::vector<osd_control::Command>& commands) {
     ControlEffects effects;
-    if (g_module.closing.load()) return effects;
+    if (GetCoreState().module.closing.load()) return effects;
     for (const auto& cmd : commands) {
         if (cmd.target == osd_control::Target::Notice) {
             if (cmd.action == osd_control::Action::ToggleNoticeDetails &&
-                g_presentation.popupKind == PopupKind::Notification &&
-                g_notice.icon != NoticeIcon::Clipboard &&
-                g_notice.icon != NoticeIcon::ClipboardFile &&
-                g_notice.icon != NoticeIcon::ClipboardText &&
-                g_notice.details.size() > 1 &&
-                cmd.generation == g_notice.generation) {
-                g_notice.panelOpen = !g_notice.panelOpen;
+                GetCoreState().presentation.popupKind == PopupKind::Notification &&
+                GetNoticeState().notice.icon != NoticeIcon::Clipboard &&
+                GetNoticeState().notice.icon != NoticeIcon::ClipboardFile &&
+                GetNoticeState().notice.icon != NoticeIcon::ClipboardText &&
+                GetNoticeState().notice.details.size() > 1 &&
+                cmd.generation == GetNoticeState().notice.generation) {
+                GetNoticeState().notice.panelOpen = !GetNoticeState().notice.panelOpen;
                 effects.notice = true;
             }
             continue;
         }
-        if(cmd.target==osd_control::Target::Media) {
-            if(!g_panel.mediaOpen||
-               cmd.generation!=g_panel.mediaGeneration) continue;
-            if(cmd.action==osd_control::Action::CloseMedia) {
+        if (cmd.target==osd_control::Target::Media) {
+            if (!GetAudioState().panel.mediaOpen||
+               cmd.generation!=GetAudioState().panel.mediaGeneration) continue;
+            if (cmd.action==osd_control::Action::CloseMedia) {
                 ResetXamlMediaController();
                 continue;
             }
-            if(cmd.index!=static_cast<int>(
-                    g_media.current.selectionSerial)) continue;
-            if(cmd.action==osd_control::Action::MediaAction) {
-                if(cmd.value>=1&&cmd.value<=7&&cmd.value!=4)
+            if (cmd.index!=static_cast<int>(
+                    GetAudioState().media.current.selectionSerial)) continue;
+            if (cmd.action==osd_control::Action::MediaAction) {
+                if (cmd.value>=1&&cmd.value<=7&&cmd.value!=4)
                     RequestMedia(cmd.value);
-            } else if(cmd.action==osd_control::Action::MediaSeek&&
-                      g_media.current.canSeek&&g_media.current.hasTimeline&&
-                      g_media.current.timelineEnd>g_media.current.timelineStart) {
+            } else if (cmd.action==osd_control::Action::MediaSeek&&
+                      GetAudioState().media.current.canSeek&&GetAudioState().media.current.hasTimeline&&
+                      GetAudioState().media.current.timelineEnd>GetAudioState().media.current.timelineStart) {
                 RequestMedia(4,std::clamp(cmd.mediaPosition,
-                    g_media.current.timelineStart,
-                    g_media.current.timelineEnd));
+                    GetAudioState().media.current.timelineStart,
+                    GetAudioState().media.current.timelineEnd));
             }
             continue;
         }
         if (cmd.target == osd_control::Target::Mixer) {
             if (cmd.action == osd_control::Action::OpenMixer) {
-                if (g_panel.mixerOpen) {
+                if (GetAudioState().panel.mixerOpen) {
                     ResetXamlMixerController();
-                } else if (g_config.showMixerArrow.load() &&
-                           g_presentation.popupKind == PopupKind::NativeVolume) {
+                } else if (GetSettingsState()->showMixerArrow.load() &&
+                           GetCoreState().presentation.popupKind == PopupKind::NativeVolume) {
                     ResetXamlMediaController();
                     
-                    g_panel.mixerOutputExpanded = false;
+                    GetAudioState().panel.mixerOutputExpanded = false;
                     RefreshMixer();
                     StartMixerOutputNotifications();
-                    g_panel.mixerOpen = true;
+                    GetAudioState().panel.mixerOpen = true;
                 }
                 effects.mixer = true;
                 continue;
             }
             if (cmd.action == osd_control::Action::CloseMixer) {
-                if (g_panel.mixerOpen &&
-                    cmd.generation == g_panel.mixerGeneration) {
+                if (GetAudioState().panel.mixerOpen &&
+                    cmd.generation == GetAudioState().panel.mixerGeneration) {
                     ResetXamlMixerController();
                     effects.mixer = true;
                 }
                 continue;
             }
-            if (!g_panel.mixerOpen ||
-                cmd.generation != g_panel.mixerGeneration) continue;
+            if (!GetAudioState().panel.mixerOpen ||
+                cmd.generation != GetAudioState().panel.mixerGeneration) continue;
+            if ((cmd.action == osd_control::Action::MixerSetPercent ||
+                 cmd.action == osd_control::Action::MixerToggleMute) &&
+                !MixerCommandMatchesCurrentRow(cmd)) continue;
             switch (cmd.action) {
                 case osd_control::Action::MixerSetPercent:
                     (void)SetMixerPercent(cmd.index, cmd.value);
@@ -10763,21 +11529,21 @@ ControlEffects ApplyOsdCommands(
                     effects.mixer = true;
                     break;
                 case osd_control::Action::MixerToggleOutput:
-                    if (!g_panel.mixerOutputExpanded) {
+                    if (!GetAudioState().panel.mixerOutputExpanded) {
                         RefreshMixer(); // Reconcile current endpoints.
-                        g_panel.mixerOutputExpanded =
-                            !g_mixer.outputOptions.empty();
+                        GetAudioState().panel.mixerOutputExpanded =
+                            !GetAudioState().mixer.outputOptions.empty();
                     } else {
-                        g_panel.mixerOutputExpanded = false;
+                        GetAudioState().panel.mixerOutputExpanded = false;
                     }
                     effects.mixer = true;
                     break;
                 case osd_control::Action::MixerSelectOutput:
                     if (cmd.index >= 0 &&
                         cmd.index < static_cast<int>(
-                            g_mixer.outputOptions.size())) {
+                            GetAudioState().mixer.outputOptions.size())) {
                         SelectMixerOutput(cmd.index);
-                        g_panel.mixerOutputExpanded = false;
+                        GetAudioState().panel.mixerOutputExpanded = false;
                         effects.mixer = true;
                     }
                     break;
@@ -10786,7 +11552,7 @@ ControlEffects ApplyOsdCommands(
             continue;
         }
         if (cmd.target == osd_control::Target::Volume) {
-            if (g_presentation.popupKind != PopupKind::NativeVolume) continue;
+            if (GetCoreState().presentation.popupKind != PopupKind::NativeVolume) continue;
             bool ok = false;
             if (cmd.action == osd_control::Action::ToggleMute)
                 ok = ToggleDefaultAudioMute();
@@ -10797,39 +11563,39 @@ ControlEffects ApplyOsdCommands(
             if (ok) effects.volume = true;
             continue;
         }
-        if (!g_writer.ReadyForCommands()) continue;
+        if (!GetBrightnessState().writer.ReadyForCommands()) continue;
 
         if (cmd.target == osd_control::Target::NativeBrightness) {
-            if (g_presentation.popupKind != PopupKind::NativeBrightness ||
-                !g_presentation.nativePercentKnown) continue;
+            if (GetCoreState().presentation.popupKind != PopupKind::NativeBrightness ||
+                !GetCoreState().presentation.nativePercentKnown) continue;
             if (cmd.action == osd_control::Action::ToggleMute) continue;
             const int requested = cmd.action == osd_control::Action::Wheel
-                ? g_presentation.nativePercent + (cmd.value / WHEEL_DELTA) * kWheelStepPercent
+                ? GetCoreState().presentation.nativePercent + (cmd.value / WHEEL_DELTA) * kWheelStepPercent
                 : cmd.value;
             const int percent = std::clamp(requested, 0, 100);
-            if (percent == g_presentation.nativePercent) continue;
+            if (percent == GetCoreState().presentation.nativePercent) continue;
             BrightnessWheelTask task{};
             task.native = true;
             task.value = percent;
-            task.generation = ++g_writer.generation;
-            if (g_ddc.lastConfirmedNative < 0)
-                g_ddc.lastConfirmedNative = g_presentation.nativePercent;
-            g_presentation.nativePercent = percent;
+            task.generation = ++GetBrightnessState().writer.generation;
+            if (GetBrightnessState().ddc.lastConfirmedNative < 0)
+                GetBrightnessState().ddc.lastConfirmedNative = GetCoreState().presentation.nativePercent;
+            GetCoreState().presentation.nativePercent = percent;
             QueueBrightnessWheelTask(task);
             effects.nativeBrightness = true;
             continue;
         }
 
         if (cmd.target != osd_control::Target::DdcBrightness ||
-            g_presentation.popupKind != PopupKind::DdcBrightness ||
+            GetCoreState().presentation.popupKind != PopupKind::DdcBrightness ||
             cmd.action == osd_control::Action::ToggleMute) continue;
         const auto selected = std::find_if(
-            g_ddc.targets.begin(), g_ddc.targets.end(),
+            GetBrightnessState().ddc.targets.begin(), GetBrightnessState().ddc.targets.end(),
             [&](const DdcTargetState& target) {
                 return target.event.physicalIndex == cmd.physicalIndex &&
                     _wcsicmp(target.event.device, cmd.device) == 0;
             });
-        if (selected == g_ddc.targets.end()) continue;
+        if (selected == GetBrightnessState().ddc.targets.end()) continue;
         auto& event = selected->event;
         if (event.maximum <= event.minimum) continue; // Unknown range.
         // Keep the actively edited physical target in the XAML batch.
@@ -10849,14 +11615,14 @@ ControlEffects ApplyOsdCommands(
         BrightnessWheelTask task{};
         task.monitor = event;  // Exact display + physical index.
         task.value = static_cast<int>(raw);
-        task.generation = ++g_writer.generation;
-        g_ddc.RememberPendingWriteOnControllerThread(event, task.generation);
+        task.generation = ++GetBrightnessState().writer.generation;
+        GetBrightnessState().ddc.RememberPendingWriteOnControllerThread(event, task.generation);
         event.value = raw;
-        if (g_presentation.visible.physicalIndex == event.physicalIndex &&
-            _wcsicmp(g_presentation.visible.device, event.device) == 0)
-            g_presentation.visible.value = raw;
+        if (GetCoreState().presentation.visible.physicalIndex == event.physicalIndex &&
+            _wcsicmp(GetCoreState().presentation.visible.device, event.device) == 0)
+            GetCoreState().presentation.visible.value = raw;
         QueueBrightnessWheelTask(task);
-        effects.ddc = true;
+        effects.RecordDdc(event);
     }
     return effects;
 }
@@ -10887,29 +11653,25 @@ bool IsShellInputSiteReady() {
 }
 
 void TryStartXamlAfterShellInputSite(HWND receiver) {
-    if (!receiver || g_module.closing.load(std::memory_order_acquire) ||
-        g_module.shellXamlStarted || !IsShellInputSiteReady()) return;
-    g_module.shellXamlStarted = true;
+    if (!receiver || GetCoreState().module.closing.load(std::memory_order_acquire) ||
+        GetCoreState().module.shellXamlStarted || !IsShellInputSiteReady()) return;
+    GetCoreState().module.shellXamlStarted = true;
     Wh_Log(L"Fluent OSD: Shell InputSite hierarchy ready; starting XAML");
-    xaml_osd::Start();
+    xaml_osd::Start(receiver);
 }
 
 // Same creation export observed by upstream Taskbar Volume Control and
 // Taskbar Scroll Actions. Run the original first. Only notify the controller
 // asynchronously, never initialize XAML within the Shell creation stack.
-using CreateWindowInBand_t =
-    HWND (WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD,
-                   int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID, DWORD);
-CreateWindowInBand_t g_createWindowInBandOriginal = nullptr;
 
 HWND WINAPI ShellCreateWindowInBandHook(
         DWORD exStyle, LPCWSTR className, LPCWSTR title, DWORD style,
         int x, int y, int width, int height, HWND parent, HMENU menu,
         HINSTANCE instance, LPVOID param, DWORD band) {
-    HWND created = g_createWindowInBandOriginal(
+    HWND created = GetCoreState().module.createWindowInBandOriginal(
         exStyle, className, title, style, x, y, width, height,
         parent, menu, instance, param, band);
-    if (!created || g_module.closing.load(std::memory_order_acquire))
+    if (!created || GetCoreState().module.closing.load(std::memory_order_acquire))
         return created;
     // lpClassName may contain a 16-bit ATOM. Do not dereference an ATOM.
     if ((reinterpret_cast<ULONG_PTR>(className) &
@@ -10920,7 +11682,7 @@ HWND WINAPI ShellCreateWindowInBandHook(
     // If the controller does not yet exist, its one-time snapshot after
     // window creation covers this early event. The receiver is published
     // atomically for callbacks, not read from controller-thread state.
-    const HWND receiver = g_module.ReceiverForCallbacks();
+    const HWND receiver = GetCoreState().module.ReceiverForCallbacks();
     if (receiver)
         (void)PostMessageW(receiver, kShellInputSiteReadyMessage, 0, 0);
     return created;
@@ -10940,153 +11702,215 @@ void HookShellInputSiteCreation() {
         return;
     }
     WindhawkUtils::SetFunctionHook(
-        target, ShellCreateWindowInBandHook, &g_createWindowInBandOriginal);
+        target, ShellCreateWindowInBandHook,
+        &GetCoreState().module.createWindowInBandOriginal);
     Wh_Log(L"Fluent OSD: InputSite creation hook configured");
 }
 
+// The native notification is independent of XAML. A temporary tray icon
+// remains discoverable for manual retry if the balloon disappears.
+NOTIFYICONDATAW XamlFailureTrayData(HWND hwnd) {
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = kXamlFailureTrayId;
+    return nid;
+}
+void ClearXamlFailureNotice(HWND hwnd) {
+    if (!GetCoreState().module.xamlFailureTrayVisible || !hwnd) return;
+    auto nid = XamlFailureTrayData(hwnd);
+    (void)Shell_NotifyIconW(NIM_DELETE, &nid);
+    GetCoreState().module.xamlFailureTrayVisible = false;
+}
+void ShowXamlFailureNotice(HWND hwnd) {
+    if (!hwnd || GetCoreState().module.closing.load() || !xaml_osd::IsFailed())
+        return;
+    auto nid = XamlFailureTrayData(hwnd);
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO;
+    nid.uCallbackMessage = kXamlFailureTrayCallback;
+    nid.hIcon = LoadIconW(nullptr, IDI_WARNING); // Shared system icon.
+    wcscpy_s(nid.szTip, Tr(OsdText::XamlRendererFailed));
+    wcscpy_s(nid.szInfoTitle, L"Fluent OSD");
+    wcscpy_s(nid.szInfo, Tr(OsdText::XamlRetryHint));
+    nid.dwInfoFlags = NIIF_WARNING;
+    const bool existing = GetCoreState().module.xamlFailureTrayVisible;
+    if (!Shell_NotifyIconW(existing ? NIM_MODIFY : NIM_ADD, &nid)) {
+        Wh_Log(L"Fluent OSD/XAML: native failure notification unavailable (%lu)",
+               GetLastError());
+        return;
+    }
+    if (!existing) {
+        GetCoreState().module.xamlFailureTrayVisible = true;
+        nid.uVersion = NOTIFYICON_VERSION_4;
+        (void)Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    }
+}
 LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (hwnd == g_module.receiveWnd && msg == kShellInputSiteReadyMessage) {
+    if (hwnd == GetCoreState().module.receiveWnd &&
+        msg == xaml_osd::kRendererFailedMessage) {
+        ShowXamlFailureNotice(hwnd);
+        return 0;
+    }
+    if (hwnd == GetCoreState().module.receiveWnd &&
+        msg == xaml_osd::kRendererReadyMessage) {
+        if (xaml_osd::IsReady()) ClearXamlFailureNotice(hwnd);
+        return 0;
+    }
+    if (hwnd == GetCoreState().module.receiveWnd &&
+        msg == kXamlFailureTrayCallback) {
+        const UINT event = LOWORD(static_cast<DWORD>(lp));
+        if (GetCoreState().module.xamlFailureTrayVisible &&
+            !GetCoreState().module.closing.load() &&
+            (event == NIN_BALLOONUSERCLICK ||
+             event == NIN_SELECT || event == NIN_KEYSELECT))
+            (void)xaml_osd::Restart(hwnd);
+        return 0;
+    }
+    if (hwnd == GetCoreState().module.receiveWnd && msg == kShellInputSiteReadyMessage) {
         TryStartXamlAfterShellInputSite(hwnd);
         return 0;
     }
-    if (hwnd == g_module.receiveWnd && msg == osd_control::kMessage) {
+    if (hwnd == GetCoreState().module.receiveWnd && msg == osd_control::kMessage) {
         const auto commands = osd_control::Drain();
         // Event routing owns the active-backend policy; hardware execution
         // does not read an XAML feature flag or depend on renderer types.
         {
             const auto effects = ApplyOsdCommands(commands);
             if (effects.mixer ||
-                (effects.volume && g_panel.mixerOpen)) {
-                if (g_panel.mixerOpen) ShowXamlMixerPanel();
+                (effects.volume && GetAudioState().panel.mixerOpen)) {
+                if (GetAudioState().panel.mixerOpen) ShowXamlMixerPanel();
                 else ShowMigratedXamlLevel(PopupKind::NativeVolume);
             } else if (effects.volume) {
                 ShowMigratedXamlLevel(PopupKind::NativeVolume);
             }
             if (effects.nativeBrightness)
                 ShowMigratedXamlLevel(PopupKind::NativeBrightness);
-            if (effects.ddc)
-                (void)ShowXamlDdcTargets(g_presentation.visible);
+            if (!effects.changedDdcTargets.empty())
+                (void)ShowXamlDdcTargets(
+                    effects.changedDdcTargets.back(), &effects.changedDdcTargets);
             if (effects.notice)
-                ShowMigratedXamlDeviceNotice(g_notice.duration);
+                ShowMigratedXamlDeviceNotice(GetNoticeState().notice.duration);
         }
         return 0;
     }
-    if (hwnd == g_module.receiveWnd && msg == WM_TIMER && wp == kEventBatchTimer) {
+    if (hwnd == GetCoreState().module.receiveWnd && msg == WM_TIMER && wp == kEventBatchTimer) {
         FlushNoticeBatch();
         return 0;
     }
-    if (hwnd == g_module.receiveWnd && msg == WM_TIMER && wp == kDdcBatchTimer) {
+    if (hwnd == GetCoreState().module.receiveWnd && msg == WM_TIMER && wp == kDdcBatchTimer) {
         KillTimer(hwnd, kDdcBatchTimer);
         DisplayDdcBatch();
         return 0;
     }
-    if (hwnd == g_module.receiveWnd && msg == WM_TIMER &&
+    if (hwnd == GetCoreState().module.receiveWnd && msg == WM_TIMER &&
         wp == kMediaAnimationTimer) {
-        if (!g_panel.mediaOpen || !xaml_osd::IsPrimaryVisible()) {
+        if (!GetAudioState().panel.mediaOpen || !xaml_osd::IsPrimaryVisible()) {
             KillTimer(hwnd, kMediaAnimationTimer);
             return 0;
         }
         const uint64_t now = GetTickCount64();
-        if (now - g_media.lastRefreshTick >= kMediaRefreshIntervalMs) {
-            g_media.lastRefreshTick = now;
+        if (now - GetAudioState().media.lastRefreshTick >= kMediaRefreshIntervalMs) {
+            GetAudioState().media.lastRefreshTick = now;
             RequestMedia();
         }
         return 0;
     }
-    if (hwnd == g_module.receiveWnd && msg == WM_CLIPBOARDUPDATE) {
+    if (hwnd == GetCoreState().module.receiveWnd && msg == WM_CLIPBOARDUPDATE) {
         ProcessClipboard();
         return 0;
     }
-    if (hwnd == g_module.receiveWnd && msg == WM_DEVICECHANGE) {
+    if (hwnd == GetCoreState().module.receiveWnd && msg == WM_DEVICECHANGE) {
         if (HandleDeviceChange(wp, lp)) return TRUE;
     }
-    if (hwnd == g_module.receiveWnd && msg == kBluetoothQueueMessage) {
+    if (hwnd == GetCoreState().module.receiveWnd && msg == kBluetoothQueueMessage) {
         bt_monitor::Drain();
         return 0;
     }
-    if (hwnd == g_module.receiveWnd && msg == kBluetoothConfigMessage) {
-        if (g_config.showBluetoothEvents.load()) bt_monitor::Start();
+    if (hwnd == GetCoreState().module.receiveWnd && msg == kBluetoothConfigMessage) {
+        if (GetSettingsState()->showBluetoothEvents.load()) bt_monitor::Start();
         else bt_monitor::Stop();
         return 0;
     }
-    if (hwnd == g_module.receiveWnd && msg == kNetworkNoticeMessage) {
-        if (!g_config.showNetworkEvents.load()) return 0;
-        if (!g_network.refreshPending) {
-            g_network.ResetRefresh();
-            g_network.refreshPending = true;
+    if (hwnd == GetCoreState().module.receiveWnd && msg == kNetworkNoticeMessage) {
+        if (!GetSettingsState()->showNetworkEvents.load()) return 0;
+        if (!GetConnectivityState().network.refreshPending) {
+            GetConnectivityState().network.ResetRefresh();
+            GetConnectivityState().network.refreshPending = true;
         }
         if (wp == 1) {
-            g_network.hintPending = true;
-            g_network.hintLevel = static_cast<int>(lp);
+            GetConnectivityState().network.hintPending = true;
+            GetConnectivityState().network.hintLevel = static_cast<int>(lp);
         }
-        g_network.refreshSecondPass = false;
+        GetConnectivityState().network.refreshSecondPass = false;
         if (!SetTimer(hwnd, kNetworkRefreshTimer, kNetworkDebounceMs, nullptr)) {
             Wh_Log(L"Fluent OSD/network: debounce timer unavailable (%lu)",
                    GetLastError());
-            g_network.sawInterfaceTransition |= CaptureNetworkEvents();
+            GetConnectivityState().network.sawInterfaceTransition |= CaptureNetworkEvents();
             FinishNetworkRefresh();
         }
         return 0;
     }
-    if (hwnd == g_module.receiveWnd && msg == WM_TIMER &&
+    if (hwnd == GetCoreState().module.receiveWnd && msg == WM_TIMER &&
         wp == kNetworkRefreshTimer) {
         KillTimer(hwnd, kNetworkRefreshTimer);
-        if (!g_config.showNetworkEvents.load()) {
-            g_network.ResetRefresh();
+        if (!GetSettingsState()->showNetworkEvents.load()) {
+            GetConnectivityState().network.ResetRefresh();
             return 0;
         }
-        g_network.sawInterfaceTransition |= CaptureNetworkEvents();
-        if (!g_network.refreshSecondPass) {
-            g_network.refreshSecondPass = true;
+        GetConnectivityState().network.sawInterfaceTransition |= CaptureNetworkEvents();
+        if (!GetConnectivityState().network.refreshSecondPass) {
+            GetConnectivityState().network.refreshSecondPass = true;
             if (SetTimer(hwnd, kNetworkRefreshTimer, kNetworkSettleMs, nullptr))
                 return 0;
         }
         FinishNetworkRefresh();
         return 0;
     }
-    if (hwnd == g_module.receiveWnd && msg == kNetworkConfigMessage) {
-        const bool enabled = g_config.showNetworkEvents.load();
-        if (enabled && !g_network.uiSettingEnabled) {
-            CaptureNetworkBaseline();
-            RefreshNetworkHintBaseline();
-        }
+    if (hwnd == GetCoreState().module.receiveWnd && msg == kNetworkConfigMessage) {
+        const bool enabled = GetSettingsState()->showNetworkEvents.load();
+        if (enabled && !GetConnectivityState().network.uiSettingEnabled)
+            InitNetworkEvents();
         if (!enabled) {
             KillTimer(hwnd, kNetworkRefreshTimer);
-            g_network.ResetRefresh();
+            GetConnectivityState().network.ResetRefresh();
+            if (GetConnectivityState().network.uiSettingEnabled) {
+                if (GetConnectivityState().network.CancelCallbacksOnControllerThread())
+                    GetConnectivityState().network.ReleaseLibraryOnControllerThread();
+            }
         }
-        g_network.uiSettingEnabled = enabled;
+        GetConnectivityState().network.uiSettingEnabled = enabled;
         return 0;
     }
-    if (msg == kNativeExtraMessage && hwnd == g_module.receiveWnd) {
-        NativeEventInfo received = g_nativeMailbox.Take();
+    if (msg == kNativeExtraMessage && hwnd == GetCoreState().module.receiveWnd) {
+        NativeEventInfo received = GetNativeEventState().mailbox.Take();
         if (!ShowCustomNative(received.kind)) return 0;
         
-        g_presentation.nativeEventCurrent = std::move(received);
-        g_presentation.popupKind = PopupKind::NativeEvent;
+        GetCoreState().presentation.nativeEventCurrent = std::move(received);
+        GetCoreState().presentation.popupKind = PopupKind::NativeEvent;
         BrightnessEvent ev{};
         MovePopupToDisplay(ev);
         ShowMigratedXamlNativeEvent();
         return 0;
     }
-    if (msg == kNativeOsdMessage && hwnd == g_module.receiveWnd) {
+    if (msg == kNativeOsdMessage && hwnd == GetCoreState().module.receiveWnd) {
         const Kind kind = static_cast<Kind>(wp);
         if (kind != Kind::Volume && kind != Kind::Brightness)
             return 0;
         if (!ShowCustomNative(kind)) return 0;
-        g_presentation.popupKind = kind == Kind::Volume ?
+        GetCoreState().presentation.popupKind = kind == Kind::Volume ?
             PopupKind::NativeVolume : PopupKind::NativeBrightness;
-        g_presentation.nativePercent = static_cast<int>(lp);
+        GetCoreState().presentation.nativePercent = static_cast<int>(lp);
         if (kind == Kind::Brightness)
-            g_ddc.lastConfirmedNative = g_presentation.nativePercent;
-        g_presentation.nativePercentKnown = g_presentation.nativePercent >= 0 && g_presentation.nativePercent <= 100;
-        g_presentation.nativeMuted = false;
+            GetBrightnessState().ddc.lastConfirmedNative = GetCoreState().presentation.nativePercent;
+        GetCoreState().presentation.nativePercentKnown = GetCoreState().presentation.nativePercent >= 0 && GetCoreState().presentation.nativePercent <= 100;
+        GetCoreState().presentation.nativeMuted = false;
         if (kind == Kind::Volume) {
             int actual = 0;
             bool mute = false;
             if (ReadDefaultAudioVolume(actual, mute)) {
-                g_presentation.nativePercent = actual;
-                g_presentation.nativePercentKnown = true;
-                g_presentation.nativeMuted = mute;
+                GetCoreState().presentation.nativePercent = actual;
+                GetCoreState().presentation.nativePercentKnown = true;
+                GetCoreState().presentation.nativeMuted = mute;
             }
             ShowNativeVolumePopup();
         } else {
@@ -11096,19 +11920,19 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    if (msg == kAudioRefreshMessage && hwnd == g_module.receiveWnd) {
-        if (g_mixer.notify) g_mixer.notify->ClearPending();
-        if (g_panel.mixerOpen && !g_module.closing.load()) {
+    if (msg == kAudioRefreshMessage && hwnd == GetCoreState().module.receiveWnd) {
+        if (GetAudioState().mixer.notify) GetAudioState().mixer.notify->ClearPending();
+        if (GetAudioState().panel.mixerOpen && !GetCoreState().module.closing.load()) {
             RefreshMixer();
             ShowXamlMixerPanel();
         }
         return 0;
     }
-    if (msg == kMediaUpdateMessage && hwnd == g_module.receiveWnd) {
-        g_media.ConsumeOnControllerThread();
-        if (g_presentation.popupKind == PopupKind::NativeVolume &&
-            !g_panel.mixerOpen && xaml_osd::IsPrimaryVisible()) {
-            if(g_media.current.available&&g_config.showSmtcOnVolume.load())
+    if (msg == kMediaUpdateMessage && hwnd == GetCoreState().module.receiveWnd) {
+        GetAudioState().media.ConsumeOnControllerThread();
+        if (GetCoreState().presentation.popupKind == PopupKind::NativeVolume &&
+            !GetAudioState().panel.mixerOpen && xaml_osd::IsPrimaryVisible()) {
+            if (GetAudioState().media.current.available&&GetSettingsState()->showSmtcOnVolume.load())
                 (void)ShowXamlMediaPanel(true);
             else {
                 ResetXamlMediaController();
@@ -11117,63 +11941,64 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    if (msg == kLockToggleMessage && hwnd == g_module.receiveWnd) {
+    if (msg == kLockToggleMessage && hwnd == GetCoreState().module.receiveWnd) {
         int index = static_cast<int>(wp);
-        if (index < 0 || index >= 4 || !g_config.showLockKeys[index].load()) return 0;
+        if (index < 0 || index >= 4 || !GetSettingsState()->showLockKeys[index].load()) return 0;
         
-        g_keys.last = index;
-        g_keys.lastValue = lp != 0;
-        g_presentation.popupKind = PopupKind::LockStatus;
+        GetNoticeState().keys.last = index;
+        GetNoticeState().keys.lastValue = lp != 0;
+        GetCoreState().presentation.popupKind = PopupKind::LockStatus;
         BrightnessEvent ev{};
         MovePopupToDisplay(ev);
         ShowMigratedXamlLockStatus();
         return 0;
     }
-    if (msg == kBrightnessWheelResultMessage && hwnd == g_module.receiveWnd) {
+    if (msg == kBrightnessWheelResultMessage && hwnd == GetCoreState().module.receiveWnd) {
         const DWORD generation = static_cast<DWORD>(wp);
         const bool success = (lp & 1) != 0;
         const bool native = (lp & 2) != 0;
         if (!native) {
             DdcRuntimeState::PendingWrite write{};
-            if (!g_ddc.TakePendingWriteOnControllerThread(generation, write))
+            if (!GetBrightnessState().ddc.TakePendingWriteOnControllerThread(generation, write))
                 return 0; // Superseded DDC write: never roll back its target.
             const auto target = std::find_if(
-                g_ddc.targets.begin(), g_ddc.targets.end(),
+                GetBrightnessState().ddc.targets.begin(), GetBrightnessState().ddc.targets.end(),
                 [&](const DdcTargetState& item) {
                     return item.event.physicalIndex ==
                             write.event.physicalIndex &&
                         _wcsicmp(item.event.device,
                                 write.event.device) == 0;
                 });
-            const bool master = g_presentation.visible.physicalIndex ==
+            const bool master = GetCoreState().presentation.visible.physicalIndex ==
                     write.event.physicalIndex &&
-                _wcsicmp(g_presentation.visible.device, write.event.device) == 0;
+                _wcsicmp(GetCoreState().presentation.visible.device, write.event.device) == 0;
             if (!success) {
-                if (target != g_ddc.targets.end())
+                if (target != GetBrightnessState().ddc.targets.end())
                     target->event.value = write.previousValue;
-                if (master) g_presentation.visible.value = write.previousValue;
+                if (master) GetCoreState().presentation.visible.value = write.previousValue;
                 Wh_Log(L"Fluent OSD/XAML: DDC write failed for '%s' index %lu",
                     write.event.device, write.event.physicalIndex);
-                if (g_presentation.popupKind == PopupKind::DdcBrightness)
-                    (void)ShowXamlDdcTargets(g_presentation.visible);
-            } else if (master && target != g_ddc.targets.end()) {
-                g_ddc.lastConfirmedDdc = target->event.value;
+                if (GetCoreState().presentation.popupKind == PopupKind::DdcBrightness &&
+                    target != GetBrightnessState().ddc.targets.end())
+                    (void)ShowXamlDdcTargets(target->event);
+            } else if (master && target != GetBrightnessState().ddc.targets.end()) {
+                GetBrightnessState().ddc.lastConfirmedDdc = target->event.value;
             }
             return 0;
         }
-        if (generation != g_writer.generation) return 0;
+        if (generation != GetBrightnessState().writer.generation) return 0;
         if (native) {
-            if (success) g_ddc.lastConfirmedNative = g_presentation.nativePercent;
-            else if (g_ddc.lastConfirmedNative >= 0) {
-                g_presentation.nativePercent = g_ddc.lastConfirmedNative;
-                if (g_presentation.popupKind == PopupKind::NativeBrightness)
+            if (success) GetBrightnessState().ddc.lastConfirmedNative = GetCoreState().presentation.nativePercent;
+            else if (GetBrightnessState().ddc.lastConfirmedNative >= 0) {
+                GetCoreState().presentation.nativePercent = GetBrightnessState().ddc.lastConfirmedNative;
+                if (GetCoreState().presentation.popupKind == PopupKind::NativeBrightness)
                     ShowMigratedXamlLevel(PopupKind::NativeBrightness);
                 Wh_Log(L"Native brightness wheel write failed; restored value");
             }
         }
         return 0;
     }
-    if (msg == WM_COPYDATA && hwnd == g_module.receiveWnd) {
+    if (msg == WM_COPYDATA && hwnd == GetCoreState().module.receiveWnd) {
         auto* cds = reinterpret_cast<const COPYDATASTRUCT*>(lp);
         if (!cds || cds->dwData != kCopyDataTag ||
             cds->cbData != sizeof(BrightnessEvent) || !cds->lpData)
@@ -11185,7 +12010,7 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (WCHAR ch : ev.device) {
             if (!ch) { terminator = true; break; }
         }
-        if (!terminator || g_module.closing.load()) return FALSE;
+        if (!terminator || GetCoreState().module.closing.load()) return FALSE;
         // DDC/CI VCP values are 16-bit. Reject malformed cross-process
         // notices before their values can influence slider geometry.
         if (ev.physicalIndex >= 32 ||
@@ -11196,11 +12021,11 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                   ev.value < ev.minimum || ev.value > ev.maximum)))
             return FALSE;
         // producerPid is descriptive metadata, not sender authentication.
-        if (!g_config.showDdcBrightness.load()) return TRUE;
+        if (!GetSettingsState()->showDdcBrightness.load()) return TRUE;
         // Coalesce by GDI display + physical index, retaining last-write order.
-        const bool firstInBatch = g_ddc.AccumulateOnControllerThread(ev);
+        const bool firstInBatch = GetBrightnessState().ddc.AccumulateOnControllerThread(ev);
         if (firstInBatch &&
-            !SetTimer(g_module.receiveWnd, kDdcBatchTimer, kDdcBatchDelayMs, nullptr))
+            !SetTimer(GetCoreState().module.receiveWnd, kDdcBatchTimer, kDdcBatchDelayMs, nullptr))
             DisplayDdcBatch(); // Timer allocation failure must not lose updates.
         return TRUE;
     }
@@ -11225,60 +12050,61 @@ DWORD WINAPI UiThreadProc(void*) {
     if (!RegisterClassExW(&wc)) {
         Wh_Log(L"OSD message receiver registration failed (%lu)",
                GetLastError());
-        if (g_module.uiReady) SetEvent(g_module.uiReady);
+        if (GetCoreState().module.uiReady) SetEvent(GetCoreState().module.uiReady);
         ReleaseWindowsAccentProvider();
         if (initialized) CoUninitialize();
         return 0;
     }
-    g_module.receiveWnd = CreateWindowExW(0, kWindowClass, L"", 0,
+    GetCoreState().module.receiveWnd = CreateWindowExW(0, kWindowClass, L"", 0,
         0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
-    if (g_module.receiveWnd) {
-        g_module.PublishReceiver(g_module.receiveWnd);
-        g_module.clipboardListener =
-            AddClipboardFormatListener(g_module.receiveWnd) != FALSE;
+    if (GetCoreState().module.receiveWnd) {
+        GetCoreState().module.PublishReceiver(GetCoreState().module.receiveWnd);
+        GetCoreState().module.clipboardListener =
+            AddClipboardFormatListener(GetCoreState().module.receiveWnd) != FALSE;
         InitDeviceEvents();
         InitNetworkEvents();
     } else {
         Wh_Log(L"OSD message receiver creation failed (%lu)", GetLastError());
     }
     for (int i = 0; i < 4; ++i)
-        g_keys.toggle[i] = (GetKeyState(kLockVk[i]) & 1) != 0;
+        GetNoticeState().keys.toggle[i] = (GetKeyState(kLockVk[i]) & 1) != 0;
     HMODULE module = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         reinterpret_cast<PCWSTR>(reinterpret_cast<void*>(LockKeyProc)),
         &module);
-    g_keys.hook = SetWindowsHookExW(WH_KEYBOARD_LL, LockKeyProc, module, 0);
-    if (!g_keys.hook)
+    GetNoticeState().keys.hook = SetWindowsHookExW(WH_KEYBOARD_LL, LockKeyProc, module, 0);
+    if (!GetNoticeState().keys.hook)
         Wh_Log(L"Lock-key keyboard hook unavailable (%lu)", GetLastError());
     // Single check handles late injection; creation hook handles new InputSites.
-    if (g_module.receiveWnd) TryStartXamlAfterShellInputSite(g_module.receiveWnd);
-    if (g_module.uiReady) SetEvent(g_module.uiReady);
+    if (GetCoreState().module.receiveWnd) TryStartXamlAfterShellInputSite(GetCoreState().module.receiveWnd);
+    if (GetCoreState().module.uiReady) SetEvent(GetCoreState().module.uiReady);
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    g_module.BeginShutdown();
-    if (g_keys.hook) { UnhookWindowsHookEx(g_keys.hook); g_keys.hook = nullptr; }
-    if (g_module.clipboardListener && g_module.receiveWnd)
-        RemoveClipboardFormatListener(g_module.receiveWnd);
-    g_module.clipboardListener = false;
-    if (g_module.receiveWnd) {
-        KillTimer(g_module.receiveWnd, kEventBatchTimer);
-        KillTimer(g_module.receiveWnd, kDdcBatchTimer);
-        KillTimer(g_module.receiveWnd, kMediaAnimationTimer);
-        KillTimer(g_module.receiveWnd, kNetworkRefreshTimer);
+    GetCoreState().module.BeginShutdown();
+    if (GetNoticeState().keys.hook) { UnhookWindowsHookEx(GetNoticeState().keys.hook); GetNoticeState().keys.hook = nullptr; }
+    if (GetCoreState().module.clipboardListener && GetCoreState().module.receiveWnd)
+        RemoveClipboardFormatListener(GetCoreState().module.receiveWnd);
+    GetCoreState().module.clipboardListener = false;
+    if (GetCoreState().module.receiveWnd) {
+        ClearXamlFailureNotice(GetCoreState().module.receiveWnd);
+        KillTimer(GetCoreState().module.receiveWnd, kEventBatchTimer);
+        KillTimer(GetCoreState().module.receiveWnd, kDdcBatchTimer);
+        KillTimer(GetCoreState().module.receiveWnd, kMediaAnimationTimer);
+        KillTimer(GetCoreState().module.receiveWnd, kNetworkRefreshTimer);
     }
-    g_ddc.ClearPendingOnControllerThread();
-    g_notice.ResetBatch();
-    g_notice.usbNames.clear();
-    g_network.ResetRefresh();
-    g_network.interfaces.clear();
+    GetBrightnessState().ddc.ClearPendingOnControllerThread();
+    GetNoticeState().notice.ResetBatch();
+    GetNoticeState().notice.usbNames.clear();
+    GetConnectivityState().network.ResetRefresh();
+    GetConnectivityState().network.interfaces.clear();
     StopDeviceEvents();
     ClearClipboardThumbnail();
-    g_mixer.ReleaseStorageOnControllerThread();
-    if (g_module.receiveWnd) DestroyWindow(g_module.receiveWnd);
-    g_module.receiveWnd = nullptr;
+    GetAudioState().mixer.ReleaseStorageOnControllerThread();
+    if (GetCoreState().module.receiveWnd) DestroyWindow(GetCoreState().module.receiveWnd);
+    GetCoreState().module.receiveWnd = nullptr;
     UnregisterClassW(kWindowClass, wc.hInstance);
     ReleaseWindowsAccentProvider();
     if (initialized) CoUninitialize();
@@ -11295,11 +12121,11 @@ BOOL Wh_ModInit() {
     if (!GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe))) return FALSE;
     PCWSTR name = wcsrchr(exe, L'\\');
     name = name ? name + 1 : exe;
-    g_module.isExplorer = _wcsicmp(name, L"explorer.exe") == 0;
+    GetCoreState().module.isExplorer = _wcsicmp(name, L"explorer.exe") == 0;
     const bool isTwinkle = _wcsicmp(name, L"Twinkle Tray.exe") == 0;
-    if (!g_module.isExplorer && !isTwinkle) return FALSE;
+    if (!GetCoreState().module.isExplorer && !isTwinkle) return FALSE;
     LoadSettings();
-    if (g_module.isExplorer) {
+    if (GetCoreState().module.isExplorer) {
         HookNativeOsd();
         HookShellInputSiteCreation();
     }
@@ -11309,39 +12135,39 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModAfterInit() {
-    if (!g_module.isExplorer) return;
-    g_module.uiReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_module.uiReady) {
+    if (!GetCoreState().module.isExplorer) return;
+    GetCoreState().module.uiReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!GetCoreState().module.uiReady) {
         Wh_Log(L"Cannot create UI ready event: %lu", GetLastError());
         return;
     }
-    g_module.uiThread = CreateThread(nullptr, 0, UiThreadProc, nullptr, 0,
-                              &g_module.uiThreadId);
-    if (!g_module.uiThread) {
+    GetCoreState().module.uiThread = CreateThread(nullptr, 0, UiThreadProc, nullptr, 0,
+                              &GetCoreState().module.uiThreadId);
+    if (!GetCoreState().module.uiThread) {
         Wh_Log(L"Cannot start OSD UI thread: %lu", GetLastError());
-        CloseHandle(g_module.uiReady);
-        g_module.uiReady = nullptr;
+        CloseHandle(GetCoreState().module.uiReady);
+        GetCoreState().module.uiReady = nullptr;
         return;
     }
-    if (WaitForSingleObject(g_module.uiReady, 1500) != WAIT_OBJECT_0)
+    if (WaitForSingleObject(GetCoreState().module.uiReady, 1500) != WAIT_OBJECT_0)
         Wh_Log(L"OSD UI initialization did not signal readiness");
-    g_writer.stop.store(false);
+    GetBrightnessState().writer.stop.store(false);
     const HANDLE writerWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    g_writer.PublishWake(writerWake);
+    GetBrightnessState().writer.PublishWake(writerWake);
     if (writerWake) {
-        g_writer.thread = CreateThread(nullptr, 0,
+        GetBrightnessState().writer.thread = CreateThread(nullptr, 0,
             BrightnessWheelThreadProc, nullptr, 0, nullptr);
-        if (!g_writer.thread)
-            g_writer.CloseWakeAfterWorkerStops();
+        if (!GetBrightnessState().writer.thread)
+            GetBrightnessState().writer.CloseWakeAfterWorkerStops();
     }
-    g_media.stop.store(false);
+    GetAudioState().media.stop.store(false);
     const HANDLE mediaWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    g_media.PublishWake(mediaWake);
+    GetAudioState().media.PublishWake(mediaWake);
     if (mediaWake) {
-        g_media.thread = CreateThread(nullptr, 0, MediaThreadProc, nullptr,
+        GetAudioState().media.thread = CreateThread(nullptr, 0, MediaThreadProc, nullptr,
                                     0, nullptr);
-        if (!g_media.thread)
-            g_media.CloseWakeAfterWorkerStops();
+        if (!GetAudioState().media.thread)
+            GetAudioState().media.CloseWakeAfterWorkerStops();
     }
     // XAML starts from the input event or one-time controller snapshot,
     // never directly during Windhawk's AfterInit callback.
@@ -11351,12 +12177,12 @@ void Wh_ModSettingsChanged() {
     LoadSettings();
     // Settings may be called on Windhawk's worker thread. Never bypass the
     // shell-readiness gate when reloading settings during cold startup.
-    const HWND target = g_module.ReceiverForCallbacks();
-    if (g_module.isExplorer && target)
+    const HWND target = GetCoreState().module.ReceiverForCallbacks();
+    if (GetCoreState().module.isExplorer && target)
         (void)PostMessageW(target, kShellInputSiteReadyMessage, 0, 0);
-    if (g_module.isExplorer && target)
+    if (GetCoreState().module.isExplorer && target)
         (void)PostMessageW(target, kBluetoothConfigMessage, 0, 0);
-    if (g_module.isExplorer && target)
+    if (GetCoreState().module.isExplorer && target)
         (void)PostMessageW(target, kNetworkConfigMessage, 0, 0);
     // Refresh the next OSD using the newly selected theme. Settings never
     // force an unexpected brightness write or background monitor read.
@@ -11364,37 +12190,44 @@ void Wh_ModSettingsChanged() {
 
 void Wh_ModBeforeUninit() {
     // Withdraw the published HWND before joining workers and the controller.
-    g_module.BeginShutdown();
+    GetCoreState().module.BeginShutdown();
     // WinRT/XAML is STA-owned and must exit before the module unloads.
     xaml_osd::Stop();
     // Stop all worker threads before the UI windows or DLL can be unloaded.
-    g_writer.SignalStop();
-    if (g_writer.thread) {
-        WaitForSingleObject(g_writer.thread, INFINITE);
-        CloseHandle(g_writer.thread);
-        g_writer.thread = nullptr;
+    GetBrightnessState().writer.SignalStop();
+    if (GetBrightnessState().writer.thread) {
+        // Keep the safe unbounded join; report unusually slow hardware exits.
+        const DWORD first = WaitForSingleObject(GetBrightnessState().writer.thread, 2500);
+        if (first == WAIT_TIMEOUT) {
+            Wh_Log(L"Fluent OSD/brightness: worker still active after 2500 ms; awaiting safe exit");
+            (void)WaitForSingleObject(GetBrightnessState().writer.thread, INFINITE);
+        } else if (first != WAIT_OBJECT_0) {
+            Wh_Log(L"Fluent OSD/brightness: join returned %lu", first);
+        }
+        CloseHandle(GetBrightnessState().writer.thread);
+        GetBrightnessState().writer.thread = nullptr;
     }
-    g_writer.CloseWakeAfterWorkerStops();
-    g_media.SignalStop();
-    if (g_media.thread) {
+    GetBrightnessState().writer.CloseWakeAfterWorkerStops();
+    GetAudioState().media.SignalStop();
+    if (GetAudioState().media.thread) {
         // Await completion to guarantee there is no executing code in the
         // Windhawk DLL after unload. The WinRT worker is independent of Explorer.
-        WaitForSingleObject(g_media.thread, INFINITE);
-        CloseHandle(g_media.thread);
-        g_media.thread = nullptr;
+        WaitForSingleObject(GetAudioState().media.thread, INFINITE);
+        CloseHandle(GetAudioState().media.thread);
+        GetAudioState().media.thread = nullptr;
     }
-    g_media.CloseWakeAfterWorkerStops();
-    if (g_module.uiThread) {
+    GetAudioState().media.CloseWakeAfterWorkerStops();
+    if (GetCoreState().module.uiThread) {
         // Waiting with a 2.5-second timeout and then unloading could leave
         // this DLL executing on a live UI thread. Join before the unload.
-        PostThreadMessageW(g_module.uiThreadId, WM_QUIT, 0, 0);
-        WaitForSingleObject(g_module.uiThread, INFINITE);
-        CloseHandle(g_module.uiThread);
-        g_module.uiThread = nullptr;
+        PostThreadMessageW(GetCoreState().module.uiThreadId, WM_QUIT, 0, 0);
+        WaitForSingleObject(GetCoreState().module.uiThread, INFINITE);
+        CloseHandle(GetCoreState().module.uiThread);
+        GetCoreState().module.uiThread = nullptr;
     }
-    if (g_module.uiReady) {
-        CloseHandle(g_module.uiReady);
-        g_module.uiReady = nullptr;
+    if (GetCoreState().module.uiReady) {
+        CloseHandle(GetCoreState().module.uiReady);
+        GetCoreState().module.uiReady = nullptr;
     }
 }
 
@@ -11402,17 +12235,26 @@ void Wh_ModUninit() {
     // Windhawk removes hooks between BeforeUninit and Uninit. Worker
     // and receiver threads have also joined, so these no_destroy buffers
     // can now release their allocations without racing hook callbacks.
-    g_nativeMailbox.ReleaseAfterHooksRemoved();
-    g_ddc.ReleaseAfterHooksRemoved();
-    g_writer.ReleaseStorageAfterWorkerStops();
-    g_media.ReleaseStorageAfterThreadsStop();
+    GetNativeEventState().mailbox.ReleaseAfterHooksRemoved();
+    GetBrightnessState().ddc.ReleaseAfterHooksRemoved();
+    GetBrightnessState().writer.ReleaseStorageAfterWorkerStops();
+    GetAudioState().media.ReleaseStorageAfterThreadsStop();
+    // Do not depend on global C++ destructors at DLL_PROCESS_DETACH.
+    // Threads are joined and callbacks/hooks have been withdrawn by now.
+    osd_control::GetControlState().ReleaseAfterHooksRemoved();
+    xaml_osd::GetXamlState().ReleaseAfterThreadsStop();
+    GetNoticeState().ReleaseAfterControllerStops();
+    GetConnectivityState().ReleaseAfterControllerStops();
+    GetCoreState().ReleaseAfterThreadsStop();
+    GetSettingsModuleState().ReleaseAfterThreadsStop();
     // Mixer COM objects and containers are released by the UI owner thread.
-    if (g_module.confirmatorDll) {
-        FreeLibrary(g_module.confirmatorDll);
-        g_module.confirmatorDll = nullptr;
+    GetCoreState().module.createWindowInBandOriginal = nullptr; // Windhawk removed hooks.
+    if (GetCoreState().module.confirmatorDll) {
+        FreeLibrary(GetCoreState().module.confirmatorDll);
+        GetCoreState().module.confirmatorDll = nullptr;
     }
-    if (g_module.ddcDll) {
-        FreeLibrary(g_module.ddcDll);
-        g_module.ddcDll = nullptr;
+    if (GetCoreState().module.ddcDll) {
+        FreeLibrary(GetCoreState().module.ddcDll);
+        GetCoreState().module.ddcDll = nullptr;
     }
 }
