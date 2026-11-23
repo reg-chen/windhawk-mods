@@ -3945,10 +3945,18 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
         state.fading = state.fadeOut = false;
         state.card.Opacity(1.0);
     }
-    if (!SetWindowPos(state.host, HWND_TOPMOST,
+    const BOOL positioned = SetWindowPos(state.host, HWND_TOPMOST,
                        placed.x, placed.y, placed.width, placed.height,
-                      SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        Wh_Log(L"Fluent OSD/XAML: show failed (%lu)", GetLastError());
+                       SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const DWORD positionError = positioned ? 0 : GetLastError();
+    if (osd_model::SelectView(value.kind) == osd_model::View::Level)
+        Wh_Log(L"Fluent OSD/DIAG level-position: kind=%d hwnd=%p x=%d y=%d w=%d h=%d ok=%d err=%lu visible=%d",
+            static_cast<int>(value.kind), state.host,
+            static_cast<int>(placed.x), static_cast<int>(placed.y),
+            static_cast<int>(placed.width), static_cast<int>(placed.height),
+            positioned != FALSE, positionError, IsWindowVisible(state.host) != FALSE);
+    if (!positioned) {
+        Wh_Log(L"Fluent OSD/XAML: show failed (%lu)", positionError);
         return;
     }
     if (!wasVisible) {
@@ -5272,7 +5280,20 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     }
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
-        !state.fillClip || !state.levelSlider || !state.statusView.statusTile) return;
+        !state.fillClip || !state.levelSlider || !state.statusView.statusTile) {
+        Wh_Log(L"Fluent OSD/DIAG level-missing: kind=%d hwnd=%d card=%d canvas=%d slider=%d icon=%d value=%d track=%d fill=%d clip=%d tile=%d",
+            static_cast<int>(value.kind), state.host != nullptr,
+            state.card ? 1 : 0, state.canvas ? 1 : 0,
+            state.levelSlider ? 1 : 0, state.icon ? 1 : 0,
+            state.value ? 1 : 0, state.track ? 1 : 0,
+            state.fill ? 1 : 0, state.fillClip ? 1 : 0,
+            state.statusView.statusTile ? 1 : 0);
+        return;
+    }
+    Wh_Log(L"Fluent OSD/DIAG level-draw: kind=%d hwnd=%p vertical=%d known=%d anchor=(%ld,%ld,%ld,%ld) scale=%.2f",
+        static_cast<int>(value.kind), state.host, value.vertical ? 1 : 0,
+        value.valueKnown ? 1 : 0, value.anchor.left, value.anchor.top,
+        value.anchor.right, value.anchor.bottom, static_cast<double>(value.scale));
     if (state.current.kind != value.kind) state.wheelRemainder = 0;
     state.current = value;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
@@ -5900,14 +5921,19 @@ void CreateSurface(State& state, HINSTANCE instance) {
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
 
+    Wh_Log(L"Fluent OSD/DIAG surface-host: hwnd=%p viewOnly=%d",
+        state.host, state.viewOnly ? 1 : 0);
     state.source = hosting::DesktopWindowXamlSource{};
     ComPtr<IDesktopWindowXamlSourceNative> interop;
     winrt::check_hresult(winrt::get_unknown(state.source)->
         QueryInterface(kInteropIID,
             reinterpret_cast<void**>(interop.GetAddressOf())));
+    Wh_Log(L"Fluent OSD/DIAG surface-QI: hwnd=%p", state.host);
     winrt::check_hresult(interop->AttachToWindow(state.host));
     winrt::check_hresult(interop->get_WindowHandle(&state.island));
     if (!state.island) winrt::throw_hresult(E_POINTER);
+    Wh_Log(L"Fluent OSD/DIAG surface-attached: hwnd=%p island=%p",
+        state.host, state.island);
     if (state.viewOnly)
         SetWindowLongPtrW(state.island, GWL_EXSTYLE,
             GetWindowLongPtrW(state.island, GWL_EXSTYLE) |
@@ -5916,6 +5942,8 @@ void CreateSurface(State& state, HINSTANCE instance) {
         SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW))
         winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
     CreateContent(state);
+    Wh_Log(L"Fluent OSD/DIAG surface-content: hwnd=%p slider=%d",
+        state.host, state.levelSlider ? 1 : 0);
 }
 
 void CloseSurface(State& state) {
@@ -5963,6 +5991,11 @@ void DeliverPending(State& root) {
     std::vector<Snapshot> batch = GetXamlState().snapshots.Take();
     if (batch.empty()) return;
     const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
+    if (ddc || batch.front().kind == LevelKind::Volume ||
+        batch.front().kind == LevelKind::NativeBrightness)
+        Wh_Log(L"Fluent OSD/DIAG deliver: kind=%d count=%u root=%p",
+            static_cast<int>(batch.front().kind), static_cast<unsigned>(batch.size()),
+            root.host);
     const bool attached = batch.size() >= 2 &&
         ((batch[0].kind == LevelKind::Volume &&
           (batch[1].kind == LevelKind::Media ||
@@ -6002,6 +6035,8 @@ void DeliverPending(State& root) {
         if (found == root.peers.end()) {
             auto peer = std::make_unique<State>();
             peer->viewOnly = readOnly;
+            if (snap.kind == LevelKind::DdcBrightness)
+                Wh_Log(L"Fluent OSD/DIAG peer-begin: key='%s'", key.c_str());
             try { CreateSurface(*peer, GetModuleHandleW(nullptr)); }
             catch (const winrt::hresult_error& ex) {
                 Wh_Log(L"Fluent OSD/XAML: peer create failed 0x%08lX",
@@ -6009,6 +6044,9 @@ void DeliverPending(State& root) {
                 CloseSurface(*peer);
                 return nullptr;
             }
+            if (snap.kind == LevelKind::DdcBrightness)
+                Wh_Log(L"Fluent OSD/DIAG peer-created: key='%s' hwnd=%p",
+                    key.c_str(), peer->host);
             found = root.peers.emplace(key, std::move(peer)).first;
         }
         DrawSnapshot(*found->second, snap);
@@ -6153,10 +6191,24 @@ bool IsReady() {
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
     const HWND hwnd = GetXamlState().lifecycle.ReadyWindow();
-    if (!hwnd || GetXamlState().lifecycle.IsStopping() || GetXamlState().lifecycle.IsFailed() ||
-        snapshots.empty()) return false;
+    const bool trace = !snapshots.empty() &&
+        (snapshots.front().kind == LevelKind::Volume ||
+         snapshots.front().kind == LevelKind::NativeBrightness ||
+         snapshots.front().kind == LevelKind::DdcBrightness);
+    const bool stopping = GetXamlState().lifecycle.IsStopping();
+    const bool failed = GetXamlState().lifecycle.IsFailed();
+    if (!hwnd || stopping || failed || snapshots.empty()) {
+        if (trace) Wh_Log(L"Fluent OSD/DIAG batch-rejected: kind=%d count=%u hwnd=%p stopping=%d failed=%d",
+            static_cast<int>(snapshots.front().kind), static_cast<unsigned>(snapshots.size()),
+            hwnd, stopping ? 1 : 0, failed ? 1 : 0);
+        return false;
+    }
     GetXamlState().snapshots.Publish(snapshots);
-    return PostMessageW(hwnd, kShowMessage, 0, 0) != FALSE;
+    const BOOL posted = PostMessageW(hwnd, kShowMessage, 0, 0);
+    if (trace) Wh_Log(L"Fluent OSD/DIAG batch-posted: kind=%d count=%u hwnd=%p posted=%d",
+        static_cast<int>(snapshots.front().kind), static_cast<unsigned>(snapshots.size()),
+        hwnd, posted != FALSE);
+    return posted != FALSE;
 }
 bool IsPrimaryVisible() {
     const HWND hwnd=GetXamlState().lifecycle.ReadyWindow();
@@ -7826,8 +7878,12 @@ bool RouteNativeVolumeBrightness(Kind kind, int reportedValue) {
         return false;
     HWND receiver = FindWindowExW(HWND_MESSAGE, nullptr,
                                   kWindowClass, nullptr);
-    return receiver && PostMessageW(receiver, kNativeOsdMessage,
+    const BOOL posted = receiver && PostMessageW(receiver, kNativeOsdMessage,
         static_cast<WPARAM>(kind), static_cast<LPARAM>(reportedValue));
+    Wh_Log(L"Fluent OSD/DIAG native-route: pid=%lu kind=%d value=%d receiver=%p posted=%d",
+        GetCurrentProcessId(), static_cast<int>(kind), reportedValue, receiver,
+        posted != FALSE);
+    return posted != FALSE;
 }
 
 // --- Windows 11 native HardwareConfirmator OSD switches ---
@@ -10047,6 +10103,8 @@ bool ShowXamlDdcTargets(
         // An unresolved delta must not dismiss another monitor's live OSD.
         return false;
     }
+    Wh_Log(L"Fluent OSD/DIAG DDC-snapshots: mode=%d count=%u device='%s' physicalIndex=%lu",
+        mode, static_cast<unsigned>(batch.size()), master.device, master.physicalIndex);
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
         Wh_Log(L"Fluent OSD/XAML: DDC batch not delivered");
@@ -12031,6 +12089,9 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const Kind kind = static_cast<Kind>(wp);
         if (kind != Kind::Volume && kind != Kind::Brightness)
             return 0;
+        Wh_Log(L"Fluent OSD/DIAG native-receiver: pid=%lu kind=%d value=%d enabled=%d",
+            GetCurrentProcessId(), static_cast<int>(kind), static_cast<int>(lp),
+            ShowCustomNative(kind) ? 1 : 0);
         if (!ShowCustomNative(kind)) return 0;
         GetCoreState().presentation.popupKind = kind == Kind::Volume ?
             PopupKind::NativeVolume : PopupKind::NativeBrightness;
