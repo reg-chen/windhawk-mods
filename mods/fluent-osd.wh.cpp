@@ -92,6 +92,18 @@ See the [complete screenshot gallery](https://github.com/reg-chen/windhawk-mods-
    Hide and Show are independent; custom displays are off by default.
 3. Adjust appearance, layout and timing to your preference.
 
+### Twinkle Tray coexistence
+
+When using **Twinkle Tray** for DDC/CI brightness control, open
+**Twinkle Tray → Settings → General → Default overlay behavior → Disable overlay**.
+This disables Twinkle Tray's own brightness overlay without disabling DDC/CI
+brightness control, preventing overlapping indicators. Fluent OSD does not
+change Twinkle Tray's settings or force-hide its overlay.
+
+使用 Twinkle Tray 進行 DDC/CI 調光時，請在「設定 → 一般 → 預設浮層行為」
+選擇「停用浮層」（名稱依介面語言而異）。此選項不影響調光功能，
+只避免 Twinkle Tray 的亮度提示與 Fluent OSD 重疊。
+
 ## Custom background brushes
 
 Under **Fluent appearance > Background effect**, choose **Transparency**
@@ -7085,10 +7097,16 @@ public:
     HRESULT STDMETHODCALLTYPE OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA data) override {
         if (!data) return S_OK;
         HWND hwnd = target_.load(std::memory_order_acquire);
+        Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG notify: gen=%u scalar=%.4f muted=%d target=%p pending=%d",
+            generation_, static_cast<double>(data->fMasterVolume),
+            data->bMuted != FALSE, hwnd,
+            pending_.load(std::memory_order_acquire) ? 1 : 0);
         if (!hwnd || pending_.exchange(true, std::memory_order_acq_rel)) return S_OK;
-        if (!PostMessageW(hwnd, kCoreAudioVolumeMessage,
-                          static_cast<WPARAM>(generation_), 0))
-            pending_.store(false, std::memory_order_release);
+        const BOOL posted = PostMessageW(hwnd, kCoreAudioVolumeMessage,
+                                        static_cast<WPARAM>(generation_), 0);
+        Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG post: gen=%u ok=%d",
+            generation_, posted != FALSE);
+        if (!posted) pending_.store(false, std::memory_order_release);
         return S_OK;
     }
 };
@@ -8480,7 +8498,13 @@ void RebindCoreAudioVolume() {
         if (rawId) CoTaskMemFree(rawId);
     }
     if (device && !id.empty() && watcher.endpoint &&
-        watcher.endpointId == id) return;
+        watcher.endpointId == id) {
+        Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG endpoint unchanged: gen=%u",
+            watcher.generation);
+        return;
+    }
+    Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG endpoint rebind: gen=%u present=%d",
+        watcher.generation, device ? 1 : 0);
     watcher.UnbindEndpoint();
     if (FAILED(hr) || !device) {
         Wh_Log(L"Fluent OSD/COREAUDIO: no default output hr=0x%08lX",
@@ -11841,8 +11865,13 @@ void ShowNativeVolumePopup() {
     auto& current = GetCoreState().presentation;
     if (current.nativePercentKnown &&
         GetAudioState().coreVolume.SuppressExactDuplicate(
-            current.nativePercent, current.nativeMuted))
+            current.nativePercent, current.nativeMuted)) {
+        Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG suppressed: percent=%d muted=%d",
+            current.nativePercent, current.nativeMuted ? 1 : 0);
         return;
+    }
+    Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG popup: percent=%d muted=%d",
+        current.nativePercent, current.nativeMuted ? 1 : 0);
     BrightnessEvent event{};
     MovePopupToDisplay(event);
     if (GetSettingsState()->showSmtcOnVolume.load() && !GetAudioState().panel.mixerOpen) RequestMedia();
@@ -12312,10 +12341,21 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (hwnd == GetCoreState().module.receiveWnd &&
         msg == kCoreAudioVolumeMessage) {
         auto& watcher = GetAudioState().coreVolume;
-        if (static_cast<unsigned>(wp) != watcher.generation) return 0;
+        if (static_cast<unsigned>(wp) != watcher.generation) {
+            Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG stale: got=%u current=%u",
+                static_cast<unsigned>(wp), watcher.generation);
+            return 0;
+        }
         if (watcher.levelListener) watcher.levelListener->ClearPending();
         if (GetCoreState().module.closing.load() ||
-            !ShowCustomNative(Kind::Volume)) return 0;
+            !ShowCustomNative(Kind::Volume)) {
+            Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG receiver skipped: closing=%d enabled=%d",
+                GetCoreState().module.closing.load() ? 1 : 0,
+                ShowCustomNative(Kind::Volume) ? 1 : 0);
+            return 0;
+        }
+        Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG receiver: gen=%u",
+            watcher.generation);
         int percent = 0;
         bool muted = false;
         if (!ReadDefaultAudioVolume(percent, muted)) {
