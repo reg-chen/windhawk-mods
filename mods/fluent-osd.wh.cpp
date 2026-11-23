@@ -103,10 +103,6 @@ This disables Twinkle Tray's own brightness overlay without disabling DDC/CI
 brightness control, preventing overlapping indicators. Fluent OSD does not
 change Twinkle Tray's settings or force-hide its overlay.
 
-使用 Twinkle Tray 進行 DDC/CI 調光時，請在「設定 → 一般 → 預設浮層行為」
-選擇「停用浮層」（名稱依介面語言而異）。此選項不影響調光功能，
-只避免 Twinkle Tray 的亮度提示與 Fluent OSD 重疊。
-
 ## Custom background brushes
 
 Under **Fluent appearance > Background effect**, choose **Transparency**
