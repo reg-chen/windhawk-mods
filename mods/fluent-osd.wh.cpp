@@ -3,7 +3,7 @@
 // @name            Fluent OSD
 // @description     Native XAML on-screen displays for volume, brightness, media, mixer and Windows system events.
 // @description:zh-TW 以原生 XAML 顯示音量、亮度、媒體、混音器及 Windows 系統事件提示。
-// @version         1.1.5
+// @version         1.1.5.1
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -24,6 +24,9 @@ Windows indicators to hide and which custom OSDs to show.
 
 - **Volume and brightness:** Horizontal or vertical layouts, interactive
   sliders, mouse-wheel control and optional per-monitor DDC/CI brightness.
+  Master volume changes are observed through Core Audio (including
+  EarTrumpet tray-wheel adjustments), independent of Windows' native
+  OSD trigger.
 - **Media:** Album art, track details, playback controls, timeline,
   shuffle and repeat (subject to media-session support).
 - **Audio mixer:** Master and per-app volume/mute controls and playback
@@ -3957,18 +3960,10 @@ void ShowPositionedSurface(State& state, const Snapshot& value,
         state.fading = state.fadeOut = false;
         state.card.Opacity(1.0);
     }
-    const BOOL positioned = SetWindowPos(state.host, HWND_TOPMOST,
+    if (!SetWindowPos(state.host, HWND_TOPMOST,
                        placed.x, placed.y, placed.width, placed.height,
-                       SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    const DWORD positionError = positioned ? 0 : GetLastError();
-    if (osd_model::SelectView(value.kind) == osd_model::View::Level)
-        Wh_Log(L"Fluent OSD/DIAG level-position: kind=%d hwnd=%p x=%d y=%d w=%d h=%d ok=%d err=%lu visible=%d",
-            static_cast<int>(value.kind), state.host,
-            static_cast<int>(placed.x), static_cast<int>(placed.y),
-            static_cast<int>(placed.width), static_cast<int>(placed.height),
-            positioned != FALSE, positionError, IsWindowVisible(state.host) != FALSE);
-    if (!positioned) {
-        Wh_Log(L"Fluent OSD/XAML: show failed (%lu)", positionError);
+                      SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+        Wh_Log(L"Fluent OSD/XAML: show failed (%lu)", GetLastError());
         return;
     }
     if (!wasVisible) {
@@ -5292,20 +5287,7 @@ void DrawSnapshot(State& state, const Snapshot& value) {
     }
     if (!state.host || !state.card || !state.canvas ||
         !state.icon || !state.value || !state.track || !state.fill ||
-        !state.fillClip || !state.levelSlider || !state.statusView.statusTile) {
-        Wh_Log(L"Fluent OSD/DIAG level-missing: kind=%d hwnd=%d card=%d canvas=%d slider=%d icon=%d value=%d track=%d fill=%d clip=%d tile=%d",
-            static_cast<int>(value.kind), state.host != nullptr,
-            state.card ? 1 : 0, state.canvas ? 1 : 0,
-            state.levelSlider ? 1 : 0, state.icon ? 1 : 0,
-            state.value ? 1 : 0, state.track ? 1 : 0,
-            state.fill ? 1 : 0, state.fillClip ? 1 : 0,
-            state.statusView.statusTile ? 1 : 0);
-        return;
-    }
-    Wh_Log(L"Fluent OSD/DIAG level-draw: kind=%d hwnd=%p vertical=%d known=%d anchor=(%ld,%ld,%ld,%ld) scale=%.2f",
-        static_cast<int>(value.kind), state.host, value.vertical ? 1 : 0,
-        value.valueKnown ? 1 : 0, value.anchor.left, value.anchor.top,
-        value.anchor.right, value.anchor.bottom, static_cast<double>(value.scale));
+        !state.fillClip || !state.levelSlider || !state.statusView.statusTile) return;
     if (state.current.kind != value.kind) state.wheelRemainder = 0;
     state.current = value;
     state.scale = std::clamp(static_cast<double>(value.scale), 0.5, 6.0);
@@ -5933,19 +5915,14 @@ void CreateSurface(State& state, HINSTANCE instance) {
         static_cast<unsigned long>(border),
         static_cast<unsigned long>(frame));
 
-    Wh_Log(L"Fluent OSD/DIAG surface-host: hwnd=%p viewOnly=%d",
-        state.host, state.viewOnly ? 1 : 0);
     state.source = hosting::DesktopWindowXamlSource{};
     ComPtr<IDesktopWindowXamlSourceNative> interop;
     winrt::check_hresult(winrt::get_unknown(state.source)->
         QueryInterface(kInteropIID,
             reinterpret_cast<void**>(interop.GetAddressOf())));
-    Wh_Log(L"Fluent OSD/DIAG surface-QI: hwnd=%p", state.host);
     winrt::check_hresult(interop->AttachToWindow(state.host));
     winrt::check_hresult(interop->get_WindowHandle(&state.island));
     if (!state.island) winrt::throw_hresult(E_POINTER);
-    Wh_Log(L"Fluent OSD/DIAG surface-attached: hwnd=%p island=%p",
-        state.host, state.island);
     if (state.viewOnly)
         SetWindowLongPtrW(state.island, GWL_EXSTYLE,
             GetWindowLongPtrW(state.island, GWL_EXSTYLE) |
@@ -5954,8 +5931,6 @@ void CreateSurface(State& state, HINSTANCE instance) {
         SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW))
         winrt::throw_hresult(HRESULT_FROM_WIN32(GetLastError()));
     CreateContent(state);
-    Wh_Log(L"Fluent OSD/DIAG surface-content: hwnd=%p slider=%d",
-        state.host, state.levelSlider ? 1 : 0);
 }
 
 void CloseSurface(State& state) {
@@ -6003,11 +5978,6 @@ void DeliverPending(State& root) {
     std::vector<Snapshot> batch = GetXamlState().snapshots.Take();
     if (batch.empty()) return;
     const bool ddc = batch.front().kind == LevelKind::DdcBrightness;
-    if (ddc || batch.front().kind == LevelKind::Volume ||
-        batch.front().kind == LevelKind::NativeBrightness)
-        Wh_Log(L"Fluent OSD/DIAG deliver: kind=%d count=%u root=%p",
-            static_cast<int>(batch.front().kind), static_cast<unsigned>(batch.size()),
-            root.host);
     const bool attached = batch.size() >= 2 &&
         ((batch[0].kind == LevelKind::Volume &&
           (batch[1].kind == LevelKind::Media ||
@@ -6047,8 +6017,6 @@ void DeliverPending(State& root) {
         if (found == root.peers.end()) {
             auto peer = std::make_unique<State>();
             peer->viewOnly = readOnly;
-            if (snap.kind == LevelKind::DdcBrightness)
-                Wh_Log(L"Fluent OSD/DIAG peer-begin: key='%s'", key.c_str());
             try { CreateSurface(*peer, GetModuleHandleW(nullptr)); }
             catch (const winrt::hresult_error& ex) {
                 Wh_Log(L"Fluent OSD/XAML: peer create failed 0x%08lX",
@@ -6056,9 +6024,6 @@ void DeliverPending(State& root) {
                 CloseSurface(*peer);
                 return nullptr;
             }
-            if (snap.kind == LevelKind::DdcBrightness)
-                Wh_Log(L"Fluent OSD/DIAG peer-created: key='%s' hwnd=%p",
-                    key.c_str(), peer->host);
             found = root.peers.emplace(key, std::move(peer)).first;
         }
         DrawSnapshot(*found->second, snap);
@@ -6203,24 +6168,10 @@ bool IsReady() {
 }
 bool ShowBatch(const std::vector<Snapshot>& snapshots) {
     const HWND hwnd = GetXamlState().lifecycle.ReadyWindow();
-    const bool trace = !snapshots.empty() &&
-        (snapshots.front().kind == LevelKind::Volume ||
-         snapshots.front().kind == LevelKind::NativeBrightness ||
-         snapshots.front().kind == LevelKind::DdcBrightness);
-    const bool stopping = GetXamlState().lifecycle.IsStopping();
-    const bool failed = GetXamlState().lifecycle.IsFailed();
-    if (!hwnd || stopping || failed || snapshots.empty()) {
-        if (trace) Wh_Log(L"Fluent OSD/DIAG batch-rejected: kind=%d count=%u hwnd=%p stopping=%d failed=%d",
-            static_cast<int>(snapshots.front().kind), static_cast<unsigned>(snapshots.size()),
-            hwnd, stopping ? 1 : 0, failed ? 1 : 0);
-        return false;
-    }
+    if (!hwnd || GetXamlState().lifecycle.IsStopping() || GetXamlState().lifecycle.IsFailed() ||
+        snapshots.empty()) return false;
     GetXamlState().snapshots.Publish(snapshots);
-    const BOOL posted = PostMessageW(hwnd, kShowMessage, 0, 0);
-    if (trace) Wh_Log(L"Fluent OSD/DIAG batch-posted: kind=%d count=%u hwnd=%p posted=%d",
-        static_cast<int>(snapshots.front().kind), static_cast<unsigned>(snapshots.size()),
-        hwnd, posted != FALSE);
-    return posted != FALSE;
+    return PostMessageW(hwnd, kShowMessage, 0, 0) != FALSE;
 }
 bool IsPrimaryVisible() {
     const HWND hwnd=GetXamlState().lifecycle.ReadyWindow();
@@ -7097,16 +7048,10 @@ public:
     HRESULT STDMETHODCALLTYPE OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA data) override {
         if (!data) return S_OK;
         HWND hwnd = target_.load(std::memory_order_acquire);
-        Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG notify: gen=%u scalar=%.4f muted=%d target=%p pending=%d",
-            generation_, static_cast<double>(data->fMasterVolume),
-            data->bMuted != FALSE, hwnd,
-            pending_.load(std::memory_order_acquire) ? 1 : 0);
         if (!hwnd || pending_.exchange(true, std::memory_order_acq_rel)) return S_OK;
-        const BOOL posted = PostMessageW(hwnd, kCoreAudioVolumeMessage,
-                                        static_cast<WPARAM>(generation_), 0);
-        Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG post: gen=%u ok=%d",
-            generation_, posted != FALSE);
-        if (!posted) pending_.store(false, std::memory_order_release);
+        if (!PostMessageW(hwnd, kCoreAudioVolumeMessage,
+                          static_cast<WPARAM>(generation_), 0))
+            pending_.store(false, std::memory_order_release);
         return S_OK;
     }
 };
@@ -8030,12 +7975,8 @@ bool RouteNativeVolumeBrightness(Kind kind, int reportedValue) {
         return false;
     HWND receiver = FindWindowExW(HWND_MESSAGE, nullptr,
                                   kWindowClass, nullptr);
-    const BOOL posted = receiver && PostMessageW(receiver, kNativeOsdMessage,
+    return receiver && PostMessageW(receiver, kNativeOsdMessage,
         static_cast<WPARAM>(kind), static_cast<LPARAM>(reportedValue));
-    Wh_Log(L"Fluent OSD/DIAG native-route: pid=%lu kind=%d value=%d receiver=%p posted=%d",
-        GetCurrentProcessId(), static_cast<int>(kind), reportedValue, receiver,
-        posted != FALSE);
-    return posted != FALSE;
 }
 
 // --- Windows 11 native HardwareConfirmator OSD switches ---
@@ -8498,13 +8439,7 @@ void RebindCoreAudioVolume() {
         if (rawId) CoTaskMemFree(rawId);
     }
     if (device && !id.empty() && watcher.endpoint &&
-        watcher.endpointId == id) {
-        Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG endpoint unchanged: gen=%u",
-            watcher.generation);
-        return;
-    }
-    Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG endpoint rebind: gen=%u present=%d",
-        watcher.generation, device ? 1 : 0);
+        watcher.endpointId == id) return;
     watcher.UnbindEndpoint();
     if (FAILED(hr) || !device) {
         Wh_Log(L"Fluent OSD/COREAUDIO: no default output hr=0x%08lX",
@@ -10346,8 +10281,6 @@ bool ShowXamlDdcTargets(
         // An unresolved delta must not dismiss another monitor's live OSD.
         return false;
     }
-    Wh_Log(L"Fluent OSD/DIAG DDC-snapshots: mode=%d count=%u device='%s' physicalIndex=%lu",
-        mode, static_cast<unsigned>(batch.size()), master.device, master.physicalIndex);
     const bool ok = xaml_osd::ShowBatch(batch);
     if (!ok)
         Wh_Log(L"Fluent OSD/XAML: DDC batch not delivered");
@@ -11865,13 +11798,8 @@ void ShowNativeVolumePopup() {
     auto& current = GetCoreState().presentation;
     if (current.nativePercentKnown &&
         GetAudioState().coreVolume.SuppressExactDuplicate(
-            current.nativePercent, current.nativeMuted)) {
-        Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG suppressed: percent=%d muted=%d",
-            current.nativePercent, current.nativeMuted ? 1 : 0);
+            current.nativePercent, current.nativeMuted))
         return;
-    }
-    Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG popup: percent=%d muted=%d",
-        current.nativePercent, current.nativeMuted ? 1 : 0);
     BrightnessEvent event{};
     MovePopupToDisplay(event);
     if (GetSettingsState()->showSmtcOnVolume.load() && !GetAudioState().panel.mixerOpen) RequestMedia();
@@ -12341,21 +12269,10 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (hwnd == GetCoreState().module.receiveWnd &&
         msg == kCoreAudioVolumeMessage) {
         auto& watcher = GetAudioState().coreVolume;
-        if (static_cast<unsigned>(wp) != watcher.generation) {
-            Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG stale: got=%u current=%u",
-                static_cast<unsigned>(wp), watcher.generation);
-            return 0;
-        }
+        if (static_cast<unsigned>(wp) != watcher.generation) return 0;
         if (watcher.levelListener) watcher.levelListener->ClearPending();
         if (GetCoreState().module.closing.load() ||
-            !ShowCustomNative(Kind::Volume)) {
-            Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG receiver skipped: closing=%d enabled=%d",
-                GetCoreState().module.closing.load() ? 1 : 0,
-                ShowCustomNative(Kind::Volume) ? 1 : 0);
-            return 0;
-        }
-        Wh_Log(L"Fluent OSD/EARTRUMPET-DIAG receiver: gen=%u",
-            watcher.generation);
+            !ShowCustomNative(Kind::Volume)) return 0;
         int percent = 0;
         bool muted = false;
         if (!ReadDefaultAudioVolume(percent, muted)) {
@@ -12367,8 +12284,6 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         presentation.nativePercent = percent;
         presentation.nativePercentKnown = true;
         presentation.nativeMuted = muted;
-        Wh_Log(L"Fluent OSD/COREAUDIO: volume event percent=%d muted=%d generation=%u",
-            percent, muted ? 1 : 0, watcher.generation);
         ShowNativeVolumePopup();
         return 0;
     }
@@ -12388,9 +12303,6 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const Kind kind = static_cast<Kind>(wp);
         if (kind != Kind::Volume && kind != Kind::Brightness)
             return 0;
-        Wh_Log(L"Fluent OSD/DIAG native-receiver: pid=%lu kind=%d value=%d enabled=%d",
-            GetCurrentProcessId(), static_cast<int>(kind), static_cast<int>(lp),
-            ShowCustomNative(kind) ? 1 : 0);
         if (!ShowCustomNative(kind)) return 0;
         GetCoreState().presentation.popupKind = kind == Kind::Volume ?
             PopupKind::NativeVolume : PopupKind::NativeBrightness;
