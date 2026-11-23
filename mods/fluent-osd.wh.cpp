@@ -3,7 +3,7 @@
 // @name            Fluent OSD
 // @description     Native XAML on-screen displays for volume, brightness, media, mixer and Windows system events.
 // @description:zh-TW 以原生 XAML 顯示音量、亮度、媒體、混音器及 Windows 系統事件提示。
-// @version         1.1.5.1
+// @version         1.1.5.2
 // @author          Reg Chen
 // @github          https://github.com/reg-chen
 // @include         explorer.exe
@@ -34,7 +34,8 @@ Windows indicators to hide and which custom OSDs to show.
 - **System events:** Lock keys, keyboard backlight, airplane mode,
   camera, microphone, virtual desktop and other Windows indicators.
 - **Notifications:** Clipboard, USB, Bluetooth and network events.
-- **Appearance:** Themes, colors, custom background brushes, window
+- **Appearance:** Themes, colors, custom background brushes, optional
+  3:1 contrast enhancement for accent-colored foreground icons, window
   corner radius, button shapes, sizing, placement, multi-monitor display
   and visibility timing. English and Traditional Chinese are supported.
 
@@ -457,6 +458,11 @@ External project and product names/trademarks belong to their owners.
           $description:zh-TW: 只有進度條顏色來源設為自訂時才使用。無效的十六進位色碼會回退至系統強調色。
           #! $showIf: {ddcAccentMode: custom}
           #! $format: colorRgb
+        - ddcEnhanceAccentForeground: false
+          $name: Auto-enhance accent-colored foreground contrast
+          $name:zh-TW: 自動增強輔色前景對比
+          $description: Adjusts accent-colored icons and chevrons only when estimated contrast is below 3:1; progress bars and decorative fills retain the original accent. Transparent and layered backgrounds use the configured solid background as an approximation.
+          $description:zh-TW: 僅在輔色圖示與箭頭的估計對比低於 3:1 時自動加亮或加暗；進度條及裝飾性填色保留原輔色。透明或分層背景以設定的純色背景近似估算。
         - ddcTrackMode: system
           $name: Progress track color
           $name:zh-TW: 進度軌道顏色
@@ -947,6 +953,64 @@ constexpr PCWSTR kClipboardText = L"\uE9A4";
 constexpr PCWSTR kClipboard = L"\uE8C8";
 } // namespace osd_glyph
 
+// Accent-only foreground contrast adjustment. Preserve original accent for
+// progress bars, selection backgrounds and decorative state fills.
+// WCAG 2.2 non-text contrast target: 3:1 against the estimated backdrop.
+// Layered/acrylic/transparent cards cannot provide an exact per-pixel backdrop.
+namespace osd_palette {
+constexpr double kMinimumIconContrast = 3.0;
+double LinearChannel(BYTE channel) {
+    const double x = channel / 255.0;
+    return x <= 0.04045 ? x / 12.92 :
+        std::pow((x + 0.055) / 1.055, 2.4);
+}
+double RelativeLuminance(DWORD rgb) {
+    return 0.2126 * LinearChannel(static_cast<BYTE>(rgb >> 16)) +
+           0.7152 * LinearChannel(static_cast<BYTE>(rgb >> 8)) +
+           0.0722 * LinearChannel(static_cast<BYTE>(rgb));
+}
+double ContrastRatio(DWORD a, DWORD b) {
+    const double x = RelativeLuminance(a), y = RelativeLuminance(b);
+    return (std::max(x, y) + 0.05) / (std::min(x, y) + 0.05);
+}
+DWORD MixRgb(DWORD from, DWORD toward, double fraction) {
+    DWORD color = 0;
+    for (int shift : {16, 8, 0}) {
+        const int start = (from >> shift) & 0xff;
+        const int end = (toward >> shift) & 0xff;
+        color |= static_cast<DWORD>(std::lround(
+            start + (end - start) * fraction)) << shift;
+    }
+    return color;
+}
+DWORD CompositeOpaque(DWORD foreground, DWORD background, BYTE alpha) {
+    return MixRgb(background, foreground, alpha / 255.0);
+}
+DWORD EnhanceForeground(DWORD accent, DWORD background, bool enabled) {
+    if (!enabled || ContrastRatio(accent, background) >= kMinimumIconContrast)
+        return accent;
+    // Try both directions and keep the smaller RGB adjustment. Neutral
+    // endpoints preserve the RGB hue ordering without changing source accent.
+    const auto candidate = [&](DWORD target) -> std::pair<double, DWORD> {
+        if (ContrastRatio(target, background) < kMinimumIconContrast)
+            return {2.0, accent};
+        double low = 0.0, high = 1.0;
+        for (int i = 0; i < 20; ++i) {
+            const double mid = (low + high) * 0.5;
+            if (ContrastRatio(MixRgb(accent, target, mid), background) >=
+                kMinimumIconContrast)
+                high = mid;
+            else
+                low = mid;
+        }
+        return {high, MixRgb(accent, target, high)};
+    };
+    const auto lighter = candidate(0xFFFFFF);
+    const auto darker = candidate(0x000000);
+    return lighter.first <= darker.first ? lighter.second : darker.second;
+}
+} // namespace osd_palette
+
 // Presentation-independent input arithmetic. Both the legacy GDI+
 // controls and migrated XAML controls use these same normalized units.
 namespace osd_input {
@@ -1100,6 +1164,8 @@ struct Snapshot {
     int iconSize = 16, fontSize = 15;
     DWORD background = 0x232327, text = 0xf8f8fc;
     DWORD accent = 0x67acff, track = 0x56565c;
+    // Derived only for accent foreground glyphs; decorative fills use accent.
+    DWORD accentForeground = 0x67acff, accentTileForeground = 0x67acff;
 };
 
 // Functional transformations: unchanged input -> new owned output.
@@ -4065,7 +4131,7 @@ void UpdateNoticeDetails(State& state, const Snapshot& value,
     // Same XAML Button/glyph contract as the volume Mixer.
     state.statusView.noticeChevron.Content(winrt::box_value(winrt::hstring(
         osd_layout::MixerChevronGlyph(value.noticeDirection))));
-    state.statusView.noticeChevron.Foreground(Brush(value.accent));
+    state.statusView.noticeChevron.Foreground(Brush(value.accentForeground));
     const double size = std::clamp(headerH * .32, 20.0, 28.0);
     state.statusView.noticeChevron.Width(size);
     state.statusView.noticeChevron.Height(size);
@@ -4225,7 +4291,8 @@ void DrawStatusSnapshot(State& state, const Snapshot& value) {
             ? std::clamp(value.fontSize, 12, 24)
             : std::clamp(value.iconSize + 7, 16, 32)));
     state.statusView.statusGlyph.Foreground(Brush(
-        value.statusFontIcon || value.statusActive ? value.accent : value.text,
+        value.statusFontIcon || value.statusActive
+            ? value.accentTileForeground : value.text,
         value.statusFontIcon || value.statusActive ? 255 : 195));
     state.statusView.statusTitle.Text(winrt::hstring(value.statusTitle));
     state.statusView.statusDetail.Text(winrt::hstring(value.statusDetail));
@@ -6583,6 +6650,7 @@ struct OsdSettingsState {
     // Layout and palette options. Values are atomic because settings can be
     // reloaded outside the Explorer OSD UI thread.
     std::atomic<int> accentMode{0};
+    std::atomic<bool> enhanceAccentForeground{false};
     std::atomic<DWORD> customAccent{0};
     std::atomic<bool> validCustomAccent{false};
     std::atomic<int> backgroundMode{0};
@@ -7849,6 +7917,8 @@ void LoadSettings() {
     settings.fadeEnabled.store(Wh_GetIntSetting(L"CustomOSD.Layout.fadeOsd") != 0);
     settings.fadeDuration.store(std::clamp(Wh_GetIntSetting(L"CustomOSD.Layout.fadeDurationMs"), 60, 450));
     settings.accentMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcAccentMode"));
+    settings.enhanceAccentForeground.store(
+        Wh_GetIntSetting(L"CustomOSD.Appearance.ddcEnhanceAccentForeground") != 0);
     settings.backgroundMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcBackgroundMode"));
     settings.textMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcTextMode"));
     settings.trackMode.store(IsCustomMode(L"CustomOSD.Appearance.ddcTrackMode"));
@@ -10088,6 +10158,13 @@ xaml_osd::Snapshot MakeXamlSnapshot(
     data.text = OsdTextRgb(light, *settings);
     data.accent = OsdAccentRgb(*settings);
     data.track = OsdTrackRgb(light, false, *settings);
+    const bool enhance = settings->enhanceAccentForeground.load();
+    data.accentForeground = osd_palette::EnhanceForeground(
+        data.accent, data.background, enhance);
+    // Status glyphs are drawn on a track-tinted tile (alpha 120).
+    data.accentTileForeground = osd_palette::EnhanceForeground(
+        data.accent, osd_palette::CompositeOpaque(
+            data.track, data.background, 120), enhance);
     return data;
 }
 
