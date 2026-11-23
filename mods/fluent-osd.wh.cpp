@@ -6250,6 +6250,9 @@ constexpr UINT kNetworkNoticeMessage = WM_APP + 324;
 constexpr UINT kNativeExtraMessage = WM_APP + 325;
 constexpr UINT kShellInputSiteReadyMessage = WM_APP + 329;
 constexpr UINT kNetworkConfigMessage = WM_APP + 330;
+constexpr UINT kCoreAudioVolumeMessage = WM_APP + 331;
+constexpr UINT kCoreAudioEndpointMessage = WM_APP + 332;
+constexpr UINT kCoreAudioConfigMessage = WM_APP + 333;
 constexpr DWORD kEventMagic = 0x54434444; // 'DDCT', private wire format
 
 enum class Kind : int {
@@ -7050,11 +7053,142 @@ struct PanelControllerState {
     uint32_t mixerGeneration = 1, mediaGeneration = 1;
 };
 // All Core Audio COM operations retain their controller-apartment owner.
+// Audio notifications are asynchronous. COM objects live only on the Explorer
+// controller thread; callbacks post messages without taking locks or calling COM.
+class CoreAudioLevelListener final : public IAudioEndpointVolumeCallback {
+    std::atomic<ULONG> refs_{1};
+    std::atomic<HWND> target_;
+    std::atomic<bool> pending_{false};
+    const unsigned generation_;
+public:
+    CoreAudioLevelListener(HWND hwnd, unsigned generation)
+        : target_(hwnd), generation_(generation) {}
+    void Stop() { target_.store(nullptr, std::memory_order_release); }
+    void ClearPending() { pending_.store(false, std::memory_order_release); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
+        if (!result) return E_POINTER;
+        *result = nullptr;
+        if (IsEqualIID(iid, IID_IUnknown) ||
+            IsEqualIID(iid, __uuidof(IAudioEndpointVolumeCallback))) {
+            *result = static_cast<IAudioEndpointVolumeCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return refs_.fetch_add(1) + 1; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG left = refs_.fetch_sub(1) - 1;
+        if (!left) delete this;
+        return left;
+    }
+    HRESULT STDMETHODCALLTYPE OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA data) override {
+        if (!data) return S_OK;
+        HWND hwnd = target_.load(std::memory_order_acquire);
+        if (!hwnd || pending_.exchange(true, std::memory_order_acq_rel)) return S_OK;
+        if (!PostMessageW(hwnd, kCoreAudioVolumeMessage,
+                          static_cast<WPARAM>(generation_), 0))
+            pending_.store(false, std::memory_order_release);
+        return S_OK;
+    }
+};
+class CoreAudioEndpointListener final : public IMMNotificationClient {
+    std::atomic<ULONG> refs_{1};
+    std::atomic<HWND> target_;
+    std::atomic<bool> pending_{false};
+    void Notify() {
+        HWND hwnd = target_.load(std::memory_order_acquire);
+        if (!hwnd || pending_.exchange(true, std::memory_order_acq_rel)) return;
+        if (!PostMessageW(hwnd, kCoreAudioEndpointMessage, 0, 0))
+            pending_.store(false, std::memory_order_release);
+    }
+public:
+    explicit CoreAudioEndpointListener(HWND hwnd) : target_(hwnd) {}
+    void Stop() { target_.store(nullptr, std::memory_order_release); }
+    void ClearPending() { pending_.store(false, std::memory_order_release); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
+        if (!result) return E_POINTER;
+        *result = nullptr;
+        if (IsEqualIID(iid, IID_IUnknown) ||
+            IsEqualIID(iid, __uuidof(IMMNotificationClient))) {
+            *result = static_cast<IMMNotificationClient*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return refs_.fetch_add(1) + 1; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG left = refs_.fetch_sub(1) - 1;
+        if (!left) delete this;
+        return left;
+    }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role,
+                                                      LPCWSTR) override {
+        if (flow == eRender && (role == eConsole || role == eMultimedia))
+            Notify();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { Notify(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { Notify(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override {
+        Notify(); return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR,
+                                                      const PROPERTYKEY) override {
+        return S_OK;
+    }
+};
+struct CoreAudioVolumeObserver {
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    Microsoft::WRL::ComPtr<CoreAudioEndpointListener> endpointListener;
+    Microsoft::WRL::ComPtr<IAudioEndpointVolume> endpoint;
+    Microsoft::WRL::ComPtr<CoreAudioLevelListener> levelListener;
+    std::wstring endpointId;
+    unsigned generation = 0;
+    bool hasRecentDisplay = false;
+    int recentPercent = 0;
+    bool recentMuted = false;
+    ULONGLONG recentTick = 0;
+    bool SuppressExactDuplicate(int percent, bool muted) {
+        const ULONGLONG now = GetTickCount64();
+        const bool duplicate = hasRecentDisplay &&
+            recentPercent == percent && recentMuted == muted &&
+            now - recentTick < 160;
+        if (!duplicate) {
+            hasRecentDisplay = true;
+            recentPercent = percent;
+            recentMuted = muted;
+            recentTick = now;
+        }
+        return duplicate;
+    }
+    void UnbindEndpoint() {
+        if (levelListener) levelListener->Stop();
+        if (endpoint && levelListener)
+            (void)endpoint->UnregisterControlChangeNotify(levelListener.Get());
+        levelListener.Reset();
+        endpoint.Reset();
+        endpointId.clear();
+        ++generation; // Prevent stale notifications from prior outputs.
+        hasRecentDisplay = false;
+    }
+    void Stop() {
+        if (endpointListener) endpointListener->Stop();
+        UnbindEndpoint();
+        if (enumerator && endpointListener)
+            (void)enumerator->UnregisterEndpointNotificationCallback(
+                endpointListener.Get());
+        endpointListener.Reset();
+        enumerator.Reset();
+    }
+};
 // no_destroy retains the existing explicit worker/controller cleanup contract.
 struct AudioModuleState final {
     MediaRuntimeState media;
     MixerRuntimeState mixer;
     PanelControllerState panel;
+    CoreAudioVolumeObserver coreVolume;
 };
 AudioModuleState& GetAudioState() {
     [[clang::no_destroy]] static AudioModuleState instance;
@@ -8326,6 +8460,91 @@ bool ReadDefaultAudioVolume(int& percent, bool& muted) {
     return ok;
 }
 
+// Watch the active default endpoint (multimedia, then console). All COM work
+// runs on the controller thread; observer callbacks only PostMessage.
+void RebindCoreAudioVolume() {
+    auto& watcher = GetAudioState().coreVolume;
+    if (!watcher.enumerator) return;
+    Microsoft::WRL::ComPtr<IMMDevice> device;
+    HRESULT hr = watcher.enumerator->GetDefaultAudioEndpoint(
+        eRender, eMultimedia, device.GetAddressOf());
+    if (FAILED(hr) || !device) {
+        device.Reset();
+        hr = watcher.enumerator->GetDefaultAudioEndpoint(
+            eRender, eConsole, device.GetAddressOf());
+    }
+    std::wstring id;
+    if (SUCCEEDED(hr) && device) {
+        LPWSTR rawId = nullptr;
+        if (SUCCEEDED(device->GetId(&rawId)) && rawId) id.assign(rawId);
+        if (rawId) CoTaskMemFree(rawId);
+    }
+    if (device && !id.empty() && watcher.endpoint &&
+        watcher.endpointId == id) return;
+    watcher.UnbindEndpoint();
+    if (FAILED(hr) || !device) {
+        Wh_Log(L"Fluent OSD/COREAUDIO: no default output hr=0x%08lX",
+            static_cast<unsigned long>(hr));
+        return;
+    }
+    Microsoft::WRL::ComPtr<IAudioEndpointVolume> volume;
+    hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
+        nullptr, reinterpret_cast<void**>(volume.GetAddressOf()));
+    if (FAILED(hr) || !volume) {
+        Wh_Log(L"Fluent OSD/COREAUDIO: endpoint activation failed 0x%08lX",
+            static_cast<unsigned long>(hr));
+        return;
+    }
+    auto* cb = new (std::nothrow) CoreAudioLevelListener(
+        GetCoreState().module.receiveWnd, watcher.generation);
+    if (!cb) return;
+    hr = volume->RegisterControlChangeNotify(cb);
+    if (FAILED(hr)) {
+        cb->Stop();
+        cb->Release();
+        Wh_Log(L"Fluent OSD/COREAUDIO: volume registration failed 0x%08lX",
+            static_cast<unsigned long>(hr));
+        return;
+    }
+    watcher.levelListener.Attach(cb);
+    watcher.endpoint = std::move(volume);
+    watcher.endpointId = std::move(id);
+    Wh_Log(L"Fluent OSD/COREAUDIO: bound default output generation=%u",
+        watcher.generation);
+}
+void StartCoreAudioVolumeObserver() {
+    auto& watcher = GetAudioState().coreVolume;
+    if (watcher.enumerator || !ShowCustomNative(Kind::Volume) ||
+        !GetCoreState().module.receiveWnd) return;
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+        CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+        reinterpret_cast<void**>(enumerator.GetAddressOf()));
+    if (FAILED(hr) || !enumerator) {
+        Wh_Log(L"Fluent OSD/COREAUDIO: enumerator failed 0x%08lX",
+            static_cast<unsigned long>(hr));
+        return;
+    }
+    auto* cb = new (std::nothrow) CoreAudioEndpointListener(
+        GetCoreState().module.receiveWnd);
+    if (!cb) return;
+    hr = enumerator->RegisterEndpointNotificationCallback(cb);
+    if (FAILED(hr)) {
+        cb->Stop();
+        cb->Release();
+        Wh_Log(L"Fluent OSD/COREAUDIO: output registration failed 0x%08lX",
+            static_cast<unsigned long>(hr));
+        return;
+    }
+    watcher.enumerator = std::move(enumerator);
+    watcher.endpointListener.Attach(cb);
+    RebindCoreAudioVolume();
+}
+void ConfigureCoreAudioVolumeObserver() {
+    auto& watcher = GetAudioState().coreVolume;
+    if (ShowCustomNative(Kind::Volume)) StartCoreAudioVolumeObserver();
+    else if (watcher.enumerator) watcher.Stop();
+}
 // Core Audio operation: the XAML controller owns rendering and timeouts.
 bool AdjustDefaultAudioWheel(int steps) {
     if (!steps || GetCoreState().presentation.popupKind != PopupKind::NativeVolume) return false;
@@ -11619,6 +11838,11 @@ void ShowXamlMixerPanel() {
 }
 
 void ShowNativeVolumePopup() {
+    auto& current = GetCoreState().presentation;
+    if (current.nativePercentKnown &&
+        GetAudioState().coreVolume.SuppressExactDuplicate(
+            current.nativePercent, current.nativeMuted))
+        return;
     BrightnessEvent event{};
     MovePopupToDisplay(event);
     if (GetSettingsState()->showSmtcOnVolume.load() && !GetAudioState().panel.mixerOpen) RequestMedia();
@@ -12085,6 +12309,41 @@ LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ShowMigratedXamlNativeEvent();
         return 0;
     }
+    if (hwnd == GetCoreState().module.receiveWnd &&
+        msg == kCoreAudioVolumeMessage) {
+        auto& watcher = GetAudioState().coreVolume;
+        if (static_cast<unsigned>(wp) != watcher.generation) return 0;
+        if (watcher.levelListener) watcher.levelListener->ClearPending();
+        if (GetCoreState().module.closing.load() ||
+            !ShowCustomNative(Kind::Volume)) return 0;
+        int percent = 0;
+        bool muted = false;
+        if (!ReadDefaultAudioVolume(percent, muted)) {
+            Wh_Log(L"Fluent OSD/COREAUDIO: volume event read failed");
+            return 0;
+        }
+        auto& presentation = GetCoreState().presentation;
+        presentation.popupKind = PopupKind::NativeVolume;
+        presentation.nativePercent = percent;
+        presentation.nativePercentKnown = true;
+        presentation.nativeMuted = muted;
+        Wh_Log(L"Fluent OSD/COREAUDIO: volume event percent=%d muted=%d generation=%u",
+            percent, muted ? 1 : 0, watcher.generation);
+        ShowNativeVolumePopup();
+        return 0;
+    }
+    if (hwnd == GetCoreState().module.receiveWnd &&
+        msg == kCoreAudioEndpointMessage) {
+        auto& watcher = GetAudioState().coreVolume;
+        if (watcher.endpointListener) watcher.endpointListener->ClearPending();
+        if (!GetCoreState().module.closing.load()) RebindCoreAudioVolume();
+        return 0;
+    }
+    if (hwnd == GetCoreState().module.receiveWnd &&
+        msg == kCoreAudioConfigMessage) {
+        if (!GetCoreState().module.closing.load()) ConfigureCoreAudioVolumeObserver();
+        return 0;
+    }
     if (msg == kNativeOsdMessage && hwnd == GetCoreState().module.receiveWnd) {
         const Kind kind = static_cast<Kind>(wp);
         if (kind != Kind::Volume && kind != Kind::Brightness)
@@ -12259,6 +12518,7 @@ DWORD WINAPI UiThreadProc(void*) {
             AddClipboardFormatListener(GetCoreState().module.receiveWnd) != FALSE;
         InitDeviceEvents();
         InitNetworkEvents();
+        StartCoreAudioVolumeObserver();
     } else {
         Wh_Log(L"OSD message receiver creation failed (%lu)", GetLastError());
     }
@@ -12296,6 +12556,7 @@ DWORD WINAPI UiThreadProc(void*) {
     GetNoticeState().notice.usbNames.clear();
     GetConnectivityState().network.ResetRefresh();
     GetConnectivityState().network.interfaces.clear();
+    GetAudioState().coreVolume.Stop();
     StopDeviceEvents();
     ClearClipboardThumbnail();
     GetAudioState().mixer.ReleaseStorageOnControllerThread();
@@ -12380,6 +12641,8 @@ void Wh_ModSettingsChanged() {
         (void)PostMessageW(target, kBluetoothConfigMessage, 0, 0);
     if (GetCoreState().module.isExplorer && target)
         (void)PostMessageW(target, kNetworkConfigMessage, 0, 0);
+    if (GetCoreState().module.isExplorer && target)
+        (void)PostMessageW(target, kCoreAudioConfigMessage, 0, 0);
     // Refresh the next OSD using the newly selected theme. Settings never
     // force an unexpected brightness write or background monitor read.
 }
